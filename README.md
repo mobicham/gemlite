@@ -15,12 +15,12 @@
 
 GemLite strikes the perfect balance between **flexibility** and **performance**, allowing users to easily use and modify the codebase to develop high-performance kernels optimized for their specific hardware. We have included multiple versions of the kernels to maximize performance across different matrix shapes.
 
-The project started with CUDA kernels, but we have switched to <a href="https://github.com/triton-lang/triton/">Triton</a> for enhanced flexibility. For the old CUDA version, please refer to <a href="https://github.com/mobiusml/gemlite/tree/stable_cuda_only">this branch.</a>
+The project started with CUDA kernels, but we have switched to <a href="https://github.com/triton-lang/triton/">Triton</a> for enhanced flexibility. For the old CUDA version, please refer to <a href="https://github.com/dropbox/gemlite/tree/stable_cuda_only">this branch.</a>
 
 ### Result Teaser 
 | End-to-end Performance (Llama3 8-bit)              | Matmul Performance (A16W8)               |
 | --------------------------------------------------- | ---------------------------------------- |
-| ![End to End Performance](https://github.com/mobiusml/gemlite/blob/master/images/llama3_8bit.svg) | ![Matmul Performance](https://github.com/mobiusml/gemlite/blob/master/images/8bit_gs=infeatures_32768x32768_4090RTX.svg) |
+| ![End to End Performance](https://github.com/dropbox/gemlite/blob/master/images/llama3_8bit.svg) | ![Matmul Performance](https://github.com/dropbox/gemlite/blob/master/images/8bit_gs=infeatures_32768x32768_4090RTX.svg) |
 
 Extensive performance results across different bitwidths, batch sizes, and devices are available in the [Performance](#performance) section below.
 
@@ -36,7 +36,7 @@ Extensive performance results across different bitwidths, batch sizes, and devic
 - GemLite now supports MXFP for Blackwell!
 - GemLite now supports vLLM V1 (torch.compile compatible)!
 - GemLite now supports bfloat16!
-- GemLite is now available in <a href="https://github.com/vllm-project/vllm/">vllm</a> via the <a href="https://github.com/mobiusml/hqq/">hqq</a> lib! 
+- GemLite is now available in <a href="https://github.com/vllm-project/vllm/">vllm</a> via the <a href="https://github.com/dropbox/hqq/">hqq</a> lib! 
 - GemLite is now integrated with <a href="https://github.com/pytorch/ao">TorchAO</a>/<a href="https://github.com/sgl-project/sglang">SGLang</a> for 4-bit quantization. Check-out the <a href="https://pytorch.org/blog/accelerating-llm-inference/">blogpost</a>!
 - **Major performance improvement**: especially on the A100 and H100.
 - **Flexible bitpacking**: use 8-bit packing for improved batched performance on the A100 and H100 with packed data.
@@ -56,7 +56,7 @@ pip install gemlite
 ```
 ### Latest (Recommended)
 ```
-pip install git+https://github.com/mobiusml/gemlite/
+pip install git+https://github.com/dropbox/gemlite/
 ```
 
 ## Usage
@@ -84,7 +84,7 @@ gemlite_linear = GemLiteLinear(
     scaled_activations=False, #If the activations are scaled or not
 )
 
-#Packing: we follow the hqq format (W_q - zeros) * scales ~ W (https://github.com/mobiusml/hqq/)
+#Packing: we follow the hqq format (W_q - zeros) * scales ~ W (https://github.com/dropbox/hqq/)
 gemlite_linear.pack(W_q, scales, zeros, bias)
 
 #Forward
@@ -169,7 +169,7 @@ warmup(A16W4_HQQ_INT(), shapes=[(4096, 4096), (2048, 4096)], group_size=64)
 gemlite.cache_config('new_config.json')
 ```
 ## VLLM
-You can use GemLite with vLLM via <a href="https://github.com/pytorch/ao/">torchao</a> or <a href="https://github.com/mobiusml/hqq/">hqq</a> as follows: 
+You can use GemLite with vLLM via <a href="https://github.com/pytorch/ao/">torchao</a> or <a href="https://github.com/dropbox/hqq/">hqq</a> as follows: 
 
 ```Python
 from hqq.utils.vllm import set_vllm_onthefly_hqq_quant
@@ -198,13 +198,13 @@ llm = LLM(model="meta-llama/Llama-3.2-3B-Instruct", max_model_len=4096, gpu_memo
 
 ## Deep Dive
 We implement various versions of the Triton kernels: 
-* <b><a href="https://github.com/mobiusml/gemlite/blob/master/gemlite/triton_kernels/gemv.py">GEMV</a></b>: This GEMV kernel splits the activations into 1D chunks, performs the dot product using `tl.sum`, and accumulates via atomic addition. It is primarily intended for use with small batch sizes (M == 1). 
+* <b><a href="https://github.com/dropbox/gemlite/blob/master/gemlite/triton_kernels/gemv.py">GEMV</a></b>: This GEMV kernel splits the activations into 1D chunks, performs the dot product using `tl.sum`, and accumulates via atomic addition. It is primarily intended for use with small batch sizes (M == 1). 
 
-* <b><a href="https://github.com/mobiusml/gemlite/blob/master/gemlite/triton_kernels/gemm.py">GEMM</a></b>: This GEMM kernel is implemented similarly to <a href="https://github.com/fpgaminer/GPTQ-triton">GPTQ-triton</a>. Since it uses tensor cores, activations must be padded with zeros along the batch dimension to fit at least 16 rows. It supports both float32 and float16 accumulation for fp16 inputs, but only float32 accumulation for bfloat16.
+* <b><a href="https://github.com/dropbox/gemlite/blob/master/gemlite/triton_kernels/gemm.py">GEMM</a></b>: This GEMM kernel is implemented similarly to <a href="https://github.com/fpgaminer/GPTQ-triton">GPTQ-triton</a>. Since it uses tensor cores, activations must be padded with zeros along the batch dimension to fit at least 16 rows. It supports both float32 and float16 accumulation for fp16 inputs, but only float32 accumulation for bfloat16.
 
-* <b><a href="https://github.com/mobiusml/gemlite/blob/master/gemlite/triton_kernels/gemm_splitK.py">GEMM Split-K</a></b>: This Split-K GEMM kernel is implemented similarly to <a href="https://github.com/foundation-model-stack/foundation-model-stack/blob/triton/triton/kernels/gptq/splitk_dequant_gemm.py">the gptq Split-K version</a>. We build on the gemm version above and add another dimension in the grid which splits the K dimension into multiple jobs that calculate partial sums, which are atomically added and finally stored. Split-K performs particularly well for batched LLM decoding (batch-size between 2 and 32). 
+* <b><a href="https://github.com/dropbox/gemlite/blob/master/gemlite/triton_kernels/gemm_splitK.py">GEMM Split-K</a></b>: This Split-K GEMM kernel is implemented similarly to <a href="https://github.com/foundation-model-stack/foundation-model-stack/blob/triton/triton/kernels/gptq/splitk_dequant_gemm.py">the gptq Split-K version</a>. We build on the gemm version above and add another dimension in the grid which splits the K dimension into multiple jobs that calculate partial sums, which are atomically added and finally stored. Split-K performs particularly well for batched LLM decoding (batch-size between 2 and 32). 
 
-* <b><a href="https://github.com/mobiusml/gemlite/blob/master/gemlite/triton_kernels/gemv_revsplitK.py">Gemv RevSplit-K</a></b>: 
+* <b><a href="https://github.com/dropbox/gemlite/blob/master/gemlite/triton_kernels/gemv_revsplitK.py">Gemv RevSplit-K</a></b>: 
 This newly proposed algorithm in GemLite operates in contrast to the GEMM Split-K approach, but within a GEMV context. By doubling the workload per Triton program launched in the GEMV kernel, it reduces the frequency of loading scales/zeros and lowers the number of threads needed. As a result, this method delivers the best performance for batch-size=1 decoding. 
 
 All kernels are flexible, supporting 8, 4, 2, and 1-bit weight precisions as well as float16, bfloat16 and int8/fp8 activations.
@@ -220,21 +220,21 @@ We present various end-2-end Llama results generated with <a href="https://githu
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/llama3_8bit.svg" alt="llama3_8bit.svg" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/llama3_8bit.svg" alt="llama3_8bit.svg" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/llama3_8bit_dynamic.svg" alt="llama3_8bit_dynamic.svg" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/llama3_8bit_dynamic.svg" alt="llama3_8bit_dynamic.svg" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/llama3_triton3.2.png" alt="llama3_8bit_dynamic.svg" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/llama3_triton3.2.png" alt="llama3_8bit_dynamic.svg" style="width:98%">
   </div>
  </center>
 </div> 
@@ -242,14 +242,14 @@ We present various end-2-end Llama results generated with <a href="https://githu
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/llama3_4bit.svg" alt="llama3_4bit.svg" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/llama3_4bit.svg" alt="llama3_4bit.svg" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/llama2_prefill.svg" alt="llama2_prefill.svg" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/llama2_prefill.svg" alt="llama2_prefill.svg" style="width:98%">
   </div>
  </center>
 </div> 
@@ -258,7 +258,7 @@ We present various end-2-end Llama results generated with <a href="https://githu
 We also run comparison with VLLM's MarlinHQQ kernel which supports asymmetric quantization with a group size of 64. GemLite matches or even outperforms the highly optimized CUDA kernel end-2-end.
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/llama3_vllm.svg" alt="llama3_vllm.svg" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/llama3_vllm.svg" alt="llama3_vllm.svg" style="width:98%">
   </div>
  </center>
 </div> 
@@ -272,28 +272,28 @@ We present performance results across various batch sizes on the RTX 4090. Perfo
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/8bit_gs=infeatures_4096x4096_4090RTX.svg" alt="8bit_gs=infeatures_4096x4096_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/8bit_gs=infeatures_4096x4096_4090RTX.svg" alt="8bit_gs=infeatures_4096x4096_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/8bit_gs=infeatures_8192x8192_4090RTX.svg" alt="8bit_gs=infeatures_8192x8192_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/8bit_gs=infeatures_8192x8192_4090RTX.svg" alt="8bit_gs=infeatures_8192x8192_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/8bit_gs=infeatures_16384x16384_4090RTX.svg" alt="8bit_gs=infeatures_16384x16384_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/8bit_gs=infeatures_16384x16384_4090RTX.svg" alt="8bit_gs=infeatures_16384x16384_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/8bit_gs=infeatures_32768x32768_4090RTX.svg" alt="8bit_gs=infeatures_32768x32768_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/8bit_gs=infeatures_32768x32768_4090RTX.svg" alt="8bit_gs=infeatures_32768x32768_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
@@ -306,28 +306,28 @@ We present performance results across various batch sizes on the RTX 4090. Perfo
 <summary>4-bit Weights</summary>
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/4bit_gs=128_4096x4096_4090RTX.svg" alt="4bit_gs=128_4096x4096_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/4bit_gs=128_4096x4096_4090RTX.svg" alt="4bit_gs=128_4096x4096_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/4bit_gs=128_8192x8192_4090RTX.svg" alt="4bit_gs=128_8192x8192_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/4bit_gs=128_8192x8192_4090RTX.svg" alt="4bit_gs=128_8192x8192_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/4bit_gs=128_16384x16384_4090RTX.svg" alt="4bit_gs=128_16384x16384_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/4bit_gs=128_16384x16384_4090RTX.svg" alt="4bit_gs=128_16384x16384_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/4bit_gs=128_32768x32768_4090RTX.svg" alt="4bit_gs=128_32768x32768_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/4bit_gs=128_32768x32768_4090RTX.svg" alt="4bit_gs=128_32768x32768_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
@@ -339,28 +339,28 @@ We present performance results across various batch sizes on the RTX 4090. Perfo
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/2bit_gs=128_4096x4096_4090RTX.svg" alt="2bit_gs=128_4096x4096_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/2bit_gs=128_4096x4096_4090RTX.svg" alt="2bit_gs=128_4096x4096_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/2bit_gs=128_8192x8192_4090RTX.svg" alt="2bit_gs=128_8192x8192_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/2bit_gs=128_8192x8192_4090RTX.svg" alt="2bit_gs=128_8192x8192_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/2bit_gs=128_16384x16384_4090RTX.svg" alt="2bit_gs=128_16384x16384_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/2bit_gs=128_16384x16384_4090RTX.svg" alt="2bit_gs=128_16384x16384_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
 
 <div class="row"><center>
   <div class="column">
-    <img src="https://github.com/mobiusml/gemlite/blob/master/images/2bit_gs=128_32768x32768_4090RTX.svg" alt="2bit_gs=128_32768x32768_4090RTX" style="width:98%">
+    <img src="https://github.com/dropbox/gemlite/blob/master/images/2bit_gs=128_32768x32768_4090RTX.svg" alt="2bit_gs=128_32768x32768_4090RTX" style="width:98%">
   </div>
  </center>
 </div> 
