@@ -1,4 +1,5 @@
-#OMP_NUM_THREADS=16 TRITON_PRINT_AUTOTUNING=1 CUDA_VISIBLE_DEVICES=0 ipython3 benchmark_triton.py #select the right number of threads based on your machine
+#OMP_NUM_THREADS=1 TRITON_PRINT_AUTOTUNING=1 CUDA_VISIBLE_DEVICES=0 ipython3 benchmark_triton.py
+# Tests A16W4 quantization. You should expect speed-up up to batch-sizes 64-128 for this compute-bound test
 #################################################################################################################################
 import torch
 import numpy as np
@@ -16,15 +17,15 @@ except:
     pass
 
 #GemLite
-from gemlite.core import GemLiteLinearTriton, DType, set_autotune, GEMLITE_ACC_DTYPE
-set_autotune({'GEMV_REVSPLITK':True, 'GEMV_SPLITK': True, 'GEMV':True, 'GEMM_SPLITK':True, 'GEMM':True}, exhaustive=True, use_cuda_graph=False)
+import gemlite
+from gemlite import GemLiteLinear, DType
 
 device = 'cuda:0'
 compute_dtype = torch.float16
 
-in_features, out_features = 4096, 4096
+#in_features, out_features = 4096, 4096
 #in_features, out_features = 4096*2, 4096*2
-#in_features, out_features = 4096*4, 4096*4 
+in_features, out_features = 4096*4, 4096*4 
 #in_features, out_features = 4096*8, 4096*8 
 
 #W_nbits, group_size = 8, in_features 
@@ -33,7 +34,10 @@ W_nbits, group_size = 4, 128
 
 matmul_type = "AUTO" #GEMM, GEMV, GEMV_REVSPLITK, GEMM_SPLITK | AUTO
 
-GemLiteLinearTriton.load_config('test_config.json')
+gemlite.set_kernel_caching(False)
+gemlite.set_autotune("fast") # fast / max
+
+GemLiteLinear.load_config('test_config.json') #enable this if you wanna cache the config
 #################################################################################################################################
 from triton.testing import do_bench
 
@@ -119,7 +123,7 @@ def gen_data(in_features, out_features, W_nbits, group_size, device=device):
     #GemLite
     if(W_nbits in [8, 4, 2, 1]):
 
-        gemlite_linear = GemLiteLinearTriton(W_nbits=W_nbits, 
+        gemlite_linear = GemLiteLinear(W_nbits=W_nbits, 
                                             group_size=group_size, in_features=in_features, out_features=out_features, 
                                             input_dtype=DType.FP16, output_dtype=DType.FP16)
 
@@ -175,24 +179,24 @@ def gen_data(in_features, out_features, W_nbits, group_size, device=device):
 W, gemlite_linear, torchao_linear, bitblas_linear, marlin_linear = gen_data(in_features, out_features, W_nbits, group_size)
 
 if(matmul_type == "AUTO"):
-    BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
     if(HQQLinearBitBlas is not None):
         HQQLinearBitBlas.DEFAULT_BATCHSIZE = [1, 16]
 
 if(matmul_type == "GEMV"):
-    BATCH_SIZES = [1, 2, 4, 8]
+    BATCH_SIZES = [1]
     gemlite_linear.forward = lambda x: gemlite_linear.forward_manual(x, matmul_type=matmul_type)
     if(HQQLinearBitBlas is not None):
         HQQLinearBitBlas.DEFAULT_BATCHSIZE = [1]
 
 if(matmul_type == "GEMV_SPLITK"):
-    BATCH_SIZES = [1, 2, 4, 8]
+    BATCH_SIZES = [1]
     gemlite_linear.forward = lambda x: gemlite_linear.forward_manual(x, matmul_type=matmul_type)
     if(HQQLinearBitBlas is not None):
         HQQLinearBitBlas.DEFAULT_BATCHSIZE = [1]
 
 if(matmul_type == "GEMV_REVSPLITK"):
-    BATCH_SIZES = [1, 2, 4, 8]
+    BATCH_SIZES = [1]
     gemlite_linear.forward = lambda x: gemlite_linear.forward_manual(x, matmul_type=matmul_type)
     if(HQQLinearBitBlas is not None):
         HQQLinearBitBlas.DEFAULT_BATCHSIZE = [1]
@@ -204,7 +208,7 @@ if(matmul_type == "GEMM_SPLITK"):
         HQQLinearBitBlas.DEFAULT_BATCHSIZE = [1]
 
 if(matmul_type == "GEMM"):
-    BATCH_SIZES = [32, 64, 128, 256, 512, 1024]
+    BATCH_SIZES = [64, 128]
     gemlite_linear.forward = lambda x: gemlite_linear.forward_manual(x, matmul_type=matmul_type)
     if(HQQLinearBitBlas is not None):
         HQQLinearBitBlas.DEFAULT_BATCHSIZE = [16]
@@ -237,7 +241,4 @@ for batch_size in BATCH_SIZES:
         print((batch_size, in_features, out_features), 'Marlin Speed-up vs. torch.matmul', np.round(ref_time/marlin_time, 2))
 
     print('----------------------------------------------')
-    GemLiteLinearTriton.cache_config('test_config.json')
-
-
-
+    GemLiteLinear.cache_config('test_config.json')
