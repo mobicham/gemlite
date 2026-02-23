@@ -716,31 +716,34 @@ def scale_activations_mxfp8_triton_v2(
     pad_m = (group_size - M % group_size) % group_size
     M_padded = M + pad_m
 
-    out = torch.empty((M, K), device=tensor.device, dtype=w_dtype)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    # out = torch.empty((M, K), device=tensor.device, dtype=w_dtype)
+    # scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    
+    out = tensor.to(w_dtype)
+    scales = torch.full((M_padded, K // group_size), 120, device=tensor.device, dtype=torch.uint8)
 
     #BLOCK_SIZE_M = min(max(next_power_of_2(M), group_size), 128)
     BLOCK_SIZE_M = group_size
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
-    scale_activations_mxfp8_triton_kernel_v2[grid](
-        tensor,
-        out,
-        scales,
-        M, K, 
-        tensor.stride(0), tensor.stride(1),
-        scales.stride(0), scales.stride(1),
-        out.stride(0), out.stride(1),
-        #########################
-        min_val=min_val,
-        max_val=max_val,
-        eps_exp=eps_exp,
-        GROUP_SIZE=group_size,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        num_stages=2,
-        num_warps=4,
-    )
+    # scale_activations_mxfp8_triton_kernel_v2[grid](
+    #     tensor,
+    #     out,
+    #     scales,
+    #     M, K, 
+    #     tensor.stride(0), tensor.stride(1),
+    #     scales.stride(0), scales.stride(1),
+    #     out.stride(0), out.stride(1),
+    #     #########################
+    #     min_val=min_val,
+    #     max_val=max_val,
+    #     eps_exp=eps_exp,
+    #     GROUP_SIZE=group_size,
+    #     BLOCK_SIZE_M=BLOCK_SIZE_M,
+    #     num_stages=1,
+    #     num_warps=4,
+    # )
 
     return out, scales
 

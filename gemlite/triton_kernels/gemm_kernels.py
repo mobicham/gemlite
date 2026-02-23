@@ -75,6 +75,14 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
+        
+        
+        ######################################################
+        if block_size_n % 128 > 0:
+            block_size_n = 128
+        if block_size_k % 128 > 0:
+            block_size_k = 128
+        ######################################################
 
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
 
@@ -616,7 +624,8 @@ def gemm_INT_kernel_persistent_tma(
 def gemm_MX_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
-    M, N, K, M_CLOSEST,
+    #M, N, K, M_CLOSEST,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, M_CLOSEST: tl.constexpr,
     ######### Quant parms #########
     W_nbits: tl.constexpr,
     group_size: tl.constexpr,
@@ -627,9 +636,9 @@ def gemm_MX_kernel(
     a_sizeof: tl.constexpr,
     b_sizeof: tl.constexpr,
     ######### Strides #########
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
     stride_meta_a_m: tl.constexpr, stride_meta_a_g: tl.constexpr,
     stride_meta_n: tl.constexpr, stride_meta_g: tl.constexpr,
     ######### Dtypes #########
@@ -697,27 +706,92 @@ def gemm_MX_kernel(
     offs_k_scales = tl.arange(0, BLOCK_SIZE_K_S)
     offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
+    
+    
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr,
+        [M, K // elements_per_sample_a],
+        [stride_am, stride_ak],
+        [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
+    )
+
+    # Transposed
+    b_desc = tl.make_tensor_descriptor(
+        b_ptr,
+        [N, K // elements_per_sample],
+        [stride_bn, stride_bk],
+        [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
+    )
+    
+    # 2. 5D TMA Descriptors for Scales
+    rep_m: tl.constexpr = BLOCK_SIZE_M // 128
+    rep_n: tl.constexpr = BLOCK_SIZE_N // 128
+    rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
+
+    # shape_b1: tl.constexpr = N // 128
+    # shape_b2: tl.constexpr = K // group_size // 4
+    # stride_b4: tl.constexpr = 1
+    # stride_b3: tl.constexpr = 256
+    # stride_b2: tl.constexpr = 512
+    # stride_b1: tl.constexpr = 512 * shape_b2
+    # stride_b0: tl.constexpr = stride_b1 * shape_b1
+    
+    #(8388608, 65536, 512, 256, 1) torch.Size([1, 128, 128, 2, 256])
+    shape_b1: tl.constexpr = 128
+    shape_b2: tl.constexpr = 128
+    
+    stride_b0: tl.constexpr = 8388608
+    stride_b1: tl.constexpr = 65536
+    stride_b2: tl.constexpr = 512
+    stride_b3: tl.constexpr = 256
+    stride_b4: tl.constexpr = 1
+
+    # REQUIRES BLOCK_SIZE_K / BLOCK_SIZE_N to be multiples of 128
+    scales_b_desc = tl.make_tensor_descriptor(
+        scales_ptr,
+        [1, shape_b1, shape_b2, 2, 256],
+        [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
+        [1, rep_n, rep_k, 2, 256]
+    )
+    
 
     #B-scales
     if(channel_scale_mode == 4):
         scales_a_ptrs = scales_a_ptr + offs_am[:, None] * stride_meta_a_m + offs_k_scales[None, :] * stride_meta_a_g
+    
+    # Used in channel-wise MXPF8 version
+    #scales_b = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+    scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
-        if EVEN_M and EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict) 
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+    #for k in tl.range(num_pid_k):    
+        # if EVEN_M and EVEN_K:
+        #     a = tl.load(a_ptrs, eviction_policy=a_evict) 
+        # else:
+        #     a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
         
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
+        # b = tl.load(b_ptrs, eviction_policy=b_evict)
+        
+        a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
+        b = tl.load_tensor_descriptor(b_desc, [k * BLOCK_SIZE_K_B, pid_n * BLOCK_SIZE_N]).T
 
         k_m = k * BLOCK_SIZE_K_S
-        scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
-
+        #scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
+                
+        # 5D Scale Loads and Unpacking
+        offs_scale_m = pid_m * rep_m
+        offs_scale_n = pid_n * rep_n
+        offs_scale_k = k * rep_k
+        
+        scale_b = tl.load_tensor_descriptor(scales_b_desc, [0, offs_scale_n, offs_scale_k, 0, 0])
+        scales_b = scale_b.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
+        #https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py#L220C1-L221C117
+        
         if(channel_scale_mode == 4):
             scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
         else:
-            scales_a = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+            scales_a = scales_a_1s
         
         acc = tl.dot_scaled(a, scales_a, a_dtype, b, scales_b, b_dtype, acc)
 
@@ -740,19 +814,32 @@ def gemm_MX_kernel(
         acc      = acc.to(dtype) * (scales_a[:, None] * scales_b[None, :])
 
     #############################################################################################################
-    #Output
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
-    tl.store(c_ptrs, acc, mask=mask)
+    # #Output
+    # offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    # offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+    # mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
+    # tl.store(c_ptrs, acc, mask=mask)
+    
+    c_desc = tl.make_tensor_descriptor(
+        c_ptr,
+        [M, N],
+        [stride_cm, stride_cn],
+        [BLOCK_SIZE_M, BLOCK_SIZE_N]
+    )
+    tl.store_tensor_descriptor(c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], value=acc)
+    
 
+
+PRINTED = False
 def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
                 W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
                 input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
                 channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 
                 ) -> Tensor:
     
+    
+    global PRINTED
     M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1]
     M_CLOSEST = get_closest_m(M)
     
@@ -773,7 +860,7 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         gemm_kernel = gemm_INT_kernel
         load_scales_as_block = False
 
-    gemm_kernel[grid](
+    compiled_kernel = gemm_kernel[grid](
         x, W_q, output, 
         scales, zeros, scales_x,
         M, N, K, M_CLOSEST,
@@ -798,6 +885,11 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
     )
+    
+    if PRINTED == False:
+        with open('kernel.ptx', 'w') as f:
+            f.write(compiled_kernel.asm['ptx'])
+        PRINTED = True
 
     return output
 
