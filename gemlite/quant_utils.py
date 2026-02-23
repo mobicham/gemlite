@@ -265,83 +265,241 @@ if IS_HIP:
 else:
     round_triton = round_triton_nvidia
 
+# @triton.jit
+# def scale_activations_per_token_kernel(
+#     tensor_ptr, scale_ptr, y_ptr, 
+#     M, K,
+#     stride_m, stride_k, stride_sm,
+#     ROUND: tl.constexpr, 
+#     UNROLL: tl.constexpr,
+#     min_val: tl.constexpr,
+#     max_val: tl.constexpr,
+#     fp32_scale: tl.constexpr, 
+#     BLOCK_M: tl.constexpr, 
+#     BLOCK_K: tl.constexpr,
+# ):
+#     pid_m = tl.program_id(0) * UNROLL
+#     pid_k = tl.program_id(1)
+
+#     offs_k  = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+#     offs_m  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+
+#     for m in range(UNROLL):
+#         mask = ((offs_m < M)[:, None] & (offs_k < K)[None, :]).to(tl.int1)
+#         in_ptrs = offs_m[:, None] * stride_m + offs_k[None, :] * stride_k
+#         tensor = tl.load(tensor_ptr + in_ptrs, mask=mask, other=0.0)
+#         if fp32_scale:
+#             tensor = tensor.to(tl.float32)
+
+#         scales_x = tl.max(tl.abs(tensor), axis=1, keep_dims=True)
+#         scales_x /= max_val
+#         scales_x = tl.maximum(scales_x, 1e-6)
+#         tensor /= scales_x
+#         tensor = tl.minimum(tl.maximum(tensor, min_val), max_val)
+
+#         if ROUND:
+#             tensor = round_triton(tensor)
+
+#         tl.store(scale_ptr + offs_m[:, None] * stride_sm, scales_x)
+#         tl.store(y_ptr + in_ptrs, tensor, mask=mask)
+#         offs_m += BLOCK_M
+
+# def scale_activations_per_token_triton(
+#     tensor: Tensor, w_dtype: torch.dtype, fp32_scale: bool = True
+# ) -> Tuple[Tensor, Tensor]:
+#     min_val, max_val = get_dtype_range(w_dtype)
+#     x_shape = tensor.shape
+#     tensor = tensor.view(-1, tensor.shape[-1])
+#     M, K = tensor.shape
+#     scales = torch.empty(
+#         (M, 1), dtype=torch.float32 if fp32_scale else tensor.dtype, device=tensor.device
+#     )
+#     y = torch.empty((M, K), dtype=w_dtype, device=tensor.device)
+
+#     UNROLL = 1  # max(1, M // 128)
+#     BLOCK_M = 1
+#     BLOCK_K = triton.next_power_of_2(K)
+#     grid = (triton.cdiv(M, BLOCK_M * UNROLL), triton.cdiv(K, BLOCK_K))
+
+#     ROUND = not w_dtype.is_floating_point
+
+#     scale_activations_per_token_kernel[grid](
+#         tensor,
+#         scales,
+#         y,
+#         M,
+#         K,
+#         tensor.stride(0),
+#         tensor.stride(1),
+#         scales.stride(0),
+#         min_val=min_val,
+#         max_val=max_val,
+#         fp32_scale=fp32_scale,
+#         ROUND=ROUND,
+#         UNROLL=UNROLL,
+#         BLOCK_M=BLOCK_M,
+#         BLOCK_K=BLOCK_K,
+#         num_stages=1,
+#         num_warps=4,
+#     )
+
+#     return y.view(x_shape), scales
+
+
+# from typing import Tuple
+
+# @triton.autotune(
+#     configs=[
+#         triton.Config({'BLOCK_M': 1}, num_warps=8, num_stages=1),
+#         triton.Config({'BLOCK_M': 2}, num_warps=8, num_stages=1),
+#         triton.Config({'BLOCK_M': 4}, num_warps=8, num_stages=1),
+#     ],
+#     key=['M', 'K']
+# )
+# @triton.jit
+# def scale_activations_single_pass_kernel(
+#     tensor_ptr, scale_ptr, y_ptr, 
+#     M, K,
+#     stride_m, stride_k, stride_sm,
+#     min_val: tl.constexpr, max_val: tl.constexpr,
+#     fp32_scale: tl.constexpr, ROUND: tl.constexpr,
+#     BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+# ):
+#     pid_m = tl.program_id(0)
+    
+#     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+#     offs_k = tl.arange(0, BLOCK_K)   
+#     m_mask = offs_m < M
+#     k_mask = offs_k < K
+#     mask = m_mask[:, None] & k_mask[None, :]
+
+#     offsets = offs_m[:, None] * stride_m + offs_k[None, :] * stride_k
+
+#     tensor = tl.load(tensor_ptr + offsets, mask=mask, other=0.0)
+    
+#     if fp32_scale:
+#         tensor = tensor.to(tl.float32)
+
+#     scales_x = tl.max(tl.abs(tensor), axis=1) / max_val
+#     scales_x = tl.maximum(scales_x, 1e-6)
+#     tensor = tensor / scales_x[:, None]
+#     tensor = tl.minimum(tl.maximum(tensor, min_val), max_val)
+
+#     if ROUND:
+#         tensor = round_triton(tensor)
+
+#     tl.store(scale_ptr + offs_m * stride_sm, scales_x, mask=m_mask)
+#     tl.store(y_ptr + offsets, tensor, mask=mask)
+
+# def scale_activations_per_token_triton(
+#     tensor: torch.Tensor, w_dtype: torch.dtype, fp32_scale: bool = True
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+#     min_val, max_val = get_dtype_range(w_dtype)
+    
+#     x_shape = tensor.shape
+#     tensor = tensor.view(-1, tensor.shape[-1])
+#     M, K = tensor.shape
+    
+#     scales = torch.empty((M, 1), dtype=torch.float32 if fp32_scale else tensor.dtype, device=tensor.device)
+#     y = torch.empty((M, K), dtype=w_dtype, device=tensor.device)
+
+#     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), )
+
+#     BLOCK_K = triton.next_power_of_2(K)
+#     ROUND = not w_dtype.is_floating_point
+
+#     scale_activations_single_pass_kernel[grid](
+#         tensor, scales, y,
+#         M, K,
+#         tensor.stride(0), tensor.stride(1),
+#         scales.stride(0),
+#         min_val=min_val, max_val=max_val,
+#         fp32_scale=fp32_scale, ROUND=ROUND,
+#         BLOCK_K=BLOCK_K
+#     )
+
+#     return y.view(x_shape), scales
+
+
+
+from typing import Tuple
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 1}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_M': 2}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_M': 4}, num_warps=8, num_stages=1),
+    ],
+    key=['M', 'K']
+)
 @triton.jit
-def scale_activations_per_token_kernel(
+def scale_activations_persistent_kernel(
     tensor_ptr, scale_ptr, y_ptr, 
     M, K,
     stride_m, stride_k, stride_sm,
-    ROUND: tl.constexpr, 
-    UNROLL: tl.constexpr,
-    min_val: tl.constexpr,
-    max_val: tl.constexpr,
-    fp32_scale: tl.constexpr, 
-    BLOCK_M: tl.constexpr, 
-    BLOCK_K: tl.constexpr,
+    min_val: tl.constexpr, max_val: tl.constexpr,
+    fp32_scale: tl.constexpr, ROUND: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    pid_m = tl.program_id(0) * UNROLL
-    pid_k = tl.program_id(1)
+    start_pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    num_tiles = tl.cdiv(M, BLOCK_M)
+    
+    offs_k = tl.arange(0, BLOCK_K)
+    k_mask = offs_k < K
 
-    offs_k  = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_m  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    for pid_m in range(start_pid, num_tiles, num_programs):
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_mask = offs_m < M
+        mask = m_mask[:, None] & k_mask[None, :]
 
-    for m in range(UNROLL):
-        mask = ((offs_m < M)[:, None] & (offs_k < K)[None, :]).to(tl.int1)
-        in_ptrs = offs_m[:, None] * stride_m + offs_k[None, :] * stride_k
-        tensor = tl.load(tensor_ptr + in_ptrs, mask=mask, other=0.0)
+        offsets = offs_m[:, None] * stride_m + offs_k[None, :] * stride_k
+        tensor = tl.load(tensor_ptr + offsets, mask=mask, other=0.0)
+        
         if fp32_scale:
             tensor = tensor.to(tl.float32)
-
-        scales_x = tl.max(tl.abs(tensor), axis=1, keep_dims=True)
-        scales_x /= max_val
+            
+        scales_x = tl.max(tl.abs(tensor), axis=1) / max_val
         scales_x = tl.maximum(scales_x, 1e-6)
-        tensor /= scales_x
+        tensor = tensor / scales_x[:, None]
         tensor = tl.minimum(tl.maximum(tensor, min_val), max_val)
 
         if ROUND:
             tensor = round_triton(tensor)
+        
+        tl.store(y_ptr + offsets, tensor, mask=mask)
+        tl.store(scale_ptr + offs_m * stride_sm, scales_x, mask=m_mask)
+        
+        
 
-        tl.store(scale_ptr + offs_m[:, None] * stride_sm, scales_x)
-        tl.store(y_ptr + in_ptrs, tensor, mask=mask)
-        offs_m += BLOCK_M
-
-
+NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
 def scale_activations_per_token_triton(
-    tensor: Tensor, w_dtype: torch.dtype, fp32_scale: bool = True
-) -> Tuple[Tensor, Tensor]:
+    tensor: torch.Tensor, w_dtype: torch.dtype, fp32_scale: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    
     min_val, max_val = get_dtype_range(w_dtype)
+    
     x_shape = tensor.shape
     tensor = tensor.view(-1, tensor.shape[-1])
     M, K = tensor.shape
-    scales = torch.empty(
-        (M, 1), dtype=torch.float32 if fp32_scale else tensor.dtype, device=tensor.device
-    )
+    
+    scales = torch.empty((M, 1), dtype=torch.float32 if fp32_scale else tensor.dtype, device=tensor.device)
     y = torch.empty((M, K), dtype=w_dtype, device=tensor.device)
 
-    UNROLL = 1  # max(1, M // 128)
-    BLOCK_M = 1
-    BLOCK_K = triton.next_power_of_2(K)
-    grid = (triton.cdiv(M, BLOCK_M * UNROLL), triton.cdiv(K, BLOCK_K))
+    grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META['BLOCK_M'])), )
 
+    BLOCK_K = triton.next_power_of_2(K)
     ROUND = not w_dtype.is_floating_point
 
-    scale_activations_per_token_kernel[grid](
-        tensor,
-        scales,
-        y,
-        M,
-        K,
-        tensor.stride(0),
-        tensor.stride(1),
+    scale_activations_persistent_kernel[grid](
+        tensor, scales, y,
+        M, K,
+        tensor.stride(0), tensor.stride(1),
         scales.stride(0),
-        min_val=min_val,
-        max_val=max_val,
-        fp32_scale=fp32_scale,
-        ROUND=ROUND,
-        UNROLL=UNROLL,
-        BLOCK_M=BLOCK_M,
-        BLOCK_K=BLOCK_K,
-        num_stages=1,
-        num_warps=4,
+        min_val=min_val, max_val=max_val,
+        fp32_scale=fp32_scale, ROUND=ROUND,
+        BLOCK_K=BLOCK_K
     )
 
     return y.view(x_shape), scales
