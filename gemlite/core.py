@@ -496,20 +496,25 @@ class GemLiteLinearTriton(torch.nn.Module):
             self.W_group_mode = 2
             self.channel_scale_mode = 0
             
-            ################
+            ################################
             # TMA
-            K, N = self.W_q.shape
+            # K, N = self.W_q.shape
             
-            if(self.input_dtype in [DType.MXFP4, DType.NVFP4]):
-                K *= 2
-                group_size = 2 * self.W_q.numel() // self.scales.numel()
-            else:
-                group_size = self.W_q.numel() // self.scales.numel()
-            self.scales = self.scales.reshape(1, N // 128, K // group_size // 4, 2, 256).contiguous()
-            self.W_q = self.W_q.contiguous().T
+            # if(self.input_dtype in [DType.MXFP4, DType.NVFP4]):
+            #     K *= 2
+            #     group_size = 2 * self.W_q.numel() // self.scales.numel()
+            # else:
+            #     group_size = self.W_q.numel() // self.scales.numel()
             
-            print(self.scales.stride(), self.scales.shape)
-            ################
+            # #self.scales = self.scales.contiguous().T # Transposed 2D TMA layout
+            # #self.scales = self.scales.reshape(1, N // 128, K // group_size // 4, 2, 256).contiguous() # 5D TMA layout for the scales:
+            
+            #self.W_q = self.W_q.contiguous().T #Transposed for tma
+            
+            #self.W_q = self.W_q.contiguous()
+            
+            #print(self.scales.stride(), self.scales.shape)
+            ################################
 
         if(self.scales is not None):
             self.meta_dtype = TORCH_TO_DTYPE[self.scales.dtype]

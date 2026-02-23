@@ -78,10 +78,11 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         
         
         ######################################################
-        if block_size_n % 128 > 0:
-            block_size_n = 128
-        if block_size_k % 128 > 0:
-            block_size_k = 128
+        # # FOR TMA 
+        # if block_size_n % 128 > 0:
+        #     block_size_n = 128
+        # if block_size_k % 128 > 0:
+        #     block_size_k = 128
         ######################################################
 
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
@@ -108,8 +109,9 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         if(num_stages == 0): continue #config too large
 
         ###########################################
-        # if(load_scales_as_block):#tmp MXFP fix
-        #     block_size_k = min(block_size_k, 256)
+        if(load_scales_as_block):#tmp MXFP fix
+            block_size_k = max(block_size_k, 64)
+            block_size_n = max(block_size_n, 64)
         ###########################################
 
         key = (block_size_m, block_size_n, block_size_k, group_size_m, A_load_order, num_stages, num_warps)
@@ -188,7 +190,9 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
+    
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     
     configs.append(triton.Config({'BLOCK_SIZE_M':256, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':32,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':256, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
@@ -708,52 +712,47 @@ def gemm_MX_kernel(
     scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
     
     
-    a_desc = tl.make_tensor_descriptor(
-        a_ptr,
-        [M, K // elements_per_sample_a],
-        [stride_am, stride_ak],
-        [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
-    )
+    # a_desc = tl.make_tensor_descriptor(
+    #     a_ptr,
+    #     [M, K // elements_per_sample_a],
+    #     [stride_am, stride_ak],
+    #     [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
+    # )
 
-    # Transposed
-    b_desc = tl.make_tensor_descriptor(
-        b_ptr,
-        [N, K // elements_per_sample],
-        [stride_bn, stride_bk],
-        [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
-    )
+    # # Transposed
+    # b_desc = tl.make_tensor_descriptor(
+    #     b_ptr,
+    #     [N, K // elements_per_sample],
+    #     [stride_bn, stride_bk],
+    #     [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
+    # )
     
-    # 2. 5D TMA Descriptors for Scales
-    rep_m: tl.constexpr = BLOCK_SIZE_M // 128
-    rep_n: tl.constexpr = BLOCK_SIZE_N // 128
-    rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
-
-    # shape_b1: tl.constexpr = N // 128
-    # shape_b2: tl.constexpr = K // group_size // 4
+    # # 2. 5D TMA Descriptors for Scales: #(8388608, 65536, 512, 256, 1) torch.Size([1, 128, 128, 2, 256])
+    # rep_m: tl.constexpr = BLOCK_SIZE_M // 128
+    # rep_n: tl.constexpr = BLOCK_SIZE_N // 128
+    # rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
+    # scales_b_shape1: tl.constexpr = N // 128
+    # scales_b_shape2: tl.constexpr = K // group_size // 4
     # stride_b4: tl.constexpr = 1
     # stride_b3: tl.constexpr = 256
     # stride_b2: tl.constexpr = 512
-    # stride_b1: tl.constexpr = 512 * shape_b2
-    # stride_b0: tl.constexpr = stride_b1 * shape_b1
+    # stride_b1: tl.constexpr = 512 * scales_b_shape2
+    # stride_b0: tl.constexpr = stride_b1 * scales_b_shape1
+    # # REQUIRES BLOCK_SIZE_K / BLOCK_SIZE_N to be multiples of 128
+    # scales_b_desc = tl.make_tensor_descriptor(
+    #     scales_ptr,
+    #     [1, scales_b_shape1, scales_b_shape2, 2, 256],
+    #     [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
+    #     [1, rep_n, rep_k, 2, 256]
+    # )
     
-    #(8388608, 65536, 512, 256, 1) torch.Size([1, 128, 128, 2, 256])
-    shape_b1: tl.constexpr = 128
-    shape_b2: tl.constexpr = 128
-    
-    stride_b0: tl.constexpr = 8388608
-    stride_b1: tl.constexpr = 65536
-    stride_b2: tl.constexpr = 512
-    stride_b3: tl.constexpr = 256
-    stride_b4: tl.constexpr = 1
-
-    # REQUIRES BLOCK_SIZE_K / BLOCK_SIZE_N to be multiples of 128
-    scales_b_desc = tl.make_tensor_descriptor(
-        scales_ptr,
-        [1, shape_b1, shape_b2, 2, 256],
-        [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
-        [1, rep_n, rep_k, 2, 256]
-    )
-    
+    # # 2D TMA - transposed
+    # scales_b_desc = tl.make_tensor_descriptor(
+    #     scales_ptr,
+    #     [K // group_size, N],
+    #     [stride_meta_g, stride_meta_n],
+    #     [BLOCK_SIZE_K_S, BLOCK_SIZE_N],
+    # )
 
     #B-scales
     if(channel_scale_mode == 4):
@@ -766,32 +765,40 @@ def gemm_MX_kernel(
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
     #for k in tl.range(num_pid_k):    
-        # if EVEN_M and EVEN_K:
-        #     a = tl.load(a_ptrs, eviction_policy=a_evict) 
-        # else:
-        #     a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        if EVEN_M and EVEN_K:
+            a = tl.load(a_ptrs, eviction_policy=a_evict) 
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
         
-        # b = tl.load(b_ptrs, eviction_policy=b_evict)
+        b = tl.load(b_ptrs, eviction_policy=b_evict)
         
-        a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
-        b = tl.load_tensor_descriptor(b_desc, [k * BLOCK_SIZE_K_B, pid_n * BLOCK_SIZE_N]).T
+        #a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
+        #b = tl.load_tensor_descriptor(b_desc, [k * BLOCK_SIZE_K_B, pid_n * BLOCK_SIZE_N]).T
 
         k_m = k * BLOCK_SIZE_K_S
-        #scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
-                
-        # 5D Scale Loads and Unpacking
-        offs_scale_m = pid_m * rep_m
-        offs_scale_n = pid_n * rep_n
-        offs_scale_k = k * rep_k
         
-        scale_b = tl.load_tensor_descriptor(scales_b_desc, [0, offs_scale_n, offs_scale_k, 0, 0])
-        scales_b = scale_b.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
+        ####################################################################################
+        # NO TMA
+        scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
+                
+        
+        # # 2D TMA
+        # scales_b = tl.load_tensor_descriptor(scales_b_desc, [k * BLOCK_SIZE_K_S, pid_n * BLOCK_SIZE_N]).T
+        
+        # 5D Scale Loads and Unpacking
+        # offs_scale_m = pid_m * rep_m
+        # offs_scale_n = pid_n * rep_n
+        # offs_scale_k = k * rep_k
+        
+        #scale_b = tl.load_tensor_descriptor(scales_b_desc, [0, offs_scale_n, offs_scale_k, 0, 0])
+        #scales_b = scale_b.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
         #https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py#L220C1-L221C117
         
         if(channel_scale_mode == 4):
             scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
         else:
             scales_a = scales_a_1s
+        ####################################################################################
         
         acc = tl.dot_scaled(a, scales_a, a_dtype, b, scales_b, b_dtype, acc)
 
