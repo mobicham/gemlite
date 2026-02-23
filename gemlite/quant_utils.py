@@ -952,6 +952,25 @@ def scale_activations_mxfp4_triton_kernel_v2(
     #Load
     mask = ((offs_m[:, None] < M) & (offs_k[None, :] < K)).to(tl.int1)
     tensor_ptrs = tensor_ptr + (offs_m[:, None] * stride_m_t + offs_k[None, :] * stride_k_t)
+    
+    #################################################
+    # 1. Device-Side TMA Descriptors
+    # tensor_desc = tl.make_tensor_descriptor(
+    #     tensor_ptr,
+    #     [M, K],
+    #     [stride_m_t, stride_k_t],
+    #     [BLOCK_SIZE_M, GROUP_SIZE]
+    # )
+
+    # out_desc = tl.make_tensor_descriptor(
+    #     out_ptr,
+    #     [M, K // 2],
+    #     [stride_m_o, stride_k_o],
+    #     [BLOCK_SIZE_M, HALF_GROUP_SIZE]
+    # )
+    
+    #tensor = tl.load_tensor_descriptor(tensor_desc, [pid_m * BLOCK_SIZE_M, pid_k * GROUP_SIZE]).to(tl.float32)
+    #################################################
     tensor = tl.load(tensor_ptrs, mask=mask, other=0.0).to(tl.float32)
     
     #next power of 2 via log
@@ -970,6 +989,7 @@ def scale_activations_mxfp4_triton_kernel_v2(
     offs_k = pid_k * HALF_GROUP_SIZE + tl.arange(0, HALF_GROUP_SIZE)
     out_mask = ((offs_m[:, None] < M) & (offs_k[None, :] < (K // 2))).to(tl.int1)
     tl.store(out_ptr + (offs_m[:, None] * stride_m_o + offs_k[None, :] * stride_k_o), out, mask=out_mask)
+    #tl.store_tensor_descriptor(out_desc, [pid_m * BLOCK_SIZE_M, pid_k * HALF_GROUP_SIZE], out)
 
     offs_k = pid_k * 1 + tl.arange(0, 1)
     tl.store(scales_ptr + (offs_m[:, None] * stride_m_s + offs_k[None, :] * stride_k_s), scales_log2)
@@ -986,34 +1006,31 @@ def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     pad_m = (group_size - M % group_size) % group_size
     M_padded = M + pad_m
 
-    # out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    # scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
+    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
     
-    out = tensor.to(torch.uint8)[:M, :K // 2]
-    scales = torch.full((M_padded, K // group_size), 120, device=tensor.device, dtype=torch.uint8)
-
     #BLOCK_SIZE_M = min(max(next_power_of_2(M), group_size), 128)
     BLOCK_SIZE_M = group_size
     
     grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
-    # scale_activations_mxfp4_triton_kernel_v2[grid](
-    #     tensor,
-    #     out,
-    #     scales,
-    #     thr_pos[device_index],
-    #     M, K, 
-    #     tensor.stride(0), tensor.stride(1),
-    #     scales.stride(0), scales.stride(1),
-    #     out.stride(0), out.stride(1),
-    #     #########################
-    #     eps_exp=eps_exp,
-    #     GROUP_SIZE=group_size,
-    #     BLOCK_SIZE_M=BLOCK_SIZE_M,
-    #     num_stages=2,
-    #     num_warps=4,
-    # )
+    scale_activations_mxfp4_triton_kernel_v2[grid](
+        tensor,
+        out,
+        scales,
+        thr_pos[device_index],
+        M, K, 
+        tensor.stride(0), tensor.stride(1),
+        scales.stride(0), scales.stride(1),
+        out.stride(0), out.stride(1),
+        #########################
+        eps_exp=eps_exp,
+        GROUP_SIZE=group_size,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        num_stages=1,
+        num_warps=4,
+    )
 
     return out, scales
 
