@@ -882,7 +882,7 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         gemm_kernel = gemm_INT_kernel
         load_scales_as_block = False
 
-    compiled_kernel = gemm_kernel[grid](
+    gemm_kernel[grid](
         x, W_q, output, 
         scales, zeros, scales_x,
         M, N, K, M_CLOSEST,
@@ -908,11 +908,6 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         data_contiguous    = data_contiguous,
     )
     
-    if PRINTED == False:
-        with open('kernel.ptx', 'w') as f:
-            f.write(compiled_kernel.asm['ptx'])
-        PRINTED = True
-
     return output
 
 # # Persistent version
