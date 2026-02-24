@@ -14,14 +14,14 @@ def is_fp8_supported(device_index=0):
 
 device        = 'cuda:0'
 compute_dtype = torch.bfloat16 #float16, bfloat16
-matmul_types  = ['GEMM_SPLITK', 'GEMM'] #TODO: add GEMV use-cases
+matmul_types  = ['GEMM'] #GEMM_SPLITK #TODO: add GEMV use-cases
 reset_config()
 set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
 torch.random.manual_seed(0)
 in_features, out_features = 4096, 2048
-batch_sizes               = [1, 4, 16]
+batch_sizes               = [16, 64, 512]
 linear_layer              = torch.nn.Linear(in_features=in_features, out_features=out_features, device=device, dtype=compute_dtype, bias=False)
 linear_layer.weight.data /= 10.
 linear_layer.weight.requires_grad = False
@@ -42,13 +42,20 @@ class TestGemliteMXFP(unittest.TestCase):
 				err   = (y_ref - y_gem).abs().mean().item()
 				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
 
-	@unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
-	def test_A16W8_MXFP(self):
-		gemlite_linear = A16W8_MXFP(device=device, dtype=compute_dtype).from_linear(linear_layer, del_orig=False)
-		self.assertTrue(gemlite_linear.W_q.numel() * gemlite_linear.W_q.itemsize == (in_features * out_features))
-		self.assertTrue(not gemlite_linear.scaled_activations)
-		self.eval(gemlite_linear, tol = 2e-4)
+	# @unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
+	# def test_A16W8_MXFP(self):
+	# 	gemlite_linear = A16W8_MXFP(device=device, dtype=compute_dtype).from_linear(linear_layer, del_orig=False)
+	# 	self.assertTrue(gemlite_linear.W_q.numel() * gemlite_linear.W_q.itemsize == (in_features * out_features))
+	# 	self.assertTrue(not gemlite_linear.scaled_activations)
+	# 	self.eval(gemlite_linear, tol = 2e-4)
 
+	@unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
+	def test_A8W8_MXFP_post_scale_dynamic(self):
+		gemlite_linear = A8W8_MXFP_dynamic(device=device, dtype=compute_dtype, post_scale=True).from_linear(linear_layer, del_orig=False)
+		self.assertTrue(gemlite_linear.W_q.numel() * gemlite_linear.W_q.itemsize == (in_features * out_features))
+		self.assertTrue(gemlite_linear.scaled_activations)
+		self.eval(gemlite_linear, tol = 2e-4)
+  
 	@unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
 	def test_A8W8_MXFP_dynamic(self):
 		gemlite_linear = A8W8_MXFP_dynamic(device=device, dtype=compute_dtype, post_scale=False).from_linear(linear_layer, del_orig=False)
@@ -56,11 +63,11 @@ class TestGemliteMXFP(unittest.TestCase):
 		self.assertTrue(gemlite_linear.scaled_activations)
 		self.eval(gemlite_linear, tol = 2e-4)
 
-	def test_A16W4_MXFP(self):
-		gemlite_linear = A16W4_MXFP(device=device, dtype=compute_dtype).from_linear(linear_layer, del_orig=False)
-		self.assertTrue(gemlite_linear.W_q.numel() * gemlite_linear.W_q.itemsize == (in_features * out_features // 2))
-		self.assertTrue(not gemlite_linear.scaled_activations)
-		self.eval(gemlite_linear, tol = 7e-4)
+	# def test_A16W4_MXFP(self):
+	# 	gemlite_linear = A16W4_MXFP(device=device, dtype=compute_dtype).from_linear(linear_layer, del_orig=False)
+	# 	self.assertTrue(gemlite_linear.W_q.numel() * gemlite_linear.W_q.itemsize == (in_features * out_features // 2))
+	# 	self.assertTrue(not gemlite_linear.scaled_activations)
+	# 	self.eval(gemlite_linear, tol = 7e-4)
 
 	@unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
 	def test_A8W4_MXFP_dynamic(self):

@@ -19,7 +19,7 @@ fp8_dtype     = torch.float8_e4m3fn #float8_e4m3fn / torch.float8_e5m2 (Nvidia)
 gemlite_dtype = TORCH_TO_DTYPE[compute_dtype]
 matmul_types  = ['GEMV_REVSPLITK', 'GEMV', 'GEMV_SPLITK', 'GEMM_SPLITK', 'GEMM']
 reset_config()
-set_autotune(False)
+#set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
 
