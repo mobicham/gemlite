@@ -501,30 +501,41 @@ def scale_activations_per_token_triton_v3(
 @triton.jit
 def next_power_of_2_log_triton(val, eps_exp: tl.constexpr):
     exp = tl.ceil(tl.log2(val)).to(tl.int32)
+    exp = exp + 127
     exp = tl.maximum(tl.minimum(exp, 254), 127 + eps_exp)
-    scales = tl.where(exp >= 0, 1 << exp, 1.0 / (1 << (-exp)))
+    scales = tl.cast(exp << 23, tl.float32, bitcast=True)
     return scales, exp
 
 @triton.jit
 def next_power_of_2_ptx_triton(val, eps_exp: tl.constexpr):
-    exp = tl.inline_asm_elementwise(
-        """
-        {
-        lg2.approx.f32 $1, $1;
-        cvt.rpi.f32.f32 $1, $1;
-        cvt.rzi.s32.f32 $0, $1;
-        }
+    scales, biased_exp = tl.inline_asm_elementwise(
+        f"""
+        {{
+        .reg .f32 f_log;
+        .reg .f32 f_ceil;
+        .reg .s32 r_exp;
+        .reg .f32 f_clamped;
+
+        lg2.approx.f32 f_log, $2;
+        cvt.rpi.f32.f32 f_ceil, f_log;
+        cvt.rzi.s32.f32 r_exp, f_ceil;
+
+        max.s32 r_exp, r_exp, {eps_exp};
+        min.s32 r_exp, r_exp, 127;
+
+        add.s32 $1, r_exp, 127;
+        cvt.rn.f32.s32 f_clamped, r_exp;
+        ex2.approx.f32 $0, f_clamped;
+        }}
         """,
-        "=r,r",
+        "=f,=r,f",
         [val],
-        dtype=tl.int32, 
+        dtype=(tl.float32, tl.int32),
         is_pure=True,
         pack=1
     )
-
-    exp = tl.maximum(tl.minimum(exp, 254), 127 + eps_exp)
-    scales = tl.where(exp >= 0, 1 << exp, 1.0 / (1 << (-exp)))
-    return scales, exp
+    
+    return scales, biased_exp
 
 @triton.jit
 def next_power_of_2_bitwise_triton(val, eps_exp: tl.constexpr):
@@ -533,12 +544,14 @@ def next_power_of_2_bitwise_triton(val, eps_exp: tl.constexpr):
     mant = xi & 0x7FFFFF
     exp += tl.where(mant != 0, 1, 0)
     exp = tl.maximum(tl.minimum(exp, 254), 127 + eps_exp)
-    yi = exp << 23
-    scales = tl.cast(yi, tl.float32, bitcast=True)
+    scales = tl.cast(exp << 23, tl.float32, bitcast=True)
     return scales, exp
 
-next_power_of_2_triton = next_power_of_2_ptx_triton
+next_power_of_2_triton = next_power_of_2_bitwise_triton
 
+####################################################################################################################
+#MXFP8
+####################################################################################################################
 @torch.compile(fullgraph=True)
 def scale_activations_mxfp8_torch(
     tensor: Tensor, w_dtype: torch.dtype = torch.float8_e4m3fn
