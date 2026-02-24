@@ -20,11 +20,14 @@ set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
 torch.random.manual_seed(0)
-in_features, out_features = 4096, 2048
-batch_sizes               = [16, 64, 512]
+in_features, out_features = 4032, 2000
+batch_sizes               = [50]
 linear_layer              = torch.nn.Linear(in_features=in_features, out_features=out_features, device=device, dtype=compute_dtype, bias=False)
 linear_layer.weight.data /= 10.
 linear_layer.weight.requires_grad = False
+
+
+assert in_features % 32 == 0, "in_features must be divisible by 32 for the current implementation"
 
 #Pre-cache data for faster processing
 input_data = {}
@@ -83,7 +86,7 @@ class TestGemliteMXFP(unittest.TestCase):
 		self.eval(gemlite_linear, tol = 1e-3)
 
 	def test_A4W4_NVFP_dynamic(self):
-		gemlite_linear = A4W4_MXFP_dynamic(device=device, dtype=compute_dtype).from_linear(linear_layer, del_orig=False)
+		gemlite_linear = A4W4_NVFP_dynamic(device=device, dtype=compute_dtype).from_linear(linear_layer, del_orig=False)
 		self.assertTrue(gemlite_linear.W_q.numel() * gemlite_linear.W_q.itemsize == (in_features * out_features // 2))
 		self.assertTrue(gemlite_linear.scaled_activations)
 		self.eval(gemlite_linear, tol = 1e-3)

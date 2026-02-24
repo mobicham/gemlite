@@ -228,6 +228,29 @@ class WeightQuantizerMXFP:
 ####################################################################################################################
 #INT8 / FP8 activations
 ####################################################################################################################
+def prune_large_blocks(configs, named_args, **kwargs):
+    M = named_args['M']
+    
+    pruned = []
+    for config in configs:
+        if config.kwargs['BLOCK_SIZE_M'] <= M:
+            pruned.append(config)
+            
+    if not pruned:
+        for config in configs:
+            new_kwargs = config.kwargs.copy()
+            new_kwargs['BLOCK_SIZE_M'] = 16
+                
+            pruned.append(
+                triton.Config(
+                    new_kwargs,
+                    num_warps=config.num_warps,
+                    num_stages=config.num_stages
+                )
+            )
+        
+    return pruned
+
 # Main activation scaling functions
 @torch.compile(fullgraph=True)
 def scale_activations_per_token_torch(
@@ -250,7 +273,7 @@ def scale_activations_per_token_torch(
     if not w_dtype.is_floating_point:
         out.round_()
 
-    out = out.to(dtype=w_dtype)
+    out = out.to(dtype=w_dtype)    
     return out.view(out_shape), scales
 
 @triton.jit
@@ -270,20 +293,22 @@ else:
 def scale_activations_per_token_triton_v1_kernel(
     tensor_ptr, scale_ptr, y_ptr, 
     M, K,
-    stride_m, stride_k, stride_sm,
+    stride_m: tl.constexpr, 
+    stride_k: tl.constexpr, 
+    stride_sm: tl.constexpr,
     ROUND: tl.constexpr, 
     UNROLL: tl.constexpr,
     min_val: tl.constexpr,
     max_val: tl.constexpr,
     fp32_scale: tl.constexpr, 
-    BLOCK_M: tl.constexpr, 
-    BLOCK_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0) * UNROLL
     pid_k = tl.program_id(1)
 
-    offs_k  = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    offs_m  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k  = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    offs_m  = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
 
     for m in range(UNROLL):
         mask = ((offs_m < M)[:, None] & (offs_k < K)[None, :]).to(tl.int1)
@@ -303,7 +328,7 @@ def scale_activations_per_token_triton_v1_kernel(
 
         tl.store(scale_ptr + offs_m[:, None] * stride_sm, scales_x)
         tl.store(y_ptr + in_ptrs, tensor, mask=mask)
-        offs_m += BLOCK_M
+        offs_m += BLOCK_SIZE_M
 
 def scale_activations_per_token_triton_v1(
     tensor: Tensor, w_dtype: torch.dtype, fp32_scale: bool = True
@@ -318,9 +343,9 @@ def scale_activations_per_token_triton_v1(
     y = torch.empty((M, K), dtype=w_dtype, device=tensor.device)
 
     UNROLL = 1  # max(1, M // 128)
-    BLOCK_M = 1
-    BLOCK_K = triton.next_power_of_2(K)
-    grid = (triton.cdiv(M, BLOCK_M * UNROLL), triton.cdiv(K, BLOCK_K))
+    BLOCK_SIZE_M = 1
+    BLOCK_SIZE_K = triton.next_power_of_2(K)
+    grid = (triton.cdiv(M, BLOCK_SIZE_M * UNROLL), triton.cdiv(K, BLOCK_SIZE_K))
 
     ROUND = not w_dtype.is_floating_point
 
@@ -338,8 +363,8 @@ def scale_activations_per_token_triton_v1(
         fp32_scale=fp32_scale,
         ROUND=ROUND,
         UNROLL=UNROLL,
-        BLOCK_M=BLOCK_M,
-        BLOCK_K=BLOCK_K,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
         num_stages=1,
         num_warps=4,
     )
@@ -348,9 +373,9 @@ def scale_activations_per_token_triton_v1(
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 1}, num_warps=8, num_stages=1),
-        triton.Config({'BLOCK_M': 2}, num_warps=8, num_stages=1),
-        triton.Config({'BLOCK_M': 4}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 1}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 2}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 4}, num_warps=8, num_stages=1),
     ],
     key=['M', 'K']
 )
@@ -358,15 +383,20 @@ def scale_activations_per_token_triton_v1(
 def scale_activations_per_token_triton_v2_kernel(
     tensor_ptr, scale_ptr, y_ptr, 
     M, K,
-    stride_m, stride_k, stride_sm,
-    min_val: tl.constexpr, max_val: tl.constexpr,
-    fp32_scale: tl.constexpr, ROUND: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    stride_m: tl.constexpr, 
+    stride_k: tl.constexpr, 
+    stride_sm: tl.constexpr,
+    min_val: tl.constexpr, 
+    max_val: tl.constexpr,
+    fp32_scale: tl.constexpr, 
+    ROUND: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = tl.arange(0, BLOCK_K)   
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)   
     m_mask = offs_m < M
     k_mask = offs_k < K
     mask = m_mask[:, None] & k_mask[None, :]
@@ -402,9 +432,9 @@ def scale_activations_per_token_triton_v2(
     scales = torch.empty((M, 1), dtype=torch.float32 if fp32_scale else tensor.dtype, device=tensor.device)
     y = torch.empty((M, K), dtype=w_dtype, device=tensor.device)
 
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), )
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), )
 
-    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_SIZE_K = triton.next_power_of_2(K)
     ROUND = not w_dtype.is_floating_point
 
     scale_activations_per_token_triton_v2_kernel[grid](
@@ -414,16 +444,16 @@ def scale_activations_per_token_triton_v2(
         scales.stride(0),
         min_val=min_val, max_val=max_val,
         fp32_scale=fp32_scale, ROUND=ROUND,
-        BLOCK_K=BLOCK_K
+        BLOCK_SIZE_K=BLOCK_SIZE_K
     )
 
     return y.view(x_shape), scales
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_M': 1}, num_warps=8, num_stages=1),
-        triton.Config({'BLOCK_M': 2}, num_warps=8, num_stages=1),
-        triton.Config({'BLOCK_M': 4}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 1}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 2}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 4}, num_warps=8, num_stages=1),
     ],
     key=['M', 'K']
 )
@@ -431,20 +461,25 @@ def scale_activations_per_token_triton_v2(
 def scale_activations_per_token_triton_v3_kernel(
     tensor_ptr, scale_ptr, y_ptr, 
     M, K,
-    stride_m, stride_k, stride_sm,
-    min_val: tl.constexpr, max_val: tl.constexpr,
-    fp32_scale: tl.constexpr, ROUND: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    stride_m: tl.constexpr, 
+    stride_k: tl.constexpr, 
+    stride_sm: tl.constexpr,
+    min_val: tl.constexpr, 
+    max_val: tl.constexpr,
+    fp32_scale: tl.constexpr, 
+    ROUND: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
 ):
     start_pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
-    num_tiles = tl.cdiv(M, BLOCK_M)
+    num_tiles = tl.cdiv(M, BLOCK_SIZE_M)
     
-    offs_k = tl.arange(0, BLOCK_K)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
     k_mask = offs_k < K
 
     for pid_m in range(start_pid, num_tiles, num_programs):
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         m_mask = offs_m < M
         mask = m_mask[:, None] & k_mask[None, :]
 
@@ -478,9 +513,9 @@ def scale_activations_per_token_triton_v3(
     scales = torch.empty((M, 1), dtype=torch.float32 if fp32_scale else tensor.dtype, device=tensor.device)
     y = torch.empty((M, K), dtype=w_dtype, device=tensor.device)
 
-    grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META['BLOCK_M'])), )
+    grid = lambda META: (min(NUM_SMS, triton.cdiv(M, META['BLOCK_SIZE_M'])), )
 
-    BLOCK_K = triton.next_power_of_2(K)
+    BLOCK_SIZE_K = triton.next_power_of_2(K)
     ROUND = not w_dtype.is_floating_point
 
     scale_activations_per_token_triton_v3_kernel[grid](
@@ -490,7 +525,7 @@ def scale_activations_per_token_triton_v3(
         scales.stride(0),
         min_val=min_val, max_val=max_val,
         fp32_scale=fp32_scale, ROUND=ROUND,
-        BLOCK_K=BLOCK_K
+        BLOCK_SIZE_K=BLOCK_SIZE_K
     )
 
     return y.view(x_shape), scales
@@ -667,9 +702,13 @@ def scale_activations_mxfp8_triton_kernel_v2(
     out_ptr,
     scales_ptr,
     M, K,
-    stride_m_t, stride_k_t,
-    stride_m_s, stride_k_s,
-    stride_m_o, stride_k_o,
+    #########################
+    stride_m_t: tl.constexpr, 
+    stride_k_t: tl.constexpr,
+    stride_m_s: tl.constexpr, 
+    stride_k_s: tl.constexpr,
+    stride_m_o: tl.constexpr, 
+    stride_k_o: tl.constexpr,
     #########################
     min_val: tl.constexpr,
     max_val: tl.constexpr,
@@ -748,15 +787,33 @@ def scale_activations_mxfp8_triton_v2(
 
     return out, scales
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 16}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 32}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 128}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 128}, num_warps=4, num_stages=3),
+    ],
+    key=['M', 'K'],
+    prune_configs_by={'early_config_prune': prune_large_blocks},
+)
 @triton.jit
 def scale_activations_mxfp8_triton_kernel_v3(
     tensor_ptr,
     out_ptr,
     scales_ptr,
     M, K,
-    stride_m_t, stride_k_t,
-    stride_m_s, stride_k_s,
-    stride_m_o, stride_k_o,
+    #########################
+    stride_m_t: tl.constexpr, 
+    stride_k_t: tl.constexpr,
+    stride_m_s: tl.constexpr, 
+    stride_k_s: tl.constexpr,
+    stride_m_o: tl.constexpr, 
+    stride_k_o: tl.constexpr,
     #########################
     min_val: tl.constexpr,
     max_val: tl.constexpr,
@@ -764,40 +821,43 @@ def scale_activations_mxfp8_triton_kernel_v3(
     GROUP_SIZE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(axis=0)
-    pid_k = tl.program_id(axis=1)
-    out_dtype: tl.constexpr = out_ptr.dtype.element_ty
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    
+    tensor_block_ptr = tl.make_block_ptr(
+        base=tensor_ptr, shape=(M, K), strides=(stride_m_t, stride_k_t),
+        offsets=(pid_m * BLOCK_SIZE_M, pid_k * GROUP_SIZE),
+        block_shape=(BLOCK_SIZE_M, GROUP_SIZE), order=(1, 0)
+    )
+    
+    out_block_ptr = tl.make_block_ptr(
+        base=out_ptr, shape=(M, K), strides=(stride_m_o, stride_k_o),
+        offsets=(pid_m * BLOCK_SIZE_M, pid_k * GROUP_SIZE),
+        block_shape=(BLOCK_SIZE_M, GROUP_SIZE), order=(1, 0)
+    )
+
+    tensor = tl.load(tensor_block_ptr, boundary_check=(0, 1), padding_option="zero").to(tl.float32)
+    
+    abs_max = tl.max(tl.abs(tensor), axis=1, keep_dims=True)
+    scales, scales_log2 = next_power_of_2_triton(abs_max / max_val, eps_exp)
+
+    out = tensor * (1.0 / scales)    
+    out = tl.clamp(out, min=min_val, max=max_val)
+    out = out.to(out_ptr.dtype.element_ty)
+
+    tl.store(out_block_ptr, out, boundary_check=(0, 1))
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_k = pid_k * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-
-    #Load
-    mask = ((offs_m[:, None] < M) & (offs_k[None, :] < K)).to(tl.int1)
-    tensor_ptrs = tensor_ptr + (offs_m[:, None] * stride_m_t + offs_k[None, :] * stride_k_t)
-    tensor = tl.load(tensor_ptrs, mask=mask, other=0.0).to(tl.float32)
-    
-    #next power of 2 via log
-    scales, scales_log2 = next_power_of_2_triton(tl.max(tl.abs(tensor), axis=1, keep_dims=True) / max_val, eps_exp)
-
-    #Map to index
-    out = tensor / scales
-    out = tl.clamp(out, min=min_val, max=max_val)
-    out = out.to(out_dtype)
-
-    #Store
-    out_mask = ((offs_m[:, None] < M) & (offs_k[None, :] < K)).to(tl.int1)
-    tl.store(out_ptr + (offs_m[:, None] * stride_m_o + offs_k[None, :] * stride_k_o), out, mask=out_mask)
-
-    offs_k = pid_k * 1 + tl.arange(0, 1)
-    tl.store(scales_ptr + (offs_m[:, None] * stride_m_s + offs_k[None, :] * stride_k_s), scales_log2)
-
+    mask_m = offs_m < M
+    scales_ptrs = scales_ptr + (offs_m * stride_m_s + pid_k * stride_k_s)    
+    tl.store(scales_ptrs, tl.reshape(scales_log2, (BLOCK_SIZE_M, )), mask=mask_m)
 
 def scale_activations_mxfp8_triton_v3(
     tensor: torch.Tensor, w_dtype: torch.dtype = torch.float8_e4m3fn
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     group_size: int = 32
     eps_exp: int = -30
-    eps: float = 2 ** -30
+    eps: float = 2 ** eps_exp
     min_val, max_val = get_dtype_range(w_dtype)
 
     tensor = tensor.contiguous()
@@ -810,9 +870,7 @@ def scale_activations_mxfp8_triton_v3(
     out = torch.empty((M, K), device=tensor.device, dtype=w_dtype)
     scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
     
-    #BLOCK_SIZE_M = min(max(next_power_of_2(M), group_size), 128)
-    BLOCK_SIZE_M = group_size
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(K, group_size))
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
     scale_activations_mxfp8_triton_kernel_v3[grid](
@@ -828,9 +886,6 @@ def scale_activations_mxfp8_triton_v3(
         max_val=max_val,
         eps_exp=eps_exp,
         GROUP_SIZE=group_size,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        num_stages=1,
-        num_warps=4,
     )
 
     return out, scales
@@ -933,104 +988,56 @@ def scale_activations_nvfp4_torch(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     )
     return W_q, scales
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 16}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 32}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 128}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 128}, num_warps=4, num_stages=3),
+    ],
+    key=['M', 'K'],
+    prune_configs_by={'early_config_prune': prune_large_blocks},
+)
 @triton.jit
-def scale_activations_mxfp4_triton_kernel_v1(
-    tensor_ptr,
-    out_ptr,
-    scales_ptr,
-    thr_pos_ptr,
-    E,
-    eps_exp: tl.constexpr,
-    UNROLL: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(axis=0) * UNROLL
-
-    HALF_GROUP_SIZE: tl.constexpr = GROUP_SIZE // 2
-    out_dtype: tl.constexpr = out_ptr.dtype.element_ty
-    thr_pos = tl.load(thr_pos_ptr + tl.arange(0, 8), eviction_policy='evict_last')[None, :]
-
-    for m in range(UNROLL):
-        #Load
-        offs = pid * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        mask = (offs < E).to(tl.int1)
-        tensor = tl.load(tensor_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-
-        scales, scales_log2 = next_power_of_2_triton(tl.max(tl.abs(tensor)) / 6., eps_exp)
-
-        #Map to index
-        wq = tensor / scales
-        idx_abs = tl.sum(tl.abs(wq[:, None]) > thr_pos, axis=1)
-        out = tl.where(wq >= 0, idx_abs, idx_abs + 8).to(out_dtype)
-
-        #Pack
-        lo, hi = tl.split(out.reshape((HALF_GROUP_SIZE, 2), can_reorder=False))
-        out = lo | (hi << 4)
-
-        #Store
-        offs_out = pid * HALF_GROUP_SIZE + tl.arange(0, HALF_GROUP_SIZE)
-        tl.store(out_ptr + offs_out, out)
-        tl.store(scales_ptr + pid, scales_log2)
-
-        pid += 1
-
-def scale_activations_mxfp4_triton_v1(tensor: Tensor) -> Tuple[Tensor, Tensor]:
-    group_size: int = 32
-    eps_exp: int = -30
-    eps = 2 ** eps_exp
-    tensor = tensor.contiguous()
-    
-    orig_shape = tensor.shape
-    tensor = tensor.view(-1, tensor.shape[-1])
-    inter_shape = (tensor.shape[0], tensor.shape[1] // 2)
-    pad_rows = (group_size - inter_shape[0] % group_size) % group_size
-    post_pad_shape = (inter_shape[0] + pad_rows, inter_shape[1])
-    E = tensor.numel()
-
-    UNROLL = min(triton.cdiv(triton.cdiv(E, group_size), get_num_SMs(tensor.device)), 1)
-
-    out = torch.empty(inter_shape, device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty(
-        (post_pad_shape[0], post_pad_shape[1] * 2 // group_size),
-        device=tensor.device,
-        dtype=torch.uint8,
-    )
-    device_index = tensor.device.index
-    
-    grid = lambda meta: (triton.cdiv(E // UNROLL, group_size), )
-    scale_activations_mxfp4_triton_kernel_v1[grid](
-                tensor, 
-                out, 
-                scales,
-                thr_pos[device_index],
-                E,
-                eps_exp=eps_exp,
-                UNROLL=UNROLL,
-                GROUP_SIZE=group_size,
-                num_stages=1,
-                num_warps=4,
-                )
-
-    return out, scales
-
-
-@triton.jit
-def scale_activations_mxfp4_triton_kernel_v2(
+def scale_activations_mxfp4_triton_kernel(
     tensor_ptr,
     out_ptr,
     scales_ptr,
     thr_pos_ptr,
     M, K,
-    stride_m_t, stride_k_t,
-    stride_m_s, stride_k_s,
-    stride_m_o, stride_k_o,
+    #########################
+    stride_m_t: tl.constexpr, 
+    stride_k_t: tl.constexpr,
+    stride_m_s: tl.constexpr, 
+    stride_k_s: tl.constexpr,
+    stride_m_o: tl.constexpr, 
+    stride_k_o: tl.constexpr,
     #########################
     eps_exp: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
+    use_tma: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
+    
+    if use_tma:
+        tensor_desc = tl.make_tensor_descriptor(
+            tensor_ptr,
+            [M, K],
+            [stride_m_t, stride_k_t],
+            [BLOCK_SIZE_M, GROUP_SIZE]
+        )        
+        out_desc = tl.make_tensor_descriptor(
+            out_ptr,
+            [M, K // 2],
+            [stride_m_o, stride_k_o],
+            [BLOCK_SIZE_M, HALF_GROUP_SIZE]
+        )
 
     HALF_GROUP_SIZE: tl.constexpr = GROUP_SIZE // 2
     out_dtype: tl.constexpr = out_ptr.dtype.element_ty
@@ -1043,25 +1050,10 @@ def scale_activations_mxfp4_triton_kernel_v2(
     mask = ((offs_m[:, None] < M) & (offs_k[None, :] < K)).to(tl.int1)
     tensor_ptrs = tensor_ptr + (offs_m[:, None] * stride_m_t + offs_k[None, :] * stride_k_t)
     
-    #################################################
-    # 1. Device-Side TMA Descriptors
-    # tensor_desc = tl.make_tensor_descriptor(
-    #     tensor_ptr,
-    #     [M, K],
-    #     [stride_m_t, stride_k_t],
-    #     [BLOCK_SIZE_M, GROUP_SIZE]
-    # )
-
-    # out_desc = tl.make_tensor_descriptor(
-    #     out_ptr,
-    #     [M, K // 2],
-    #     [stride_m_o, stride_k_o],
-    #     [BLOCK_SIZE_M, HALF_GROUP_SIZE]
-    # )
-    
-    #tensor = tl.load_tensor_descriptor(tensor_desc, [pid_m * BLOCK_SIZE_M, pid_k * GROUP_SIZE]).to(tl.float32)
-    #################################################
-    tensor = tl.load(tensor_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if use_tma:        
+        tensor = tl.load_tensor_descriptor(tensor_desc, [pid_m * BLOCK_SIZE_M, pid_k * GROUP_SIZE]).to(tl.float32)
+    else:
+        tensor = tl.load(tensor_ptrs, mask=mask, other=0.0).to(tl.float32)
     
     #next power of 2 via log
     scales, scales_log2 = next_power_of_2_triton(tl.max(tl.abs(tensor), axis=1, keep_dims=True) / 6., eps_exp)
@@ -1078,13 +1070,15 @@ def scale_activations_mxfp4_triton_kernel_v2(
     #Store
     offs_k = pid_k * HALF_GROUP_SIZE + tl.arange(0, HALF_GROUP_SIZE)
     out_mask = ((offs_m[:, None] < M) & (offs_k[None, :] < (K // 2))).to(tl.int1)
-    tl.store(out_ptr + (offs_m[:, None] * stride_m_o + offs_k[None, :] * stride_k_o), out, mask=out_mask)
-    #tl.store_tensor_descriptor(out_desc, [pid_m * BLOCK_SIZE_M, pid_k * HALF_GROUP_SIZE], out)
+    if use_tma:
+        tl.store_tensor_descriptor(out_desc, [pid_m * BLOCK_SIZE_M, pid_k * HALF_GROUP_SIZE], out)
+    else:
+        tl.store(out_ptr + (offs_m[:, None] * stride_m_o + offs_k[None, :] * stride_k_o), out, mask=out_mask)
 
     offs_k = pid_k * 1 + tl.arange(0, 1)
     tl.store(scales_ptr + (offs_m[:, None] * stride_m_s + offs_k[None, :] * stride_k_s), scales_log2)
 
-def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
+def scale_activations_mxfp4_triton(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     group_size: int = 32
     eps_exp: int = -30
     eps: float = 2 ** eps_exp
@@ -1098,14 +1092,11 @@ def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
     scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
-    
-    #BLOCK_SIZE_M = min(max(next_power_of_2(M), group_size), 128)
-    BLOCK_SIZE_M = group_size
-    
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(K, group_size))
+        
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
-    scale_activations_mxfp4_triton_kernel_v2[grid](
+    scale_activations_mxfp4_triton_kernel[grid](
         tensor,
         out,
         scales,
@@ -1117,32 +1108,62 @@ def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
         #########################
         eps_exp=eps_exp,
         GROUP_SIZE=group_size,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        num_stages=1,
-        num_warps=4,
     )
 
     return out, scales
 
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 16}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 32}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 128}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_SIZE_M': 128}, num_warps=4, num_stages=3),
+    ],
+    key=['M', 'K'],
+    prune_configs_by={'early_config_prune': prune_large_blocks},
+)
 @triton.jit
-def scale_activations_nvfp4_triton_kernel_v2(
+def scale_activations_nvfp4_triton_kernel(
     tensor_ptr,
     out_ptr,
     scales_ptr,
     thr_pos_ptr,
     M, K,
-    stride_m_t, stride_k_t,
-    stride_m_s, stride_k_s,
-    stride_m_o, stride_k_o,
+    #########################
+    stride_m_t: tl.constexpr, 
+    stride_k_t: tl.constexpr,
+    stride_m_s: tl.constexpr, 
+    stride_k_s: tl.constexpr,
+    stride_m_o: tl.constexpr, 
+    stride_k_o: tl.constexpr,
     #########################
     eps: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     meta_scales: tl.constexpr = NVFP4_META_SCALE,
+    use_tma: tl.constexpr = False,
 ):
-
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
+    
+    if use_tma:
+        tensor_desc = tl.make_tensor_descriptor(
+            tensor_ptr,
+            [M, K],
+            [stride_m_t, stride_k_t],
+            [BLOCK_SIZE_M, GROUP_SIZE]
+        )        
+        out_desc = tl.make_tensor_descriptor(
+            out_ptr,
+            [M, K // 2],
+            [stride_m_o, stride_k_o],
+            [BLOCK_SIZE_M, HALF_GROUP_SIZE]
+        )
 
     fp8_dtype: tl.constexpr = tl.float8e4nv
     max_fp8: tl.constexpr = 448.
@@ -1157,8 +1178,12 @@ def scale_activations_nvfp4_triton_kernel_v2(
     #Load
     mask = ((offs_m[:, None] < M) & (offs_k[None, :] < K)).to(tl.int1)
     tensor_ptrs = tensor_ptr + (offs_m[:, None] * stride_m_t + offs_k[None, :] * stride_k_t)
-    tensor = tl.load(tensor_ptrs, mask=mask, other=0.0).to(tl.float32)
     
+    if use_tma:
+        tensor = tl.load_tensor_descriptor(tensor_desc, [pid_m * BLOCK_SIZE_M, pid_k * GROUP_SIZE]).to(tl.float32)
+    else:
+        tensor = tl.load(tensor_ptrs, mask=mask, other=0.0).to(tl.float32)
+        
     #FP8 scales
     scales = tl.max(tl.abs(tensor), axis=1, keep_dims=True) / (6. * meta_scales)
     scales = tl.minimum(scales, max_fp8).to(fp8_dtype)
@@ -1175,14 +1200,17 @@ def scale_activations_nvfp4_triton_kernel_v2(
 
     #Store
     offs_k = pid_k * HALF_GROUP_SIZE + tl.arange(0, HALF_GROUP_SIZE)
-    out_mask = ((offs_m[:, None] < M) & (offs_k[None, :] < (K // 2))).to(tl.int1)
-    tl.store(out_ptr + (offs_m[:, None] * stride_m_o + offs_k[None, :] * stride_k_o), out, mask=out_mask)
+    out_mask = ((offs_m[:, None] < M) & (offs_k[None, :] < (K // 2))).to(tl.int1)    
+    if use_tma:
+        tl.store_tensor_descriptor(out_desc, [pid_m * BLOCK_SIZE_M, pid_k * HALF_GROUP_SIZE], out)
+    else:
+        tl.store(out_ptr + (offs_m[:, None] * stride_m_o + offs_k[None, :] * stride_k_o), out, mask=out_mask)
 
     offs_k = pid_k + tl.arange(0, 1)
     tl.store(scales_ptr + (offs_m[:, None] * stride_m_s + offs_k[None, :] * stride_k_s), scales)
 
 
-def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def scale_activations_nvfp4_triton(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn #Nvidia only
@@ -1197,12 +1225,10 @@ def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor) -> Tuple[torch.Tenso
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
     scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
 
-    #BLOCK_SIZE_M = min(max(next_power_of_2(M), group_size), 128)
-    BLOCK_SIZE_M = group_size
-    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(K, group_size))
+    grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
-    scale_activations_nvfp4_triton_kernel_v2[grid](
+    scale_activations_nvfp4_triton_kernel[grid](
         tensor,
         out,
         scales,
@@ -1214,9 +1240,6 @@ def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor) -> Tuple[torch.Tenso
         #########################
         eps=eps,
         GROUP_SIZE=group_size,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        num_stages=2,
-        num_warps=4,
     )
 
     return out, scales
@@ -1224,5 +1247,5 @@ def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor) -> Tuple[torch.Tenso
 ####################################################################################################################
 scale_activations_per_token = scale_activations_per_token_triton_v3
 scale_activations_mxfp8 = scale_activations_mxfp8_triton_v3
-scale_activations_mxfp4 = scale_activations_mxfp4_triton_v2
-scale_activations_nvfp4 = scale_activations_nvfp4_triton_v2
+scale_activations_mxfp4 = scale_activations_mxfp4_triton
+scale_activations_nvfp4 = scale_activations_nvfp4_triton
