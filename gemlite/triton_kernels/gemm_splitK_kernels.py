@@ -38,7 +38,11 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_dec_producer', None)
             config.pop('reg_inc_consumer', None)
             config["NUM_STAGES"] = num_stages
-
+            
+            config['EVEN_M'] = (m % config['BLOCK_SIZE_M'] == 0)
+            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
+            config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+            
             yield triton.Config(config,
                 num_stages=num_stages,
                 num_warps=num_warps,
@@ -85,7 +89,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         #Constraint: K needs to be divisible by BLOCK_SIZE_K * SPLIT_K 
         while split_k > 1 and not is_divisible(k, block_size_k * split_k):
-        #while split_k > 1 and k > block_size_k * split_k:
             split_k //= 2
 
         #Nvidia
@@ -97,18 +100,19 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 #skip num_stages=1 for non-packed weights
                 continue
 
-        #Avoid OOM
-        while num_stages > 0: #TODO: revisit MXFP case
-            shared_mem = (block_size_m * block_size_k * a_sizeof + block_size_k * block_size_n * b_sizeof)
-            if(e > 1 and not load_scales_as_block): 
-                shared_mem += block_size_k * block_size_n * a_sizeof
-            shared_mem *= num_stages
-            if int(shared_mem) <= gpu_shared_memory:
-                break
-            num_stages -= 1
+        # #Avoid OOM
+        # while num_stages > 0: #TODO: revisit MXFP case
+        #     shared_mem = (block_size_m * block_size_k * a_sizeof + block_size_k * block_size_n * b_sizeof)
+        #     if(e > 1 and not load_scales_as_block): 
+        #         shared_mem += block_size_k * block_size_n * a_sizeof
+        #     shared_mem *= num_stages
+        #     if int(shared_mem) <= gpu_shared_memory:
+        #         break
+        #     num_stages -= 1
 
-        if(num_stages == 0): continue #config too large
+        # if(num_stages == 0): continue #config too large
 
+        split_k = max(split_k, 1)
         ###########################################
         if(load_scales_as_block):#tmp MXFP fix
             block_size_k = min(block_size_k, 256)
@@ -116,12 +120,20 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         key = (block_size_m, block_size_n, block_size_k, group_size_m, split_k, A_load_order, num_stages, num_warps)
         
+        even_m = (m % block_size_m == 0)
+        even_n = (n % block_size_n == 0)
+        even_k = (k % block_size_k == 0)
+
+
         new_config = {
             "BLOCK_SIZE_M": block_size_m,
             "BLOCK_SIZE_N": block_size_n,
             "BLOCK_SIZE_K": block_size_k,
             "GROUP_SIZE_M": group_size_m,
             "SPLIT_K": split_k,
+            "EVEN_M": even_m,
+            "EVEN_N": even_n,
+            "EVEN_K": even_k,
             "A_load_order": A_load_order,
             "NUM_STAGES": num_stages,
         }
@@ -195,7 +207,7 @@ def get_fast_autotune_config_nvidia():
     return configs
 
 def get_default_config_nvidia():
-    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':32, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2)]
+    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':64, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2)]
 
 ########################################################################################################################################################################
 #AMD - Instinct MI300X
@@ -247,7 +259,7 @@ def get_fast_autotune_config_amd():
     return configs
 
 def get_default_config_amd():
-    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':32, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2)]
+    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':64, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2)]
 ########################################################################################################################################################################
 
 if IS_HIP:
@@ -305,10 +317,19 @@ def gemm_splitK_INT_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr, NUM_STAGES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr, 
+    SPLIT_K: tl.constexpr, 
+    #################################
+    NUM_STAGES: tl.constexpr,
     A_load_order: tl.constexpr, 
     data_contiguous: tl.constexpr,
+    #################################
+    EVEN_M: tl.constexpr = False, 
+    EVEN_K: tl.constexpr = False, 
+    EVEN_N: tl.constexpr = False,
     #################################
     meta_evict_policy: tl.constexpr = '',
     atomic_mode: tl.constexpr = 'relaxed',
@@ -379,13 +400,19 @@ def gemm_splitK_INT_kernel(
 
     for k in range(num_pid_k):
 
-        if(A_load_order == 0): #Early load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+        if(A_load_order == 0): #Early load            
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
         b = tl.load(b_ptrs, eviction_policy=b_evict)
 
         if(A_load_order == 1): #Early load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
         
         #Meta-data loading policy
         if(W_group_mode > 0):
@@ -405,13 +432,19 @@ def gemm_splitK_INT_kernel(
             zeros = None
         
         if(A_load_order == 2): #Mid load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
         # Unpack and dequantize
         b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
         if(A_load_order == 3): #Late load 
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
         
         #Dot
         acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype) 
@@ -419,22 +452,25 @@ def gemm_splitK_INT_kernel(
         #Advance
         a_ptrs += BLOCK_SIZE_K_U * stride_ak
         b_ptrs += BLOCK_SIZE_K_P * stride_bk
+        
+        if not EVEN_K:
+            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
 
     #############################################################################################################
     #Channel-wise scaling
     if(channel_scale_mode == 1): #weight-only
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
-        acc      = acc.to(meta_dtype) * scales_b[None, :]
+        acc = acc.to(meta_dtype) * scales_b[None, :]
 
     if(channel_scale_mode == 2): #activation-only
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=meta_dtype)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+        acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
 
     if(channel_scale_mode == 3): #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+        acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
 
     #############################################################################################################
     #Output
@@ -473,8 +509,10 @@ def gemm_splitK_MX_kernel(
     stride_am, stride_ak,
     stride_bk, stride_bn,
     stride_cm, stride_cn,
-    stride_meta_a_m: tl.constexpr, stride_meta_a_g: tl.constexpr,
-    stride_meta_n: tl.constexpr, stride_meta_g: tl.constexpr,
+    stride_meta_a_m: tl.constexpr, 
+    stride_meta_a_g: tl.constexpr,
+    stride_meta_n: tl.constexpr, 
+    stride_meta_g: tl.constexpr,
     ######### Dtypes #########
     load_scales_as_block, #True | IF FALSE, RESTRICT BLOCK_SIZE_K <= 32
     input_dtype: tl.constexpr,
@@ -486,10 +524,19 @@ def gemm_splitK_MX_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
-    GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr, NUM_STAGES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr, 
+    GROUP_SIZE_M: tl.constexpr, 
+    SPLIT_K: tl.constexpr, 
+    NUM_STAGES: tl.constexpr,
+    #################################
     A_load_order: tl.constexpr,
     data_contiguous: tl.constexpr,
+    #################################
+    EVEN_M: tl.constexpr = False, 
+    EVEN_K: tl.constexpr = False, 
+    EVEN_N: tl.constexpr = False,
     #################################
     meta_evict_policy: tl.constexpr = 'evict_first',
     atomic_mode: tl.constexpr = 'relaxed',
@@ -542,16 +589,23 @@ def gemm_splitK_MX_kernel(
     BLOCK_SIZE_K_S: tl.constexpr = BLOCK_SIZE_K // group_size
     offs_k_scales = tl.arange(0, BLOCK_SIZE_K_S)
     offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    #B scales
-    scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
+    #B scales: [BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
+    scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g
 
     #A scales
     if(channel_scale_mode == 4):
         scales_a_ptrs = scales_a_ptr + offs_am[:, None] * stride_meta_a_m + offs_k_scales[None, :] * stride_meta_a_g
 
+    # Used in channel-wise MXPF8 version
+    scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+    
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-    for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
-        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+    for k in tl.range(num_pid_k):
+        if EVEN_M and EVEN_K:
+            a = tl.load(a_ptrs, eviction_policy=a_evict)
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            
         b = tl.load(b_ptrs, eviction_policy=b_evict)
 
         #k_m = ((k * SPLIT_K + pid_k) * stride_mul).to(tl.int32)
@@ -561,12 +615,15 @@ def gemm_splitK_MX_kernel(
         if(channel_scale_mode == 4):
             scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
         else:
-            scales_a = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+            scales_a = scales_a_1s
 
         acc = tl.dot_scaled(a, scales_a, a_dtype, b, scales_b, b_dtype, acc)
 
         a_ptrs += BLOCK_SIZE_K_A * stride_ak
         b_ptrs += BLOCK_SIZE_K_B * stride_bk
+        
+        if not EVEN_K:
+            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
 
     #NVFP4 meta-scale
     if(group_size == 16):
@@ -578,7 +635,7 @@ def gemm_splitK_MX_kernel(
         dtype: tl.constexpr = c_ptr.dtype.element_ty
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=dtype)
-        acc      = acc.to(dtype) * (scales_a[:, None] * scales_b[None, :])
+        acc = acc.to(dtype) * (scales_a[:, None] * scales_b[None, :])
 
     #############################################################################################################
     #Output

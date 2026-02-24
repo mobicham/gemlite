@@ -123,9 +123,8 @@ def gpu_supports_float16_acc(
 
 
 def gpu_supports_bfloat16_atomicadd():
-    #Triton tl.atomic_add doens't support bfloat16 even for Hopper and above. 
-    #return torch.cuda.get_device_capability()[0] >= 9 #Hopper and above
-    return False
+    #Triton tl.atomic_add doens't support bfloat16 on older GPUs.
+    return torch.cuda.get_device_capability()[0] >= 9 #Hopper and above
 
 NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 def get_num_SMs(device):

@@ -14,14 +14,14 @@ def is_fp8_supported(device_index=0):
 
 device        = 'cuda:0'
 compute_dtype = torch.bfloat16 #float16, bfloat16
-matmul_types  = ['GEMM'] #GEMM_SPLITK #TODO: add GEMV use-cases
+matmul_types  = ['GEMM_SPLITK', 'GEMM'] #GEMM_SPLITK #TODO: add GEMV use-cases
 reset_config()
 set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
 torch.random.manual_seed(0)
-in_features, out_features = 4032, 2000
-batch_sizes               = [50]
+in_features, out_features = 4032, 2048
+batch_sizes               = [30, 32, 60, 100, 128]
 linear_layer              = torch.nn.Linear(in_features=in_features, out_features=out_features, device=device, dtype=compute_dtype, bias=False)
 linear_layer.weight.data /= 10.
 linear_layer.weight.requires_grad = False
