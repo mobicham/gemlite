@@ -62,7 +62,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 
         #Constraints: BLOCK_SIZE_K <= group_size -> load_scales_as_block is always False for gemvs
         block_size_k = min(g, block_size_k) #Makes BLOCK_SIZE_K compatible with the group_size
-
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
@@ -241,11 +240,16 @@ def gemv_INT_kernel(
     type_id: tl.constexpr,
     use_prehook: tl.constexpr,
     ######### Strides #########
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_meta_a_m, stride_meta_a_g,
-    stride_meta_g, stride_meta_n,
+    stride_am: tl.constexpr, 
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, 
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, 
+    stride_cn: tl.constexpr,
+    stride_meta_a_m: tl.constexpr, 
+    stride_meta_a_g: tl.constexpr,
+    stride_meta_g: tl.constexpr, 
+    stride_meta_n: tl.constexpr,
     ######### Dtypes #########
     input_dtype: tl.constexpr,
     output_dtype: tl.constexpr,
@@ -256,11 +260,14 @@ def gemv_INT_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    A_load_order: tl.constexpr, NUM_STAGES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
+    A_load_order: tl.constexpr, 
+    NUM_STAGES: tl.constexpr,
     dot_prod_mode:tl.constexpr,
     data_contiguous: tl.constexpr,
-    dump_b_val: tl.constexpr = 0, #Improve accuracy mainly for A16W8 with post looop scaling
+    dump_b_val: tl.constexpr = 0, #Improve accuracy mainly for A16W8 with post loop scaling
     #####################################
     meta_evict_policy: tl.constexpr = '',
     atomic_mode: tl.constexpr = 'relaxed',
@@ -307,12 +314,17 @@ def gemv_INT_kernel(
         #orig version
         b_ptrs  = b_ptr + (offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn 
 
+    a_mask = (offs_am[:, None] < M) & (offs_ak[None, :] < K).to(tl.int1)
+    b_mask = (offs_bk[:, None] < K) & (offs_bn[None, :] < N).to(tl.int1)
+    #TODO: add EVEN_K / EVEN_N check
     ###################################################################
     #Load
     if(A_load_order == 0):
         a = tl.load(a_ptrs, eviction_policy=a_evict)
+        #a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
     b = tl.load(b_ptrs, eviction_policy=b_evict)
+    #b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
     if(A_load_order == 1):
         a = tl.load(a_ptrs, eviction_policy=a_evict)
@@ -354,10 +366,10 @@ def gemv_INT_kernel(
         a = tl.load(a_ptrs, eviction_policy=a_evict)
 
     if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
-
+        
     #Dot product
     if(dot_prod_mode == 0):
-        acc = tl.sum(a.reshape((BLOCK_SIZE_K, 1), can_reorder=False).to(acc_dtype) * b.to(acc_dtype), axis=0, keep_dims=True) 
+        acc = tl.sum((a.reshape((BLOCK_SIZE_K, 1), can_reorder=False).to(acc_dtype)) * b.to(acc_dtype), axis=0, keep_dims=True) 
     if(dot_prod_mode == 1):
         acc = tl.sum(a.reshape((BLOCK_SIZE_K, 1), can_reorder=False) * b.to(input_dtype), axis=0, keep_dims=True) 
 
@@ -380,12 +392,14 @@ def gemv_INT_kernel(
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
 
     ####################################################################
-    #Output: tl.atomic_add only supports 1D fp16 arrays, bfp16 would crash 
+    #Output
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
     tl.atomic_add(c_ptrs, acc, sem=atomic_mode) 
+
+
 @triton.autotune(
     configs=get_autotune_config(),
     key = KEYS,
@@ -408,11 +422,16 @@ def gemv_MX_kernel(
     type_id: tl.constexpr,
     use_prehook: tl.constexpr,
     ######### Strides #########
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_meta_a_m, stride_meta_a_g,
-    stride_meta_g, stride_meta_n,
+    stride_am: tl.constexpr, 
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, 
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, 
+    stride_cn: tl.constexpr,
+    stride_meta_a_m: tl.constexpr, 
+    stride_meta_a_g: tl.constexpr,
+    stride_meta_g: tl.constexpr, 
+    stride_meta_n: tl.constexpr,
     ######### Dtypes #########
     input_dtype: tl.constexpr,
     output_dtype: tl.constexpr,
@@ -423,8 +442,11 @@ def gemv_MX_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    A_load_order: tl.constexpr, NUM_STAGES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
+    A_load_order: tl.constexpr, 
+    NUM_STAGES: tl.constexpr,
     dot_prod_mode:tl.constexpr,
     data_contiguous: tl.constexpr,
     dump_b_val: tl.constexpr = 0, #Improve accuracy mainly for A16W8 with post looop scaling
@@ -474,6 +496,7 @@ def gemv_MX_kernel(
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak #[1, BLOCK_SIZE_K]
     b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn #[BLOCK_SIZE_K, BLOCK_SIZE_N]
     a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < (K // elements_per_sample_a))).to(tl.int1) 
+    b_mask = ((offs_bk[:, None] < (K // elements_per_sample)) & (offs_bn[None, :] < N)).to(tl.int1)
 
     if(W_nbits == 4): #mxpf4 mapping
         mapping = tl.load(mapping_ptr + tl.arange(0, 16), eviction_policy='evict_last')[None, :].broadcast_to((BLOCK_SIZE_K, 16))
@@ -484,6 +507,7 @@ def gemv_MX_kernel(
         a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
     b = tl.load(b_ptrs, eviction_policy=b_evict)
+    #b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
     if(A_load_order == 1):
         a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
@@ -591,8 +615,8 @@ def gemv_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         stride_meta_a_m, stride_meta_a_g = scales_x.stride(0), scales_x.stride(1)
     else:
         stride_meta_a_m, stride_meta_a_g = None, None
-        channel_scale_mode = 0
-
+        #channel_scale_mode = 0
+        
     dtype = DTYPE_TO_TRITON[input_dtype]
     if(dtype in [tl.float16, tl.bfloat16, tl.float32]):
         acc_dtype = dtype

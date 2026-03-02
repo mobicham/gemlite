@@ -59,7 +59,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-
         #tmp fix autotune getting stuck on the MI300X
         if IS_HIP:
             if block_size_n * block_size_k >= 65536:
@@ -68,9 +67,10 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         #Since we load the scales / zeros once per split_k pass, we need this
         while block_size_k >= 8 and (block_size_k * split_k > g):
            block_size_k //= 2
+        block_size_k = max(block_size_k, 8)
 
-        if(not (block_size_k * split_k <= g)):
-            continue
+        # if(not (block_size_k * split_k <= g)):
+        #     continue
 
         #Block size should be compatible with minimum-packing
         if(block_size_k < e):
@@ -92,7 +92,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         if key in used:
             continue
-
+        
         used.add(key)
         yield triton.Config(new_config, num_stages=num_stages, num_warps=num_warps, pre_hook=pre_hook)
 
@@ -120,6 +120,10 @@ def get_max_autotune_config_nvidia(): #~20 sec/shape
 
 def get_fast_autotune_config_nvidia():
     configs = []
+    #Default
+    configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':32, 'BLOCK_SIZE_K':16, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=1, num_stages=1))
+    
+    #Extra
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':16, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=1, num_stages=1))
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':32, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=2, num_stages=2))
     
@@ -236,10 +240,14 @@ def gemv_INT_revsplitK_kernel(
     type_id: tl.constexpr,
     use_prehook: tl.constexpr,
     ######### Strides #########
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_meta_g, stride_meta_n,
+    stride_am: tl.constexpr, 
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, 
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, 
+    stride_cn: tl.constexpr,
+    stride_meta_g: tl.constexpr, 
+    stride_meta_n: tl.constexpr,
     ######### Dtypes #########
     input_dtype: tl.constexpr,
     output_dtype: tl.constexpr,
@@ -250,7 +258,9 @@ def gemv_INT_revsplitK_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
     A_load_order: tl.constexpr, 
     dot_prod_mode: tl.constexpr,
     data_contiguous: tl.constexpr,

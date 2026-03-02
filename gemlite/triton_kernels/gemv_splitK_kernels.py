@@ -63,14 +63,15 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-        #K needs to be divisible by BLOCK_SIZE_K * SPLIT_K: TODO: without this, cuda-graphs breaks.
-        while block_size_k > 16 and not is_divisible(k, block_size_k * split_k):
-            block_size_k //=2
+        # #K needs to be divisible by BLOCK_SIZE_K * SPLIT_K: TODO: without this, cuda-graphs breaks.
+        # while block_size_k > 16 and not is_divisible(k, block_size_k * split_k):
+        #     block_size_k //=2
+        # block_size_k = min(block_size_k, 16)
 
-        #Skip blocks that are either too large or too small
-        block_area = (block_size_k // split_k) * block_size_n
-        if(block_area < 1024 or block_area > 4096 * 8): #128 * 8 * num_warps 
-            continue
+        # #Skip blocks that are either too large or too small
+        # block_area = (block_size_k // split_k) * block_size_n
+        # if(block_area < 1024 or block_area > 4096 * 8): #128 * 8 * num_warps 
+        #     continue
 
         #Block size should be compatible with minimum-packing
         if(block_size_k < e):
@@ -149,9 +150,7 @@ def get_fast_autotune_config_nvidia():
     return configs
 
 def get_default_config_nvidia():
-    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':2, 'BLOCK_SIZE_K':2048, 'GROUP_SIZE_M':8, 'SPLIT_K': 1, 
-                            'A_load_order':1, 'dot_prod_mode':0}, num_warps=4, num_stages=2)
-
+    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':2, 'BLOCK_SIZE_K':2048, 'GROUP_SIZE_M':8, 'SPLIT_K': 1, 'A_load_order':1, 'dot_prod_mode':0}, num_warps=4, num_stages=2)
     return [config]
 
 ########################################################################################################################################################################
@@ -249,10 +248,14 @@ def gemv_INT_splitK_kernel(
     elements_per_sample: tl.constexpr,
     type_id: tl.constexpr,
     ######### Strides #########
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_meta_g, stride_meta_n,
+    stride_am: tl.constexpr, 
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, 
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, 
+    stride_cn: tl.constexpr,
+    stride_meta_g: tl.constexpr, 
+    stride_meta_n: tl.constexpr,
     ######### Dtypes #########
     input_dtype: tl.constexpr,
     output_dtype: tl.constexpr,
@@ -263,8 +266,11 @@ def gemv_INT_splitK_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
     A_load_order: tl.constexpr, 
     dot_prod_mode: tl.constexpr,
     data_contiguous: tl.constexpr,
@@ -336,6 +342,8 @@ def gemv_INT_splitK_kernel(
         acc = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=acc_dtype)
     if(dot_prod_mode == 1):
         acc = tl.zeros((1, BLOCK_SIZE_N), dtype=acc_dtype)
+        
+    #TODO: EVEN_K / EVEN_N use-case
 
     #for k in tl.range(0, num_pid_k, 1, num_stages=1):
     for k in range(num_pid_k):

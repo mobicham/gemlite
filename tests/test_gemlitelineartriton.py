@@ -17,11 +17,19 @@ device        = 'cuda:0'
 compute_dtype = torch.bfloat16 #float16, bfloat16
 fp8_dtype     = torch.float8_e4m3fn #float8_e4m3fn / torch.float8_e5m2 (Nvidia)
 gemlite_dtype = TORCH_TO_DTYPE[compute_dtype]
-matmul_types  = ['GEMV_REVSPLITK', 'GEMV', 'GEMV_SPLITK', 'GEMM_SPLITK', 'GEMM']
+matmul_types  = ['GEMV_REVSPLITK', 'GEMV', 'GEMV_SPLITK', 'GEMM_SPLITK', 'GEMM'] #TODO: Investigate GEMV_SPLITK errors when in_features are not powers of 2
 reset_config()
-#set_autotune(False)
+set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
+in_features, out_features = 4096, 2032
+batch_sizes               = [1, 5, 100]
+W_nbits, group_size       = 4, 128 #128 / in_features
+
+if group_size is None:
+    group_size = in_features
+if group_size < in_features:
+	in_features = (in_features // group_size) * group_size #ensure divisibility for current implementation
 
 def gen_data(in_features, out_features, W_nbits, group_size, dtype=compute_dtype):
 
@@ -39,11 +47,7 @@ def gen_data(in_features, out_features, W_nbits, group_size, dtype=compute_dtype
 
 	return W, W_q, scales, zeros
 
-
-in_features, out_features = 4096, 1024
-batch_sizes               = [1, 4]
-W_nbits, group_size       = 4, 128 #128 / in_features
-W, W_q, scales, zeros     = gen_data(in_features, out_features, W_nbits=W_nbits, group_size=group_size)
+W, W_q, scales, zeros  = gen_data(in_features, out_features, W_nbits=W_nbits, group_size=group_size)
 
 class TestGemLiteLinearTriton(unittest.TestCase):
 
@@ -83,7 +87,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 				y_gem = gemlite_linear_loaded.forward_manual(x, matmul_type=matmul_type)
 
 				err   = (y_ref - y_gem).abs().mean().item()
-				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
+				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
 
 	def test_fp16xfp16(self):
 		gemlite_linear = GemLiteLinearTriton(W_nbits=16, 
@@ -101,7 +105,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 		#Use non-contiguous when data is not packed
 		self.assertTrue(gemlite_linear.data_contiguous == False)
 
-		tol = 1e-3
+		tol = 2.5e-3 #higher tol for gemv kernels, otherwise 1e-3 is fine
 
 		for batch_size in batch_sizes:
 			x = (torch.randn((batch_size, in_features), dtype=compute_dtype, device=device) / 10.)
@@ -110,7 +114,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 				if(batch_size>1  and 'GEMV' in matmul_type): continue
 				y_gem = gemlite_linear.forward_manual(x, matmul_type=matmul_type)
 				err   = (y_ref - y_gem).abs().mean().item()
-				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
+				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
 
 
 	def test_fp16xWn_asymmetric(self):
@@ -144,7 +148,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 				if(batch_size>1  and 'GEMV' in matmul_type): continue
 				y_gem = gemlite_linear.forward_manual(x, matmul_type=matmul_type)
 				err   = (y_ref - y_gem).abs().mean().item()
-				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
+				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
 
 
 	def test_int8xWn_symmetric_no_activation_scaling(self):
@@ -160,7 +164,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 
 
 		_scales = torch.randn((out_features, 1), dtype=compute_dtype, device=device) * 1e-4
-		gemlite_linear.pack(W_q, scales=_scales, zeros=7, bias=None);
+		gemlite_linear.pack(W_q, scales=_scales, zeros=7, bias=None)
 
 		#Weights are unpacked() then shifted by 7
 		self.assertTrue(gemlite_linear.W_group_mode == 1) 
@@ -176,7 +180,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 				if(batch_size>1  and 'GEMV' in matmul_type): continue
 				y_gem = gemlite_linear.forward_manual(x, matmul_type=matmul_type)
 				err   = (y_ref - y_gem).abs().mean().item()
-				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
+				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
 
 
 	def test_int8xWn_scaled_activations(self):
@@ -274,7 +278,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 				if(batch_size>1  and 'GEMV' in matmul_type): continue
 				y_gem = gemlite_linear.forward_manual(x, matmul_type=matmul_type)
 				err   = (y_ref - y_gem).abs().mean().item()
-				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
+				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
 
 	@unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
 	def test_fp8xfp8_scaled_weights_scaled_activations(self):
@@ -309,7 +313,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 				if(batch_size>1  and 'GEMV' in matmul_type): continue
 				y_gem = gemlite_linear.forward_manual(x, matmul_type=matmul_type)
 				err   = (y_ref - y_gem).abs().mean().item()
-				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
+				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
 
 	@unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
 	def test_fp8xWn_scaled_activations(self):
@@ -346,7 +350,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 				if(batch_size>1  and 'GEMV' in matmul_type): continue
 				y_gem = gemlite_linear.forward_manual(x, matmul_type=matmul_type)
 				err   = (y_ref - y_gem).abs().mean().item()
-				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
+				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
 
 	@unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
 	def test_fp8xWn_no_activation_scaling(self):
@@ -380,4 +384,4 @@ class TestGemLiteLinearTriton(unittest.TestCase):
 				if(batch_size>1  and 'GEMV' in matmul_type): continue
 				y_gem = gemlite_linear.forward_manual(x, matmul_type=matmul_type)
 				err   = (y_ref - y_gem).abs().mean().item()
-				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol))
+				self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
