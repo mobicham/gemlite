@@ -100,7 +100,7 @@ def set_acc_dtype(dtype):
 def get_default_gemv(W_nbits: int, mx_dtype: bool = False) -> str:
     #TODO: adapt mx for IS_HIP = True
     if mx_dtype: 
-        return 'GEMM_SPLITK' #TODO: fix mxf bugs in GEMV outputs garbage.
+        return 'GEMM_SPLITK' #TODO:'GEMV' if (W_nbits < 8) else 'GEMM_SPLITK' -> Revisit NVFP4 failing test.
     else:
         return 'GEMV_REVSPLITK' if (W_nbits < 8) else 'GEMV_SPLITK'
 
@@ -121,7 +121,7 @@ def enable_activation_scaling(batch_size):
     Only works with the MXFP format - use with A8W4_MXFP/A4W4_MXFP.
     """
     return True
-    #return batch_size >= 32
+    #return batch_size >= 2 #TODO: Needs Triton fix https://github.com/triton-lang/triton/pull/9577
 
 
 #Main functional forward call
