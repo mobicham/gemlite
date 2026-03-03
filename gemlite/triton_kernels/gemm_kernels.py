@@ -628,7 +628,11 @@ def gemm_INT_kernel_persistent_tma(
         #############################################################################################################
         # Store
         c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        tl.store(c_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+        mask = (m_mask[:, None] & n_mask[None, :]).to(tl.int1)
+        if EVEN_M and EVEN_N:
+            tl.store(c_ptrs, acc)
+        else:
+            tl.store(c_ptrs, acc, mask=mask)
 
 @triton.autotune(
     configs = get_autotune_config(),
@@ -850,7 +854,10 @@ def gemm_MX_kernel(
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
         mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
-        tl.store(c_ptrs, acc, mask=mask)
+        if EVEN_M and EVEN_N:
+            tl.store(c_ptrs, acc)
+        else:
+            tl.store(c_ptrs, acc, mask=mask)
     
 
 PRINTED = False

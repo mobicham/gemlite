@@ -87,9 +87,9 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-        #Constraint: K needs to be divisible by BLOCK_SIZE_K * SPLIT_K 
-        while split_k > 1 and not is_divisible(k, block_size_k * split_k):
-            split_k //= 2
+        # #Constraint: K needs to be divisible by BLOCK_SIZE_K * SPLIT_K 
+        # while split_k > 1 and not is_divisible(k, block_size_k * split_k):
+        #     split_k //= 2
 
         #Nvidia
         if not IS_HIP:
@@ -100,8 +100,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 #skip num_stages=1 for non-packed weights
                 continue
 
-        # #Avoid OOM
-        # while num_stages > 0: #TODO: revisit MXFP case
+        # #Avoid OOM: TODO: come up with a better logic, this is too conservative.
+        # while num_stages > 0:
         #     shared_mem = (block_size_m * block_size_k * a_sizeof + block_size_k * block_size_n * b_sizeof)
         #     if(e > 1 and not load_scales_as_block): 
         #         shared_mem += block_size_k * block_size_n * a_sizeof
@@ -114,7 +114,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         split_k = max(split_k, 1)
         ###########################################
-        if(load_scales_as_block):#tmp MXFP fix
+        if(load_scales_as_block): #TODO: tmp MXFP TMA fix
             block_size_k = min(block_size_k, 256)
         ###########################################
 
@@ -123,7 +123,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         even_m = (m % block_size_m == 0)
         even_n = (n % block_size_n == 0)
         even_k = (k % block_size_k == 0)
-
 
         new_config = {
             "BLOCK_SIZE_M": block_size_m,
@@ -478,12 +477,18 @@ def gemm_splitK_INT_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    mask    = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
 
     if(SPLIT_K > 1):
-        tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
+        if EVEN_M and EVEN_N:
+            tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+        else:
+            tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
     else:
-        tl.store(c_ptrs, acc, mask=mask) 
+        if EVEN_M and EVEN_N:
+            tl.store(c_ptrs, acc)
+        else:
+            tl.store(c_ptrs, acc, mask=mask)
 
 @triton.autotune(
     configs=get_autotune_config(),
@@ -645,9 +650,15 @@ def gemm_splitK_MX_kernel(
     mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
 
     if(SPLIT_K > 1):
-        tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
+        if EVEN_M and EVEN_N:
+            tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+        else:
+            tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
     else:
-        tl.store(c_ptrs, acc, mask=mask)
+        if EVEN_M and EVEN_N:
+            tl.store(c_ptrs, acc)
+        else:
+            tl.store(c_ptrs, acc, mask=mask) 
 
 def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
                         W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int,
