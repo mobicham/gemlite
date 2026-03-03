@@ -37,6 +37,10 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_dec_producer', None)
             config.pop('reg_inc_consumer', None)
 
+            config['EVEN_M'] = (m % config['BLOCK_SIZE_M'] == 0)
+            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
+            config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+
             yield triton.Config(config,
                 num_stages=num_stages,
                 num_warps=num_warps,
@@ -77,6 +81,10 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         if(block_size_k < e):
             continue
 
+        even_m = (m % block_size_m == 0)
+        even_n = (n % block_size_n == 0)
+        even_k = (k % block_size_k == 0)
+
         key = (block_size_m, block_size_n, block_size_k, group_size_m, split_k, A_load_order, dot_prod_mode, num_stages, num_warps)
         
         new_config = {
@@ -87,6 +95,9 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             'SPLIT_K'     : split_k,
             'A_load_order'  : A_load_order,
             'dot_prod_mode' : dot_prod_mode,
+            'EVEN_M': even_m,
+            'EVEN_N': even_n,
+            'EVEN_K': even_k,
         }
 
         if IS_HIP:
@@ -254,6 +265,8 @@ def gemv_INT_splitK_kernel(
     stride_bn: tl.constexpr,
     stride_cm: tl.constexpr, 
     stride_cn: tl.constexpr,
+    stride_meta_a_m: tl.constexpr, 
+    stride_meta_a_g: tl.constexpr,
     stride_meta_g: tl.constexpr, 
     stride_meta_n: tl.constexpr,
     ######### Dtypes #########
@@ -275,6 +288,10 @@ def gemv_INT_splitK_kernel(
     dot_prod_mode: tl.constexpr,
     data_contiguous: tl.constexpr,
     dump_b_val: tl.constexpr = 0, #Improve accuracy mainly for A16W8 with post looop scaling
+    #################################
+    EVEN_M: tl.constexpr = False, 
+    EVEN_K: tl.constexpr = False, 
+    EVEN_N: tl.constexpr = False,
     #################################
     meta_evict_policy: tl.constexpr = '',
     atomic_mode: tl.constexpr = 'relaxed',
@@ -321,9 +338,9 @@ def gemv_INT_splitK_kernel(
 
     #Inputs
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)  
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
     b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn)
-
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
+        
     #Meta data stuff
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
 
@@ -342,19 +359,23 @@ def gemv_INT_splitK_kernel(
         acc = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=acc_dtype)
     if(dot_prod_mode == 1):
         acc = tl.zeros((1, BLOCK_SIZE_N), dtype=acc_dtype)
-        
-    #TODO: EVEN_K / EVEN_N use-case
 
     #for k in tl.range(0, num_pid_k, 1, num_stages=1):
     for k in range(num_pid_k):
 
         if(A_load_order == 0): #Early load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
 
         b = tl.load(b_ptrs, eviction_policy=b_evict)
 
         if(A_load_order == 1): #Early load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
 
         if(W_group_mode > 0):
             k_m = ((k * SPLIT_K + pid_k) * stride_mul).to(tl.int32) 
@@ -373,13 +394,19 @@ def gemv_INT_splitK_kernel(
             zeros = None
         
         if(A_load_order == 2): #Mid load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
         # Unpack and dequantize
         b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
         if(A_load_order == 3): #Late load 
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
         if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
 
@@ -391,6 +418,10 @@ def gemv_INT_splitK_kernel(
         #Advance
         a_ptrs += BLOCK_SIZE_K_U * stride_ak
         b_ptrs += BLOCK_SIZE_K_P * stride_bk
+        
+        #Update mask
+        if not EVEN_K:
+            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_U) < K)).to(tl.int1)
 
     if(dot_prod_mode == 0):
         acc = tl.sum(acc, axis=0, keep_dims=True) 
@@ -445,6 +476,13 @@ def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
     
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), META['SPLIT_K'])
 
+    device_index = W_q.device.index
+
+    if(scales_x is not None):
+        stride_meta_a_m, stride_meta_a_g = scales_x.stride(0), scales_x.stride(1)
+    else:
+        stride_meta_a_m, stride_meta_a_g = None, None
+        
     dtype = DTYPE_TO_TRITON[input_dtype]
     if(dtype in [tl.float16, tl.bfloat16, tl.float32]):
         acc_dtype = dtype
@@ -464,6 +502,7 @@ def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         x.stride(0), x.stride(1),
         W_q.stride(0), W_q.stride(1),
         output.stride(0), output.stride(1),
+        stride_meta_a_m, stride_meta_a_g,
         scales.stride(0), scales.stride(1),
         ################################################
         input_dtype  = DTYPE_TO_TRITON[input_dtype],
@@ -489,4 +528,3 @@ class gemv_splitK:
     matmul_type = MATMUL_TYPE
 
 __all__ = ["gemv_splitK"]
-
