@@ -733,6 +733,7 @@ def gemm_MX_kernel(
             [stride_bn, stride_bk],
             [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
         )
+        
     
     # # 2. 5D TMA Descriptors for Scales: #(8388608, 65536, 512, 256, 1) torch.Size([1, 128, 128, 2, 256])
     # rep_m: tl.constexpr = BLOCK_SIZE_M // 128
@@ -773,7 +774,7 @@ def gemm_MX_kernel(
         # Load A and B tiles        
         if use_tma:
             a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
-            b = tl.load_tensor_descriptor(b_desc, [k * BLOCK_SIZE_K_B, pid_n * BLOCK_SIZE_N]).T
+            b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_B]).T
         else:
             if EVEN_M and EVEN_K:
                 a = tl.load(a_ptrs, eviction_policy=a_evict) 
