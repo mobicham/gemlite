@@ -14,7 +14,7 @@ def is_fp8_supported(device_index=0):
 
 device        = 'cuda:0'
 compute_dtype = torch.bfloat16 #float16, bfloat16
-matmul_types  = ['GEMM_SPLITK', 'GEMM'] #TODO: improve GEMV mxfp accuracy.
+matmul_types  = ['GEMM', 'GEMM_SPLITK'] #TODO: improve GEMV mxfp accuracy.
 reset_config()
 set_autotune(False)
 KERNEL.ENABLE_CACHING = False

@@ -538,6 +538,7 @@ def gemm_splitK_MX_kernel(
     b_evict: tl.constexpr = 'evict_first',
     meta_scale_norm: tl.constexpr = (0.05 ** 2),
     #################################
+    use_tma: tl.constexpr = False,
 ):
     pid   = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -590,17 +591,53 @@ def gemm_splitK_MX_kernel(
     if(channel_scale_mode == 4):
         scales_a_ptrs = scales_a_ptr + offs_am[:, None] * stride_meta_a_m + offs_k_scales[None, :] * stride_meta_a_g
 
+
+    if use_tma:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            [M, K // elements_per_sample_a],
+            [stride_am, stride_ak],
+            [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
+        )
+        
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            [N, K // elements_per_sample],
+            [stride_bn, stride_bk],
+            [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
+        )
+        
+        # 2D TMA - transposed
+        # scales_a_desc = tl.make_tensor_descriptor(                                                                                                              
+        #     scales_a_ptr,                                                                                                                                       
+        #     [M, K // group_size],                                                                                                                               
+        #     [stride_meta_a_m, stride_meta_a_g],                   
+        #     [BLOCK_SIZE_M, BLOCK_SIZE_K_S],
+        # )
+
+        scales_b_desc = tl.make_tensor_descriptor(
+            scales_ptr,
+            [K // group_size, N],
+            [stride_meta_g, stride_meta_n],
+            [BLOCK_SIZE_K_S, BLOCK_SIZE_N],
+        )
+
     # Used in channel-wise MXPF8 version
     scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+    scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
     
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k):
-        if EVEN_M and EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict)
+        if use_tma:
+            a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
+            b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_B]).T
         else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
-            
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict)
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+                
+            b = tl.load(b_ptrs, eviction_policy=b_evict)
 
         #k_m = ((k * SPLIT_K + pid_k) * stride_mul).to(tl.int32)
         k_m = (k * SPLIT_K + pid_k) * BLOCK_SIZE_K_S #OK for BLOCK_SIZE_K >=group_size
@@ -616,8 +653,9 @@ def gemm_splitK_MX_kernel(
         a_ptrs += BLOCK_SIZE_K_A * stride_ak
         b_ptrs += BLOCK_SIZE_K_B * stride_bk
         
-        if not EVEN_K:
-            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
+        if not use_tma:
+            if not EVEN_K:
+                a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
 
     #NVFP4 meta-scale
     if(group_size == 16):
@@ -654,7 +692,8 @@ def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
                         channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 
                         ) -> Tensor: 
         
-    M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1]
+    M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
+    #M, K, N = x.shape[0], W_q.shape[1] * elements_per_sample, W_q.shape[0] #W.T
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
 
     M_CLOSEST = get_closest_m(M)

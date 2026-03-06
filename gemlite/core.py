@@ -507,9 +507,9 @@ class GemLiteLinearTriton(torch.nn.Module):
             else:
                 group_size = self.W_q.numel() // self.scales.numel()
             
-            self.W_q = self.W_q.contiguous().T #Transposed for tma
+            #self.W_q = self.W_q.contiguous().T #Transposed for tma
             
-            # #self.scales = self.scales.contiguous().T # Transposed 2D TMA layout
+            #self.scales = self.scales.contiguous().T # Transposed 2D TMA layout
             # #self.scales = self.scales.reshape(1, N // 128, K // group_size // 4, 2, 256).contiguous() # 5D TMA layout for the scales:        
             
             # #print(self.scales.stride(), self.scales.shape)

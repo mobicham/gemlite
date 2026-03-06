@@ -77,11 +77,12 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             # if block_size_n % 128 > 0:
             #     block_size_n = 128
             # if block_size_k % 128 > 0:
-            #     block_size_k = 128    
+            #     block_size_k = 128
             if(e > 1):
                 block_size_k = max(block_size_k, 64) #m16n8k64
             else:
                 block_size_k = max(block_size_k, 32) #m16n8k32
+                #block_size_k = max(block_size_k, 128) #TMA
         else:
             block_size_k = min(block_size_k, g)
 
@@ -717,7 +718,6 @@ def gemm_MX_kernel(
     offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
     
-    
     if use_tma:
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
@@ -725,8 +725,7 @@ def gemm_MX_kernel(
             [stride_am, stride_ak],
             [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
         )
-
-        # Transposed
+        
         b_desc = tl.make_tensor_descriptor(
             b_ptr,
             [N, K // elements_per_sample],
@@ -734,7 +733,21 @@ def gemm_MX_kernel(
             [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
         )
         
-    
+        # 2D TMA - transposed
+        # scales_a_desc = tl.make_tensor_descriptor(                                                                                                              
+        #     scales_a_ptr,                                                                                                                                       
+        #     [M, K // group_size],                                                                                                                               
+        #     [stride_meta_a_m, stride_meta_a_g],                   
+        #     [BLOCK_SIZE_M, BLOCK_SIZE_K_S],
+        # )
+
+        scales_b_desc = tl.make_tensor_descriptor(
+            scales_ptr,
+            [K // group_size, N],
+            [stride_meta_g, stride_meta_n],
+            [BLOCK_SIZE_K_S, BLOCK_SIZE_N],
+        )
+            
     # # 2. 5D TMA Descriptors for Scales: #(8388608, 65536, 512, 256, 1) torch.Size([1, 128, 128, 2, 256])
     # rep_m: tl.constexpr = BLOCK_SIZE_M // 128
     # rep_n: tl.constexpr = BLOCK_SIZE_N // 128
@@ -754,20 +767,13 @@ def gemm_MX_kernel(
     #     [1, rep_n, rep_k, 2, 256]
     # )
     
-    # # 2D TMA - transposed
-    # scales_b_desc = tl.make_tensor_descriptor(
-    #     scales_ptr,
-    #     [K // group_size, N],
-    #     [stride_meta_g, stride_meta_n],
-    #     [BLOCK_SIZE_K_S, BLOCK_SIZE_N],
-    # )
-
     #B-scales
     if(channel_scale_mode == 4):
         scales_a_ptrs = scales_a_ptr + offs_am[:, None] * stride_meta_a_m + offs_k_scales[None, :] * stride_meta_a_g
     
     # Used in channel-wise MXPF8 version
     scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+    scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
@@ -788,7 +794,7 @@ def gemm_MX_kernel(
         scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
                 
         # # 2D TMA
-        # scales_b = tl.load_tensor_descriptor(scales_b_desc, [k * BLOCK_SIZE_K_S, pid_n * BLOCK_SIZE_N]).T
+        #scales_b = tl.load_tensor_descriptor(scales_b_desc, [k * BLOCK_SIZE_K_S, pid_n * BLOCK_SIZE_N]).T
         
         # 5D Scale Loads and Unpacking
         # offs_scale_m = pid_m * rep_m
@@ -801,6 +807,7 @@ def gemm_MX_kernel(
         
         if(channel_scale_mode == 4):
             scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
+            #scales_a = tl.load_tensor_descriptor(scales_a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_S])
         else:
             scales_a = scales_a_1s
         ####################################################################################
@@ -854,7 +861,8 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
     
     
     global PRINTED
-    M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1]
+    M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
+    #M, K, N = x.shape[0], W_q.shape[1] * elements_per_sample, W_q.shape[0] #W.T
     M_CLOSEST = get_closest_m(M)
     
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
