@@ -227,7 +227,7 @@ Examples:
         cleanup(model)
 
     # ---- PyTorch Native INT8 dynamic reference ----
-    if M >= 16:
+    if M > 16:
         model = get_model(K, N, repeat=repeat)
         patch_model_native_int8(model)
         model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
