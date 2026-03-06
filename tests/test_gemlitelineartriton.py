@@ -23,7 +23,7 @@ set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
 in_features, out_features = 4032, 2032
-batch_sizes               = [1, 5, 100]
+batch_sizes               = [1, 3, 5, 100]
 W_nbits, group_size       = 4, 128 #128 / in_features
 
 if group_size is None:

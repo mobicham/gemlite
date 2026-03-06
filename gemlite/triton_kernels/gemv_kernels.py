@@ -49,7 +49,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('num_consumer_groups', None)
             config.pop('reg_dec_producer', None)
             config.pop('reg_inc_consumer', None)
-            configs['NUM_STAGES'] = num_stages
+            config['NUM_STAGES'] = num_stages
 
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps, pre_hook=pre_hook)
             return
@@ -140,6 +140,8 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64,  'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=2))
 
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':64,  'A_load_order':0, 'dot_prod_mode':0}, num_warps=2, num_stages=1))
+    
+    configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':1024,'BLOCK_SIZE_K':32, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=1))
     return configs
 
 
@@ -377,16 +379,15 @@ def gemv_INT_kernel(
 
     ##################################################################
     #Channel-wise scaling
-    if(channel_scale_mode == 1): #weight-only
+    if channel_scale_mode == 1: #weight-only
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * scales_b[None, :]
 
-    if(channel_scale_mode == 2): #activation-only
+    if channel_scale_mode == 2: #activation-only
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=meta_dtype)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+        acc = acc.to(meta_dtype) * scales_a[:, None]
 
-    if(channel_scale_mode == 3): #weight + activation
+    if channel_scale_mode == 3: #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N,   other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])

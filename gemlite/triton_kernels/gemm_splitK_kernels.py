@@ -447,15 +447,15 @@ def gemm_splitK_INT_kernel(
 
     #############################################################################################################
     #Channel-wise scaling
-    if(channel_scale_mode == 1): #weight-only
+    if channel_scale_mode == 1: #weight-only
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc = acc.to(meta_dtype) * scales_b[None, :]
 
-    if(channel_scale_mode == 2): #activation-only
+    if channel_scale_mode == 2: #activation-only
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         acc = acc.to(meta_dtype) * scales_a[:, None]
 
-    if(channel_scale_mode == 3): #weight + activation
+    if channel_scale_mode == 3: #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])

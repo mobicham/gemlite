@@ -21,7 +21,7 @@ KERNEL.ENABLE_CACHING = False
 
 torch.random.manual_seed(0)
 in_features, out_features = 4032, 2048
-batch_sizes               = [1, 30, 32, 60, 100, 128]
+batch_sizes               = [1, 3, 30, 32, 60, 100, 128]
 linear_layer              = torch.nn.Linear(in_features=in_features, out_features=out_features, device=device, dtype=compute_dtype, bias=False)
 linear_layer.weight.data /= 10.
 linear_layer.weight.requires_grad = False

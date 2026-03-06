@@ -44,7 +44,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
     used = set()
     for config in configs:
-        block_size_m = 1 #Only 1 allowed here
+        block_size_m = 1 #next_power_of_2(m) #Only 1 allowed here
         block_size_n = min(n, config.kwargs['BLOCK_SIZE_N'])
         block_size_k = min(k, config.kwargs['BLOCK_SIZE_K'])
         split_k      = 2
@@ -142,6 +142,8 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':16, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=2))
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':32, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=1))
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':64, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=2))
+    
+    configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':1024, 'BLOCK_SIZE_K':32, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=1))
     return configs
 
 
@@ -374,16 +376,15 @@ def gemv_INT_revsplitK_kernel(
     if(dump_b_val > 0): acc /= dump_b_val
     ############################################################################################################
     #Channel-wise scaling
-    if(channel_scale_mode == 1): #weight-only
+    if channel_scale_mode == 1: #weight-only
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * scales_b[None, :]
 
-    if(channel_scale_mode == 2): #activation-only
+    if channel_scale_mode == 2: #activation-only
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=meta_dtype)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
-
-    if(channel_scale_mode == 3): #weight + activation
+        acc = acc.to(meta_dtype) * scales_a[:, None]
+        
+    if channel_scale_mode == 3: #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])

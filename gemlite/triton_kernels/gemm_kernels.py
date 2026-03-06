@@ -85,7 +85,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         else:
             block_size_k = min(block_size_k, g)
 
-
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
 
         if not IS_HIP:
@@ -600,11 +599,11 @@ def gemm_INT_kernel_persistent_tma(
             scales_b = tl.load(scales_ptr + offs_n, mask=n_mask, other=1.0, eviction_policy=meta_evict_policy)
             acc = acc.to(meta_dtype) * scales_b[None, :]
 
-        elif channel_scale_mode == 2:  # activation-only
+        if channel_scale_mode == 2:  # activation-only
             scales_a = tl.load(scales_a_ptr + offs_m, mask=m_mask, other=1.0, eviction_policy=meta_evict_policy)
             acc = acc.to(meta_dtype) * scales_a[:, None]
 
-        elif channel_scale_mode == 3:  # weight + activation
+        if channel_scale_mode == 3:  # weight + activation
             scales_a = tl.load(scales_a_ptr + offs_m, mask=m_mask, other=1.0, eviction_policy=meta_evict_policy)
             scales_b = tl.load(scales_ptr + offs_n, mask=n_mask, other=1.0, eviction_policy=meta_evict_policy)
             acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])

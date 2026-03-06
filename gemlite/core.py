@@ -108,7 +108,8 @@ def get_default_gemv(W_nbits: int, mx_dtype: bool = False) -> str:
 def get_matmul_type(batch_size: int, W_nbits: int, mx_dtype: bool = False):
     if batch_size > 64:
         return "GEMM"
-    if batch_size > 1:
+    gemv_limit = 4 if (W_nbits < 8 and not mx_dtype) else 2 # previous 1
+    if batch_size > gemv_limit:
         return "GEMM_SPLITK"
     else:
         return get_default_gemv(W_nbits, mx_dtype)
