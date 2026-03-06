@@ -597,14 +597,21 @@ def gemm_splitK_MX_kernel(
             a_ptr,
             [M, K // elements_per_sample_a],
             [stride_am, stride_ak],
-            [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
+            [BLOCK_SIZE_M, BLOCK_SIZE_K_A_E]
         )
         
         b_desc = tl.make_tensor_descriptor(
             b_ptr,
             [N, K // elements_per_sample],
             [stride_bn, stride_bk],
-            [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
+            [BLOCK_SIZE_N, BLOCK_SIZE_K_B_E]
+        )
+
+        c_desc = tl.make_tensor_descriptor(                   
+            c_ptr,
+            [M, N],
+            [stride_cm, stride_cn],
+            [BLOCK_SIZE_M, BLOCK_SIZE_N]
         )
         
         # 2D TMA - transposed
@@ -629,8 +636,8 @@ def gemm_splitK_MX_kernel(
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k):
         if use_tma:
-            a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
-            b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_B]).T
+            a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, (k * SPLIT_K + pid_k) * BLOCK_SIZE_K_A_E])
+            b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, (k * SPLIT_K + pid_k) * BLOCK_SIZE_K_B_E]).T
         else:
             if EVEN_M and EVEN_K:
                 a = tl.load(a_ptrs, eviction_policy=a_evict)
@@ -667,7 +674,7 @@ def gemm_splitK_MX_kernel(
         dtype: tl.constexpr = c_ptr.dtype.element_ty
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1.0, eviction_policy=meta_evict_policy)
         acc = acc.to(dtype) * scales_a[:, None]
-
+        
     #############################################################################################################
     #Output
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -679,12 +686,15 @@ def gemm_splitK_MX_kernel(
         if EVEN_M and EVEN_N:
             tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
         else:
-            tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
+            tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode)
     else:
-        if EVEN_M and EVEN_N:
-            tl.store(c_ptrs, acc)
+        if use_tma:
+            tl.store_tensor_descriptor(c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], value=acc)
         else:
-            tl.store(c_ptrs, acc, mask=mask) 
+            if EVEN_M and EVEN_N:
+                tl.store(c_ptrs, acc)
+            else:
+                tl.store(c_ptrs, acc, mask=mask)
 
 def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
                         W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int,

@@ -733,6 +733,13 @@ def gemm_MX_kernel(
             [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
         )
         
+        c_desc = tl.make_tensor_descriptor(
+            c_ptr,
+            [M, N],
+            [stride_cm, stride_cn],
+            [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        )
+        
         # 2D TMA - transposed
         # scales_a_desc = tl.make_tensor_descriptor(                                                                                                              
         #     scales_a_ptr,                                                                                                                                       
@@ -834,12 +841,6 @@ def gemm_MX_kernel(
     #############################################################################################################
     #Output
     if use_tma:
-        c_desc = tl.make_tensor_descriptor(
-            c_ptr,
-            [M, N],
-            [stride_cm, stride_cn],
-            [BLOCK_SIZE_M, BLOCK_SIZE_N]
-        )
         tl.store_tensor_descriptor(c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], value=acc)
     else:
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
