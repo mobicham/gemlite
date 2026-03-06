@@ -671,7 +671,7 @@ def gemm_MX_kernel(
     b_evict: tl.constexpr = "",
     meta_scale_norm: tl.constexpr = (0.05 ** 2),
     #################################
-    use_tma: tl.constexpr = False,
+    use_tma: tl.constexpr = True,
 ):
 
     pid = tl.program_id(axis=0)
