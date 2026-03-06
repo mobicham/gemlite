@@ -108,7 +108,7 @@ def is_divisible(dividend, divisor):
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
-def gpu_has_more_shared_memory(ref_gpus = ["a100", "h100", "h200", "h20", "h800", "b100", "b200"]): 
+def gpu_has_more_shared_memory(ref_gpus = ["a100", "h100", "h200", "h20", "h800", "b100", "b200", "b300", "6000"]): 
     gpu_name = torch.cuda.get_device_properties(0).name.lower()
     return True in [g in gpu_name for g in ref_gpus]
 
@@ -121,6 +121,24 @@ def gpu_supports_float16_acc(
     gpu_name = torch.cuda.get_device_properties(0).name.lower()
     return True in [g in gpu_name for g in ref_gpus]
 
+def estimate_shared_memory_per_block(block_size_m, block_size_n, block_size_k, a_sizeof, b_sizeof, num_stages, e, g, load_scales_as_block):
+    a_smem = block_size_m * block_size_k * a_sizeof
+    if load_scales_as_block:
+        # MX kernels: dot_scaled handles scaling natively, no dequant buffer
+        b_smem = (block_size_k // e) * block_size_n * b_sizeof
+        # scales: (BLOCK_N, BLOCK_K // group_size) × meta_sizeof
+        s_smem = block_size_n * (block_size_k // g) * 1  # uint8 or e4m3 = 1 byte
+        estimated_smem = (a_smem + b_smem + s_smem) * max(num_stages - 1, 1)
+    elif e > 1:
+        # INT packed: need packed B + dequantized B for MMA
+        b_smem = (block_size_k // e) * block_size_n * b_sizeof
+        b_smem += block_size_k * block_size_n * a_sizeof
+        estimated_smem = int((a_smem + b_smem) * num_stages * 1.20)
+    else:
+        # INT unpacked (8-bit): exact formula
+        b_smem = block_size_k * block_size_n * b_sizeof
+        estimated_smem = (a_smem + b_smem) * max(num_stages - 1, 1)
+    return estimated_smem
 
 def gpu_supports_bfloat16_atomicadd():
     #Triton tl.atomic_add doens't support bfloat16 on older GPUs.

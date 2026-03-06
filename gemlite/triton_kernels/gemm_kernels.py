@@ -79,43 +79,32 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
-        
         ######################################################
         # # FOR TMA 
         # if block_size_n % 128 > 0:
         #     block_size_n = 128
         # if block_size_k % 128 > 0:
         #     block_size_k = 128
+        
+        if(load_scales_as_block): #tmp MXFP fix with TMA
+            block_size_k = max(block_size_k, 64)
+            block_size_n = max(block_size_n, 64)
         ######################################################
 
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
 
-        # #Nvidia
-        # if not IS_HIP:
-        #     if e > 1 and not load_scales_as_block:
-        #         #Limit num stages when data is packed
-        #         num_stages = min(num_stages, 4)
-        #     if(e == 1 and num_stages == 1): 
-        #         #skip num_stages=1 for non-packed weights
-        #         continue
-
-        # #Avoid OOM
-        # while num_stages > 0 and not load_scales_as_block: #TODO: revisit MXFP case
-        #     shared_mem = (block_size_m * block_size_k * a_sizeof + block_size_k * block_size_n * b_sizeof)
-        #     if(e > 1): 
-        #         shared_mem += block_size_k * block_size_n * a_sizeof
-        #     shared_mem *= num_stages
-        #     if int(shared_mem) <= gpu_shared_memory:
-        #         break
-        #     num_stages -= 1
-
-        if(num_stages == 0): continue #config too large
-
-        ###########################################
-        if(load_scales_as_block):#tmp MXFP fix with TMA
-            block_size_k = max(block_size_k, 64)
-            block_size_n = max(block_size_n, 64)
-        ###########################################
+        if not IS_HIP:
+            if e == 1 and num_stages == 1:
+                continue
+        
+        # Prune configs that exceed shared memory
+        estimated_smem = estimate_shared_memory_per_block(
+            block_size_m, block_size_n, block_size_k,
+            a_sizeof, b_sizeof, num_stages, e, g,
+            load_scales_as_block
+        )
+        if estimated_smem > gpu_shared_memory:
+            continue
 
         key = (block_size_m, block_size_n, block_size_k, group_size_m, A_load_order, num_stages, num_warps)
         
@@ -185,10 +174,8 @@ def get_fast_autotune_config_nvidia():
     
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=4))
-
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=3))
     
-    #
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
@@ -197,9 +184,14 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     
+    #MXFP/NVFP
     configs.append(triton.Config({'BLOCK_SIZE_M':256, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':32,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':256, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':256, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
+    
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
     return configs
 
 def get_default_config_nvidia():
@@ -451,8 +443,7 @@ def gemm_INT_kernel(
 
     if(channel_scale_mode == 2): #activation-only
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=meta_dtype)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+        acc = acc.to(meta_dtype) * scales_a[:, None]
 
     if(channel_scale_mode == 3): #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)

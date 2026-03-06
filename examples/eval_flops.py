@@ -187,6 +187,7 @@ Examples:
     PROCESSOR_MAP = {
         "A16W8_INT8": lambda: A16W8_INT8(),
         "A16W8_FP8": lambda: A16W8_FP8(),
+        "A16W4_HQQ_INT": lambda: A16W4_HQQ_INT(),
         "A8W8_INT8_dynamic": lambda: A8W8_INT8_dynamic(),
         "A8W8_FP8_dynamic": lambda: A8W8_FP8_dynamic(),
         "A8W8_MXFP_dynamic_post_scale": lambda: A8W8_MXFP_dynamic(dtype=dtype, post_scale=True),
@@ -194,6 +195,7 @@ Examples:
         "A4W4_MXFP_dynamic": lambda: A4W4_MXFP_dynamic(dtype=dtype),
         "A4W4_NVFP_dynamic": lambda: A4W4_NVFP_dynamic(dtype=dtype),
         "none": lambda: None,
+        "fp16": lambda: None,
     }
 
     if args.processor == "all":

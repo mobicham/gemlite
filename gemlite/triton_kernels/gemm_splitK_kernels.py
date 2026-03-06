@@ -76,7 +76,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         #Constraint: BLOCK_SIZE_K >= group_size, only for load_as_block = False
         if(load_scales_as_block):
-            num_stages = max(num_stages, 2) #for dot_scaled kernels with pipelined loads
+            #num_stages = max(num_stages, 2) #for dot_scaled kernels with pipelined loads
+            block_size_k = min(block_size_k, 256) #TODO: tmp MXFP TMA fix
             if(e > 1):
                 block_size_k = max(block_size_k, 64) #m16n8k64
             else:
@@ -86,37 +87,20 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
-
-        # #Constraint: K needs to be divisible by BLOCK_SIZE_K * SPLIT_K 
-        # while split_k > 1 and not is_divisible(k, block_size_k * split_k):
-        #     split_k //= 2
-
-        #Nvidia
+        split_k      = max(split_k, 1)
+        
         if not IS_HIP:
-            if e > 1 and not load_scales_as_block:
-                #Limit num stages when data is packed
-                num_stages = min(num_stages, 4)
-            if(e == 1 and num_stages == 1): 
-                #skip num_stages=1 for non-packed weights
+            if e == 1 and num_stages == 1:
                 continue
-
-        # #Avoid OOM: TODO: come up with a better logic, this is too conservative.
-        # while num_stages > 0:
-        #     shared_mem = (block_size_m * block_size_k * a_sizeof + block_size_k * block_size_n * b_sizeof)
-        #     if(e > 1 and not load_scales_as_block): 
-        #         shared_mem += block_size_k * block_size_n * a_sizeof
-        #     shared_mem *= num_stages
-        #     if int(shared_mem) <= gpu_shared_memory:
-        #         break
-        #     num_stages -= 1
-
-        # if(num_stages == 0): continue #config too large
-
-        split_k = max(split_k, 1)
-        ###########################################
-        if(load_scales_as_block): #TODO: tmp MXFP TMA fix
-            block_size_k = min(block_size_k, 256)
-        ###########################################
+        
+        # Prune configs that exceed shared memory
+        estimated_smem = estimate_shared_memory_per_block(
+            block_size_m, block_size_n, block_size_k,
+            a_sizeof, b_sizeof, num_stages, e, g,
+            load_scales_as_block
+        )
+        if estimated_smem > gpu_shared_memory:
+            continue
 
         key = (block_size_m, block_size_n, block_size_k, group_size_m, split_k, A_load_order, num_stages, num_warps)
         
@@ -203,6 +187,8 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':512, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
     
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':32,  'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64, 'SPLIT_K':2, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=2))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64, 'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2))
     return configs
 
 def get_default_config_nvidia():
@@ -453,7 +439,7 @@ def gemm_splitK_INT_kernel(
         b_ptrs += BLOCK_SIZE_K_P * stride_bk
         
         if not EVEN_K:
-            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
+            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K * SPLIT_K) < K)).to(tl.int1)
 
     #############################################################################################################
     #Channel-wise scaling
@@ -463,8 +449,7 @@ def gemm_splitK_INT_kernel(
 
     if(channel_scale_mode == 2): #activation-only
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=meta_dtype)
-        acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+        acc = acc.to(meta_dtype) * scales_a[:, None]
 
     if(channel_scale_mode == 3): #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
