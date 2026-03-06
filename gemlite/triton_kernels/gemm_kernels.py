@@ -66,30 +66,25 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         elif m <= 128: block_size_m = min(max(block_size_m, 64), 128) #m: [64...128]
         elif m <= 256: block_size_m = min(max(block_size_m, 64), 256) #m: [128...256]
         elif m > 256:  block_size_m = min(max(block_size_m, 64), 256) #m > 256
-    
-        # #Constraint: BLOCK_SIZE_K >= group_size, only for load_as_block = False
-        # if(load_scales_as_block):
-        #     num_stages = max(num_stages, 2) #for dot_scaled kernels with pipelined loads
-        #     if(e > 1):
-        #         block_size_k = max(block_size_k, 64) #m16n8k64
-        #     else:
-        #         block_size_k = max(block_size_k, 32) #m16n8k32
-        # else:
-        #     block_size_k = min(block_size_k, g)
 
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
-        ######################################################
-        # # FOR TMA 
-        # if block_size_n % 128 > 0:
-        #     block_size_n = 128
-        # if block_size_k % 128 > 0:
-        #     block_size_k = 128
         
-        if(load_scales_as_block): #tmp MXFP fix with TMA
-            block_size_k = max(block_size_k, 64)
-            block_size_n = max(block_size_n, 64)
-        ######################################################
+        #Constraints
+        if(load_scales_as_block):            
+            # FOR TMA 
+            # block_size_k = min(block_size_k, 256) #TODO: tmp MXFP TMA fix            
+            # if block_size_n % 128 > 0:
+            #     block_size_n = 128
+            # if block_size_k % 128 > 0:
+            #     block_size_k = 128    
+            if(e > 1):
+                block_size_k = max(block_size_k, 64) #m16n8k64
+            else:
+                block_size_k = max(block_size_k, 32) #m16n8k32
+        else:
+            block_size_k = min(block_size_k, g)
+
 
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
 

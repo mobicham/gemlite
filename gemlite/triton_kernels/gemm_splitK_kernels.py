@@ -74,10 +74,14 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         #Only use higher split_k values for smaller m
         if(m >= 32): split_k = min(split_k, 8)
 
-        #Constraint: BLOCK_SIZE_K >= group_size, only for load_as_block = False
-        if(load_scales_as_block):
-            #num_stages = max(num_stages, 2) #for dot_scaled kernels with pipelined loads
-            block_size_k = min(block_size_k, 256) #TODO: tmp MXFP TMA fix
+        #Constraints
+        if(load_scales_as_block):            
+            # FOR TMA 
+            # block_size_k = min(block_size_k, 256) #TODO: tmp MXFP TMA fix            
+            # if block_size_n % 128 > 0:
+            #     block_size_n = 128
+            # if block_size_k % 128 > 0:
+            #     block_size_k = 128    
             if(e > 1):
                 block_size_k = max(block_size_k, 64) #m16n8k64
             else:
