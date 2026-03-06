@@ -1359,7 +1359,7 @@ def scale_activations_nvfp4_triton(tensor: torch.Tensor) -> Tuple[torch.Tensor, 
     return out, scales
 
 ####################################################################################################################
-scale_activations_per_token = scale_activations_per_token_triton_v4
+scale_activations_per_token = scale_activations_per_token_triton_v3
 scale_activations_mxfp8 = scale_activations_mxfp8_triton_v3
 scale_activations_mxfp4 = scale_activations_mxfp4_triton
 scale_activations_nvfp4 = scale_activations_nvfp4_triton
