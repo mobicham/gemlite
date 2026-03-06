@@ -624,12 +624,11 @@ def gemm_splitK_MX_kernel(
         acc *= meta_scale_norm
 
     #############################################################################################################
-    #Channel-wise scaling
-    if(channel_scale_mode == 2): #activation-only
+    #Channel-wise scaling  
+    if channel_scale_mode == 2:  # activation-only
         dtype: tl.constexpr = c_ptr.dtype.element_ty
-        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=dtype)
-        acc = acc.to(dtype) * (scales_a[:, None] * scales_b[None, :])
+        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1.0, eviction_policy=meta_evict_policy)
+        acc = acc.to(dtype) * scales_a[:, None]
 
     #############################################################################################################
     #Output
