@@ -5,6 +5,8 @@ from gemlite.helper import *
 import argparse
 import torch._dynamo
 torch._dynamo.config.recompile_limit = 256
+import torch._inductor.config as _inductor_config
+import triton
 
 device, dtype = 'cuda:0', torch.bfloat16
 repeat = 32
@@ -146,45 +148,224 @@ def patch_model_native_fp8(model, fp8_dtype=torch.float8_e4m3fn, use_fast_accum=
     for i, layer in enumerate(model):
         if isinstance(layer, torch.nn.Linear):
             model[i] = NativePyTorchFP8Dynamic(
-                layer, fp8_dtype=fp8_dtype, use_fast_accum=use_fast_accum
+                layer, fp8_dtype=fp8_dtype, use_fast_accum=use_fast_accum,
             )
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate TFLOP/s for various quantized matmul processors.",
-        epilog="""
-Examples:
-  # Run with default parameters
-  python eval_flops.py
+###########################################################################################################################
+# flashinfer NVFP4 reference (CUTLASS-based, supports sm_120)
+###########################################################################################################################
+def _get_flashinfer():
+    """Check if flashinfer with NVFP4 support is available."""
+    try:
+        from flashinfer import nvfp4_quantize, mm_fp4, SfLayout
+        return True, None
+    except ImportError:
+        return False, "flashinfer not installed (pip install flashinfer)"
 
-  # Run with specific dimensions:
-  python eval_flops.py --M 128 --K 4096 --N 4096
 
-  # Run only specific processors (comma-separated):
-  python eval_flops.py --processor A16W8_INT8,A8W8_FP8_dynamic
+# ---- custom_op wrappers for torch.compile compatibility ----
+@torch.library.custom_op("flashinfer_bench::nvfp4_quantize", mutates_args=())
+def _nvfp4_quantize_op(
+    a: torch.Tensor, a_global_sf: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from flashinfer import nvfp4_quantize, SfLayout
+    a_fp4, a_sf = nvfp4_quantize(a, a_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False)
+    return a_fp4, a_sf
 
-  # Run only BF16 baseline (no quantization):
-  python eval_flops.py --processor none
 
-  # Available processors:
-  #   A16W8_INT8, A16W8_FP8, A8W8_INT8_dynamic, A8W8_FP8_dynamic,
-  #   A8W8_MXFP_dynamic_post_scale, A8W8_MXFP_dynamic_no_post_scale,
-  #   A4W4_MXFP_dynamic, A4W4_NVFP_dynamic, none (BF16 baseline)
-  #   Use "all" to run every processor.
-        """,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+@torch.library.register_fake("flashinfer_bench::nvfp4_quantize")
+def _nvfp4_quantize_fake(
+    a: torch.Tensor, a_global_sf: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, K = a.shape
+    a_fp4 = torch.empty((M, K // 2), dtype=torch.uint8, device=a.device)
+    a_sf = torch.empty((M, K // 16), dtype=torch.uint8, device=a.device)
+    return a_fp4, a_sf
+
+
+@torch.library.custom_op("flashinfer_bench::mm_fp4", mutates_args=())
+def _mm_fp4_op(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: torch.Tensor,
+    out_N: int,
+) -> torch.Tensor:
+    from flashinfer import mm_fp4
+    return mm_fp4(a, b, a_descale, b_descale, alpha, torch.bfloat16, backend="cutlass")
+
+
+@torch.library.register_fake("flashinfer_bench::mm_fp4")
+def _mm_fp4_fake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: torch.Tensor,
+    out_N: int,
+) -> torch.Tensor:
+    M = a.shape[0]
+    return torch.empty((M, out_N), dtype=torch.bfloat16, device=a.device)
+
+
+class FlashinferNVFP4Dynamic(torch.nn.Module):
+    """
+    NVFP4 dynamic quantization using flashinfer CUTLASS backend.
+    Weights quantized offline in __init__; activations quantized on-the-fly in forward.
+    Compatible with torch.compile via custom_op wrappers.
+    """
+
+    def __init__(self, linear_layer: torch.nn.Linear):
+        super().__init__()
+        from flashinfer import nvfp4_quantize, SfLayout
+
+        w_bf16 = linear_layer.weight.data  # [N, K]
+        N, K = w_bf16.shape
+
+        # Quantize weights offline
+        w_global_sf = (448.0 * 6.0) / w_bf16.float().abs().nan_to_num().amax().clamp(min=1e-12)
+        w_fp4, w_sf = nvfp4_quantize(
+            w_bf16, w_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+        )
+
+        # Store pre-transposed for mm_fp4: b=[K//2, N], b_descale=[K//16, N]
+        self.register_buffer("w_fp4_t", w_fp4.T.contiguous())
+        self.register_buffer("w_sf_t", w_sf.T.contiguous())
+        self.register_buffer(
+            "w_global_sf_inv",
+            (1.0 / w_global_sf).to(torch.float32).contiguous(),
+        )
+        self.N = N
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Activation quantization: compute global scale with pytorch ops
+        x_global_sf = (448.0 * 6.0) / x.float().abs().nan_to_num().amax().clamp(min=1e-12)
+
+        # Quantize activation via custom_op (flashinfer CUDA kernel)
+        x_fp4, x_sf = torch.ops.flashinfer_bench.nvfp4_quantize(x, x_global_sf)
+
+        # alpha = 1 / (x_global_sf * w_global_sf)
+        alpha = self.w_global_sf_inv / x_global_sf
+
+        # CUTLASS FP4 matmul via custom_op
+        return torch.ops.flashinfer_bench.mm_fp4(
+            x_fp4, self.w_fp4_t, x_sf, self.w_sf_t, alpha, self.N
+        )
+
+
+def patch_model_flashinfer_nvfp4(model):
+    for i, layer in enumerate(model):
+        if isinstance(layer, torch.nn.Linear):
+            model[i] = FlashinferNVFP4Dynamic(layer)
+
+
+def bench_flashinfer_nvfp4(M, N, K):
+    """
+    Benchmark flashinfer NVFP4 matmul (CUTLASS backend) - raw single matmul, no activation quant.
+    """
+    from flashinfer import nvfp4_quantize, mm_fp4, SfLayout
+
+    a_bf16 = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b_bf16 = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+
+    a_global_sf = (448.0 * 6.0) / a_bf16.float().abs().nan_to_num().max()
+    b_global_sf = (448.0 * 6.0) / b_bf16.float().abs().nan_to_num().max()
+
+    a_fp4, a_sf = nvfp4_quantize(a_bf16, a_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False)
+    b_fp4, b_sf = nvfp4_quantize(b_bf16, b_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=True)
+
+    alpha = 1.0 / (a_global_sf * b_global_sf)
+
+    ms = triton.testing.do_bench(
+        lambda: mm_fp4(a_fp4, b_fp4.T, a_sf, b_sf.T, alpha, torch.bfloat16),
+        warmup=500, rep=500,
     )
-    parser.add_argument("--M", type=int, default=8192, help="Batch/sequence dimension")
-    parser.add_argument("--K", type=int, default=16384, help="Input feature dimension")
-    parser.add_argument("--N", type=int, default=16384, help="Output feature dimension")
-    parser.add_argument("--processor", type=str, default="all",
-                        help='Comma-separated processor names or "all" (default: all)')
-    args = parser.parse_args()
+    return ms
 
-    M, K, N = args.M, args.K, args.N
 
-    PROCESSOR_MAP = {
+###########################################################################################################################
+def run_benchmark(proc_name, M, K, N):
+    """
+    Unified benchmark runner. Returns (label, M, K, N, tflops) or None on skip.
+    Handles gemlite processors, native PyTorch INT8/FP8, and flashinfer NVFP4.
+    """
+    has_flashinfer, fi_err = _get_flashinfer()
+
+    # ---- flashinfer NVFP4 raw (single matmul, no activation quant, triton.do_bench) ----
+    if proc_name == "flashinfer_nvfp4_raw":
+        if not has_flashinfer:
+            print(f"  Skipping {proc_name}: {fi_err}")
+            return None
+        M_a = ((M + 127) // 128) * 128
+        N_a = ((N + 127) // 128) * 128
+        K_a = ((K + 127) // 128) * 128
+        try:
+            ms = bench_flashinfer_nvfp4(M_a, N_a, K_a)
+            tflops = get_flops(M_a, K_a, N_a, ms)
+            label = "flashinfer NVFP4 (raw)"
+            print(f"  {label} | {M_a}, {K_a}, {N_a} | {tflops:.2f} TFLOP/s  ({ms:.3f} ms)")
+            return (label, M_a, K_a, N_a, tflops)
+        except Exception as e:
+            print(f"  flashinfer NVFP4 raw failed: {e}")
+            return None
+
+    # ---- flashinfer NVFP4 dynamic (torch.compile + activation quant) ----
+    if proc_name == "flashinfer_nvfp4_dynamic":
+        if not has_flashinfer:
+            print(f"  Skipping {proc_name}: {fi_err}")
+            return None
+        # Disable cudagraph trees: flashinfer CUTLASS does internal workspace allocs
+        old_cudagraph = _inductor_config.triton.cudagraph_trees
+        _inductor_config.triton.cudagraph_trees = False
+
+        model = get_model(K, N, repeat=repeat)
+        patch_model_flashinfer_nvfp4(model)
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+
+        perf_time_ms = eval_model(model, M, K) / repeat
+        tflops = get_flops(M, K, N, perf_time_ms)
+        label = "flashinfer NVFP4 (dynamic)"
+        print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
+
+        cleanup(model)
+        _inductor_config.triton.cudagraph_trees = old_cudagraph
+        return (label, M, K, N, tflops)
+
+    # ---- Native PyTorch INT8 dynamic ----
+    if proc_name == "native_int8":
+        if M <= 16:
+            print(f"  Skipping native_int8 for M={M} (requires M > 16)")
+            return None
+        model = get_model(K, N, repeat=repeat)
+        patch_model_native_int8(model)
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+
+        perf_time_ms = eval_model(model, M, K) / repeat
+        tflops = get_flops(M, K, N, perf_time_ms)
+        label = "PyTorch Native INT8"
+        print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
+
+        cleanup(model)
+        return (label, M, K, N, tflops)
+
+    # ---- Native PyTorch FP8 dynamic ----
+    if proc_name == "native_fp8":
+        model = get_model(K, N, repeat=repeat)
+        patch_model_native_fp8(model, fp8_dtype=torch.float8_e4m3fn, use_fast_accum=False)
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+
+        perf_time_ms = eval_model(model, M, K) / repeat
+        tflops = get_flops(M, K, N, perf_time_ms)
+        label = "PyTorch Native FP8"
+        print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
+
+        cleanup(model)
+        return (label, M, K, N, tflops)
+
+    # ---- GemLite processors + BF16 baseline ----
+    GEMLITE_MAP = {
         "A16W8_INT8": lambda: A16W8_INT8(),
         "A16W8_FP8": lambda: A16W8_FP8(),
         "A16W4_HQQ_INT": lambda: A16W4_HQQ_INT(),
@@ -198,60 +379,92 @@ Examples:
         "fp16": lambda: None,
     }
 
+    if proc_name not in GEMLITE_MAP:
+        print(f"  Unknown processor: {proc_name}, skipping.")
+        return None
+
+    procesor = GEMLITE_MAP[proc_name]()
+
+    model = get_model(K, N, repeat=repeat)
+    if procesor is not None:
+        patch_model(model, device=device, processor=procesor)
+    model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+
+    perf_time_ms = eval_model(model, M, K) / repeat
+    label = proc_name if procesor is not None else "BF16 (no processor)"
+    tflops = get_flops(M, K, N, perf_time_ms)
+    print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
+
+    cleanup(model)
+    return (label, M, K, N, tflops)
+
+
+ALL_PROCESSORS = [
+    "none",
+    "A16W8_INT8",
+    "A16W8_FP8",
+    "A16W4_HQQ_INT",
+    "A8W8_INT8_dynamic",
+    "A8W8_FP8_dynamic",
+    "A8W8_MXFP_dynamic_post_scale",
+    "A8W8_MXFP_dynamic",
+    "A4W4_MXFP_dynamic",
+    "A4W4_NVFP_dynamic",
+    "native_int8",
+    "native_fp8",
+    "flashinfer_nvfp4_dynamic",
+    "flashinfer_nvfp4_raw",
+]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate TFLOP/s for various quantized matmul processors.",
+        epilog="""
+Examples:
+  # Run with default parameters (all processors)
+  python eval_flops.py
+
+  # Run with specific dimensions:
+  python eval_flops.py --M 128 --K 4096 --N 4096
+
+  # Run only specific processors (comma-separated):
+  python eval_flops.py --processor A4W4_MXFP_dynamic,flashinfer_nvfp4_dynamic,native_fp8
+
+  # Run only BF16 baseline (no quantization):
+  python eval_flops.py --processor none
+
+  # Available processors:
+  #   GemLite:    A16W8_INT8, A16W8_FP8, A16W4_HQQ_INT,
+  #               A8W8_INT8_dynamic, A8W8_FP8_dynamic,
+  #               A8W8_MXFP_dynamic_post_scale, A8W8_MXFP_dynamic,
+  #               A4W4_MXFP_dynamic, A4W4_NVFP_dynamic
+  #   PyTorch:    native_int8, native_fp8
+  #   flashinfer: flashinfer_nvfp4_dynamic, flashinfer_nvfp4_raw
+  #   Baseline:   none / fp16 (BF16, no quantization)
+  #   Use "all" to run every processor.
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--M", type=int, default=8192, help="Batch/sequence dimension")
+    parser.add_argument("--K", type=int, default=16384, help="Input feature dimension")
+    parser.add_argument("--N", type=int, default=16384, help="Output feature dimension")
+    parser.add_argument("--processor", type=str, default="all",
+                        help='Comma-separated processor names or "all" (default: all)')
+    args = parser.parse_args()
+
+    M, K, N = args.M, args.K, args.N
+
     if args.processor == "all":
-        processor_names = list(PROCESSOR_MAP.keys())
+        processor_names = list(ALL_PROCESSORS)
     else:
         processor_names = [p.strip() for p in args.processor.split(",")]
 
     results = []
-
-    # ---- GemLite processors ----
     for proc_name in processor_names:
-        if proc_name not in PROCESSOR_MAP:
-            print(f"Unknown processor: {proc_name}, skipping.")
-            continue
-
-        procesor = PROCESSOR_MAP[proc_name]()
-
-        model = get_model(K, N, repeat=repeat)
-        if procesor is not None:
-            patch_model(model, device=device, processor=procesor)
-        model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
-
-        perf_time_ms = eval_model(model, M, K) / repeat
-        label = proc_name if procesor is not None else "FP16 (no processor)"
-        tflops = get_flops(M, K, N, perf_time_ms)
-        print(f"Processor: {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
-        results.append((label, M, K, N, tflops))
-
-        cleanup(model)
-
-    # ---- PyTorch Native INT8 dynamic reference ----
-    if M > 16:
-        model = get_model(K, N, repeat=repeat)
-        patch_model_native_int8(model)
-        model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
-
-        perf_time_ms = eval_model(model, M, K) / repeat
-        tflops = get_flops(M, K, N, perf_time_ms)
-        print(f"PyTorch Native INT8 | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
-        results.append(("PyTorch Native INT8", M, K, N, tflops))
-
-        cleanup(model)
-    else:
-        print(f"Skipping PyTorch Native INT8 for M={M} (requires M >= 16).")
-
-    # ---- PyTorch Native FP8 dynamic reference ----
-    model = get_model(K, N, repeat=repeat)
-    patch_model_native_fp8(model, fp8_dtype=torch.float8_e4m3fn, use_fast_accum=False)
-    model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
-
-    perf_time_ms = eval_model(model, M, K) / repeat
-    tflops = get_flops(M, K, N, perf_time_ms)
-    print(f"PyTorch Native FP8 | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
-    results.append(("PyTorch Native FP8", M, K, N, tflops))
-
-    cleanup(model)
+        result = run_benchmark(proc_name, M, K, N)
+        if result is not None:
+            results.append(result)
 
     # ---- Summary ----
     print("\n" + "=" * 70)
