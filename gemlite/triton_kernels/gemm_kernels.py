@@ -187,6 +187,12 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
+    
+    #MXFP/NVFP 5D TMA optimized (num_stages=3)
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=3))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=3))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=3))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=3))
     return configs
 
 def get_default_config_nvidia():
@@ -629,7 +635,7 @@ def gemm_INT_kernel_persistent_tma(
 @triton.jit
 def gemm_MX_kernel(
     a_ptr, b_ptr, c_ptr,
-    scales_ptr, zeros_ptr, scales_a_ptr,
+    scales_ptr, zeros_ptr, scales_a_ptr, scales_5d_ptr,
     #M, N, K, M_CLOSEST,
     M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, M_CLOSEST: tl.constexpr,
     ######### Quant parms #########
@@ -740,13 +746,14 @@ def gemm_MX_kernel(
             [BLOCK_SIZE_M, BLOCK_SIZE_N]
         )
         
-        # 2D TMA - transposed
-        # scales_a_desc = tl.make_tensor_descriptor(                                                                                                              
-        #     scales_a_ptr,                                                                                                                                       
-        #     [M, K // group_size],                                                                                                                               
-        #     [stride_meta_a_m, stride_meta_a_g],                   
-        #     [BLOCK_SIZE_M, BLOCK_SIZE_K_S],
-        # )
+        # 2D TMA for activation scales (disabled: last dim < 16 bytes)
+        # if(channel_scale_mode == 4):
+        #     scales_a_desc = tl.make_tensor_descriptor(                                                                                                              
+        #         scales_a_ptr,                                                                                                                                       
+        #         [M, K // group_size],                                                                                                                               
+        #         [stride_meta_a_m, stride_meta_a_g],                   
+        #         [BLOCK_SIZE_M, BLOCK_SIZE_K_S],
+        #     )
 
         scales_b_desc = tl.make_tensor_descriptor(
             scales_ptr,
@@ -755,24 +762,25 @@ def gemm_MX_kernel(
             [BLOCK_SIZE_K_S, BLOCK_SIZE_N],
         )
             
-    # # 2. 5D TMA Descriptors for Scales: #(8388608, 65536, 512, 256, 1) torch.Size([1, 128, 128, 2, 256])
-    # rep_m: tl.constexpr = BLOCK_SIZE_M // 128
-    # rep_n: tl.constexpr = BLOCK_SIZE_N // 128
-    # rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
-    # scales_b_shape1: tl.constexpr = N // 128
-    # scales_b_shape2: tl.constexpr = K // group_size // 4
-    # stride_b4: tl.constexpr = 1
-    # stride_b3: tl.constexpr = 256
-    # stride_b2: tl.constexpr = 512
-    # stride_b1: tl.constexpr = 512 * scales_b_shape2
-    # stride_b0: tl.constexpr = stride_b1 * scales_b_shape1
-    # # REQUIRES BLOCK_SIZE_K / BLOCK_SIZE_N to be multiples of 128
-    # scales_b_desc = tl.make_tensor_descriptor(
-    #     scales_ptr,
-    #     [1, scales_b_shape1, scales_b_shape2, 2, 256],
-    #     [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
-    #     [1, rep_n, rep_k, 2, 256]
-    # )
+    # 5D TMA Descriptors for Scales (preshuffled layout)
+    USE_5D_SCALES: tl.constexpr = use_tma and (N % 128 == 0) and (BLOCK_SIZE_K // group_size % 4 == 0) and (BLOCK_SIZE_M % 128 == 0) and (BLOCK_SIZE_N % 128 == 0)
+    if USE_5D_SCALES:
+        rep_m: tl.constexpr = BLOCK_SIZE_M // 128
+        rep_n: tl.constexpr = BLOCK_SIZE_N // 128
+        rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
+        scales_b_shape1: tl.constexpr = N // 128
+        scales_b_shape2: tl.constexpr = K // group_size // 4
+        stride_b4: tl.constexpr = 1
+        stride_b3: tl.constexpr = 256
+        stride_b2: tl.constexpr = 512
+        stride_b1: tl.constexpr = 512 * scales_b_shape2
+        stride_b0: tl.constexpr = stride_b1 * scales_b_shape1
+        scales_b_5d_desc = tl.make_tensor_descriptor(
+            scales_5d_ptr,
+            [1, scales_b_shape1, scales_b_shape2, 2, 256],
+            [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
+            [1, rep_n, rep_k, 2, 256]
+        )
     
     #B-scales
     if(channel_scale_mode == 4):
@@ -797,24 +805,15 @@ def gemm_MX_kernel(
             b = tl.load(b_ptrs, eviction_policy=b_evict)
         ####################################################################################
         k_m = k * BLOCK_SIZE_K_S
-        # NO TMA
-        scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
-                
-        # # 2D TMA
-        #scales_b = tl.load_tensor_descriptor(scales_b_desc, [k * BLOCK_SIZE_K_S, pid_n * BLOCK_SIZE_N]).T
-        
-        # 5D Scale Loads and Unpacking
-        # offs_scale_m = pid_m * rep_m
-        # offs_scale_n = pid_n * rep_n
-        # offs_scale_k = k * rep_k
-        
-        #scale_b = tl.load_tensor_descriptor(scales_b_desc, [0, offs_scale_n, offs_scale_k, 0, 0])
-        #scales_b = scale_b.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
-        #https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py#L220C1-L221C117
+        if USE_5D_SCALES:
+            # 5D TMA scale loads (preshuffled layout)
+            scale_b_raw = tl.load_tensor_descriptor(scales_b_5d_desc, [0, pid_n * rep_n, k * rep_k, 0, 0])
+            scales_b = scale_b_raw.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
+        else:
+            scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
         
         if(channel_scale_mode == 4):
             scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
-            #scales_a = tl.load_tensor_descriptor(scales_a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_S])
         else:
             scales_a = scales_a_1s
         ####################################################################################
@@ -854,7 +853,7 @@ def gemm_MX_kernel(
     
 
 PRINTED = False
-def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
+def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_5d: Tensor, scales_x: Tensor,
                 W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
                 input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
                 channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 
@@ -877,43 +876,55 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         stride_meta_a_m, stride_meta_a_g = None, None
 
     if(is_mx_dtype(input_dtype)):
-        gemm_kernel = gemm_MX_kernel
-        load_scales_as_block = True
+        gemm_MX_kernel[grid](
+            x, W_q, output, 
+            scales, zeros, scales_x, scales_5d,
+            M, N, K, M_CLOSEST,
+            W_nbits, group_size, unpack_mask, elements_per_sample,
+            type_id, x.dtype.itemsize, W_q.dtype.itemsize,
+            x.stride(0), x.stride(1),
+            W_q.stride(0), W_q.stride(1),
+            output.stride(0), output.stride(1),
+            stride_meta_a_m, stride_meta_a_g,
+            scales.stride(0), scales.stride(1),
+            load_scales_as_block = True,
+            input_dtype  = DTYPE_TO_TRITON[input_dtype],
+            output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
+            acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
+            meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
+            channel_scale_mode = channel_scale_mode,
+            W_group_mode       = W_group_mode,
+            zero_is_scalar     = zeros.numel() == 1,
+            data_contiguous    = data_contiguous,
+        )
     else:
-        gemm_kernel = gemm_INT_kernel
-        load_scales_as_block = False
-
-    gemm_kernel[grid](
-        x, W_q, output, 
-        scales, zeros, scales_x,
-        M, N, K, M_CLOSEST,
-        #############################################
-        W_nbits, group_size, unpack_mask, elements_per_sample,
-        type_id, x.dtype.itemsize, W_q.dtype.itemsize,
-        ###############################################
-        x.stride(0), x.stride(1),
-        W_q.stride(0), W_q.stride(1),
-        output.stride(0), output.stride(1),
-        stride_meta_a_m, stride_meta_a_g,
-        scales.stride(0), scales.stride(1),
-        ################################################
-        load_scales_as_block = load_scales_as_block,
-        input_dtype  = DTYPE_TO_TRITON[input_dtype],
-        output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
-        acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
-        meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
-        ################################################
-        channel_scale_mode = channel_scale_mode,
-        W_group_mode       = W_group_mode,
-        zero_is_scalar     = zeros.numel() == 1,
-        data_contiguous    = data_contiguous,
-    )
+        gemm_INT_kernel[grid](
+            x, W_q, output, 
+            scales, zeros, scales_x,
+            M, N, K, M_CLOSEST,
+            W_nbits, group_size, unpack_mask, elements_per_sample,
+            type_id, x.dtype.itemsize, W_q.dtype.itemsize,
+            x.stride(0), x.stride(1),
+            W_q.stride(0), W_q.stride(1),
+            output.stride(0), output.stride(1),
+            stride_meta_a_m, stride_meta_a_g,
+            scales.stride(0), scales.stride(1),
+            load_scales_as_block = False,
+            input_dtype  = DTYPE_TO_TRITON[input_dtype],
+            output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
+            acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
+            meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
+            channel_scale_mode = channel_scale_mode,
+            W_group_mode       = W_group_mode,
+            zero_is_scalar     = zeros.numel() == 1,
+            data_contiguous    = data_contiguous,
+        )
     
     return output
 
 # # Persistent version
 # NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
-# def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
+# def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_5d: Tensor, scales_x: Tensor,
 #                 W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
 #                 input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
 #                 channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 

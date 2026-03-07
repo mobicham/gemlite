@@ -332,6 +332,24 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.compute_dtype = DTYPE_TO_TORCH[self.input_dtype.value]
         self.scaled_activations = bool(self.scaled_activations)
         self.data_contiguous = bool(self.data_contiguous)
+        
+        # Regenerate scales_5d if not in saved state (backward compat)
+        if getattr(self, "scales_5d", None) is None:
+            if is_mx_dtype(self.input_dtype) and self.scales is not None:
+                # scales is in 2D transposed layout [K//gs, N] as a Parameter
+                # We need the original [N, K//gs] for preshuffling
+                s = self.scales.data if isinstance(self.scales, torch.nn.Parameter) else self.scales
+                # s is transposed view: shape [K//gs, N], original data is [N, K//gs]
+                s_orig = s.T.contiguous()  # [N, K//gs]
+                N_dim = s_orig.shape[0]
+                K_S = s_orig.shape[1]
+                if N_dim % 128 == 0 and K_S % 4 == 0:
+                    self.scales_5d = s_orig.reshape(N_dim // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N_dim // 128, K_S // 4, 2, 256).contiguous()
+                else:
+                    self.scales_5d = torch.tensor([[]], dtype=torch.int32, device=s.device)
+            else:
+                device = self.W_q.device if self.W_q is not None else "cuda"
+                self.scales_5d = torch.tensor([[]], dtype=torch.int32, device=device)
 
     #Make sure to feed UINT8 W_q for packing
     def pack(
@@ -493,7 +511,6 @@ class GemLiteLinearTriton(torch.nn.Module):
         if(self.input_dtype in [DType.NVFP4]):
             self.scales = self.scales.to(torch.float8_e4m3fn)
         if(is_mx_dtype(self.input_dtype)):
-            self.scales = self.scales.T
             self.W_group_mode = 2
             self.channel_scale_mode = 0
             
@@ -507,22 +524,33 @@ class GemLiteLinearTriton(torch.nn.Module):
             else:
                 group_size = self.W_q.numel() // self.scales.numel()
             
-            #self.W_q = self.W_q.contiguous().T #Transposed for tma
+            # Preshuffle weight scales to 5D TMA layout for fast loading
+            # Original: [N, K//group_size] -> 5D: [1, N//128, K//group_size//4, 2, 256]
+            K_S = K // group_size
+            if N % 128 == 0 and K_S % 4 == 0:
+                self.scales_5d = self.scales.reshape(N // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N // 128, K_S // 4, 2, 256).contiguous()
+                self.use_5d_scales = True
+            else:
+                self.scales_5d = None
+                self.use_5d_scales = False
             
-            #self.scales = self.scales.contiguous().T # Transposed 2D TMA layout
-            # #self.scales = self.scales.reshape(1, N // 128, K // group_size // 4, 2, 256).contiguous() # 5D TMA layout for the scales:        
-            
-            # #print(self.scales.stride(), self.scales.shape)
+            # Keep 2D transposed layout for the kernel (pointer-based fallback)
+            self.scales = self.scales.T
             ################################
 
         if(self.scales is not None):
             self.meta_dtype = TORCH_TO_DTYPE[self.scales.dtype]
+
+        # Default scales_5d for non-FP4 dtypes
+        if not hasattr(self, 'scales_5d') or self.scales_5d is None:
+            self.scales_5d = torch.tensor([[]], dtype=torch.int32, device=self.device)
 
         #Register tensors as buffers
         self.W_q = torch.nn.Parameter(self.W_q, requires_grad=False)
         self.bias = torch.nn.Parameter(self.bias, requires_grad=False) if self.bias is not None else None
         self.scales = torch.nn.Parameter(self.scales,requires_grad=False)
         self.zeros  = torch.nn.Parameter(self.zeros, requires_grad=False)
+        self.scales_5d = torch.nn.Parameter(self.scales_5d, requires_grad=False)
 
         #Register metadata
         self.metadata = torch.nn.Parameter(
@@ -539,7 +567,7 @@ class GemLiteLinearTriton(torch.nn.Module):
 
     #Return the main arguments
     def get_tensor_args(self):
-        return [self.W_q, self.scales, self.zeros]
+        return [self.W_q, self.scales, self.zeros, self.scales_5d]
 
     def get_meta_args(self):
         return [int(self.scaled_activations),

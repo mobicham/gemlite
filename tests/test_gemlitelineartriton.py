@@ -109,7 +109,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
         ref_args = gemlite_linear.get_tensor_args()
         loaded_args = gemlite_linear_loaded.get_tensor_args()
         for i in range(len(ref_args)):
-            assert (ref_args[i] - loaded_args[i]).float().abs().mean() == 0, "tensor_args mismatch at " + str(i)
+            if ref_args[i].numel() > 0: assert (ref_args[i] - loaded_args[i]).float().abs().mean() == 0, "tensor_args mismatch at " + str(i)
 
         def ref_fn(x):
             return gemlite_linear.forward_manual(x, matmul_type='GEMM')
