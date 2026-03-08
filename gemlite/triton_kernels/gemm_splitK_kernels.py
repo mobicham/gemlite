@@ -42,7 +42,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
             config['EVEN_M'] = (m % config['BLOCK_SIZE_M'] == 0)
             config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
-            config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+            config['EVEN_K'] = (k % (config['BLOCK_SIZE_K'] * config.get('SPLIT_K', 1)) == 0)
 
             # Adjust 5D TMA compatibility for cached configs
             if load_scales_as_block and n % 128 == 0 and (k // g) % 4 == 0:
@@ -50,7 +50,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
                     config['BLOCK_SIZE_K'] *= 2
                 config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
-                config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+                config['EVEN_K'] = (k % (config['BLOCK_SIZE_K'] * config.get('SPLIT_K', 1)) == 0)
 
             yield triton.Config(config,
                 num_stages=num_stages,
@@ -102,21 +102,23 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         if not IS_HIP:
             if e == 1 and num_stages == 1:
                 continue
-        
-        # Prune configs that exceed shared memory
-        estimated_smem = estimate_shared_memory_per_block(
-            block_size_m, block_size_n, block_size_k,
-            a_sizeof, b_sizeof, num_stages, e, g,
-            load_scales_as_block
-        )
-        if estimated_smem > gpu_shared_memory:
-            continue
+
+        # Reduce num_stages until config fits in shared memory
+        while num_stages > 1:
+            estimated_smem = estimate_shared_memory_per_block(
+                block_size_m, block_size_n, block_size_k,
+                a_sizeof, b_sizeof, num_stages, e, g,
+                load_scales_as_block
+            )
+            if estimated_smem <= gpu_shared_memory:
+                break
+            num_stages -= 1
 
         key = (block_size_m, block_size_n, block_size_k, group_size_m, split_k, A_load_order, num_stages, num_warps)
         
         even_m = (m % block_size_m == 0)
         even_n = (n % block_size_n == 0)
-        even_k = (k % block_size_k == 0)
+        even_k = (k % (block_size_k * split_k) == 0)
 
         new_config = {
             "BLOCK_SIZE_M": block_size_m,
@@ -151,7 +153,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
 #These autotunes are optimized for batch-size 1 to 64 (!)
 def get_max_autotune_config_nvidia():
-    stages  = [1, 2, 4, 5] if gpu_has_more_shared_memory() else [1, 2, 4]
+    stages  = [1, 2, 3, 4, 5]
     configs = []
     for A in [0, 2]:
         for w in [4, 8]:
@@ -172,33 +174,26 @@ def get_max_autotune_config_nvidia():
 #Faster autotuner 
 def get_fast_autotune_config_nvidia():
     configs = []
-    
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':64,  'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':128, 'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':256, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':512, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
-    
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':32,  'SPLIT_K':8, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':64,  'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':128, 'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':256, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':512, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-        
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':32,  'SPLIT_K':8, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4)) 
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':32,  'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4)) 
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'SPLIT_K':2, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=2))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':256, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':512, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':32,  'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64, 'SPLIT_K':2, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=2))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64, 'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2))
+    #Small N tiles
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':128, 'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':128, 'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':256, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    #Medium N tiles (N=128 — workhorse for MX/INT types)
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
+    #Large N tiles
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'SPLIT_K':2,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=2))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':256, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':32,  'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
+    #High split_k with wide N
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':32,  'SPLIT_K':8,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
+    #Extra coverage
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':64,  'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':2,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64,  'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
     return configs
 
 def get_default_config_nvidia():
@@ -590,6 +585,7 @@ def gemm_splitK_MX_kernel(
     offs_bk = pid_k * BLOCK_SIZE_K_B_E + tl.arange(0, BLOCK_SIZE_K_B_E)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    b_mask = (offs_bk[:, None] < (K // elements_per_sample))
     
     #Scales
     stride_mul: tl.constexpr = BLOCK_SIZE_K / group_size
@@ -657,7 +653,10 @@ def gemm_splitK_MX_kernel(
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
                 
-            b = tl.load(b_ptrs, eviction_policy=b_evict)
+            if EVEN_K:
+                b = tl.load(b_ptrs, eviction_policy=b_evict)
+            else:
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0, eviction_policy=b_evict)
 
         #k_m = ((k * SPLIT_K + pid_k) * stride_mul).to(tl.int32)
         k_m = (k * SPLIT_K + pid_k) * BLOCK_SIZE_K_S #OK for BLOCK_SIZE_K >=group_size
@@ -665,10 +664,18 @@ def gemm_splitK_MX_kernel(
             scale_b_raw = tl.load_tensor_descriptor(scales_b_5d_desc, [0, pid_n * rep_n, (k * SPLIT_K + pid_k) * rep_k, 0, 0])
             scales_b = scale_b_raw.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
         else:
-            scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
+            if EVEN_K:
+                scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
+            else:
+                _scale_k_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
+                scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, mask=_scale_k_mask, other=0.0, eviction_policy=meta_evict_policy)
 
         if(channel_scale_mode == 4):
-            scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
+            if EVEN_K:
+                scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
+            else:
+                _scale_a_k_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
+                scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, mask=_scale_a_k_mask, other=0.0, eviction_policy=meta_evict_policy)
         else:
             scales_a = scales_a_1s
 
@@ -679,7 +686,8 @@ def gemm_splitK_MX_kernel(
         
         if not use_tma:
             if not EVEN_K:
-                a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
+                a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_A) < (K // elements_per_sample_a))).to(tl.int1)
+                b_mask = ((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_B) < (K // elements_per_sample))
 
     #NVFP4 meta-scale
     if(group_size == 16):

@@ -874,7 +874,7 @@ def scale_activations_mxfp8_triton_v2(
     M_padded = M + pad_m
 
     out = torch.empty((M, K), device=tensor.device, dtype=w_dtype)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    scales = torch.full((M_padded, K // group_size), fill_value=127, device=tensor.device, dtype=torch.uint8)
     
     #BLOCK_SIZE_M = min(max(next_power_of_2(M), group_size), 128)
     BLOCK_SIZE_M = group_size
@@ -982,7 +982,7 @@ def scale_activations_mxfp8_triton_v3(
     M_padded = M + pad_m
 
     out = torch.empty((M, K), device=tensor.device, dtype=w_dtype)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    scales = torch.full((M_padded, K // group_size), fill_value=127, device=tensor.device, dtype=torch.uint8)
     
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
@@ -1105,7 +1105,7 @@ def scale_activations_mxfp8_triton_v4(
     M_padded = M + pad_m
 
     out = torch.empty((M, K), device=tensor.device, dtype=w_dtype)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    scales = torch.full((M_padded, K // group_size), fill_value=127, device=tensor.device, dtype=torch.uint8)
 
     grid = lambda meta: (min(NUM_SMS, triton.cdiv(M, meta['BLOCK_SIZE_M'])),)
 
@@ -1322,7 +1322,7 @@ def scale_activations_mxfp4_triton(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     M_padded = M + pad_m
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    scales = torch.full((M_padded, K // group_size), fill_value=127, device=tensor.device, dtype=torch.uint8)
         
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
@@ -1454,7 +1454,7 @@ def scale_activations_nvfp4_triton(tensor: torch.Tensor) -> Tuple[torch.Tensor, 
     M_padded = M + pad_m
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
+    scales = torch.zeros((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
 
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
@@ -1578,7 +1578,7 @@ def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     M_padded = M + pad_m
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    scales = torch.full((M_padded, K // group_size), fill_value=127, device=tensor.device, dtype=torch.uint8)
 
     grid = lambda meta: (min(NUM_SMS, triton.cdiv(M, meta['BLOCK_SIZE_M'])),)
     device_index = tensor.device.index
@@ -1704,7 +1704,7 @@ def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor) -> Tuple[torch.Tenso
     M_padded = M + pad_m
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
+    scales = torch.zeros((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
 
     grid = lambda meta: (min(NUM_SMS, triton.cdiv(M, meta['BLOCK_SIZE_M'])),)
     device_index = tensor.device.index
@@ -1820,7 +1820,7 @@ def scale_activations_mxfp4_triton_v3(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     M_padded = M + pad_m
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    scales = torch.full((M_padded, K // group_size), fill_value=127, device=tensor.device, dtype=torch.uint8)
 
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
@@ -1947,7 +1947,7 @@ def scale_activations_nvfp4_triton_v3(tensor: torch.Tensor) -> Tuple[torch.Tenso
     M_padded = M + pad_m
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
+    scales = torch.zeros((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
 
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
@@ -2097,7 +2097,7 @@ def scale_activations_mxfp4_triton_v5(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     M_padded = M + pad_m
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=torch.uint8)
+    scales = torch.full((M_padded, K // group_size), fill_value=127, device=tensor.device, dtype=torch.uint8)
 
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, meta['BLOCK_SIZE_K']))
     device_index = tensor.device.index
@@ -2236,7 +2236,7 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor) -> Tuple[torch.Tenso
     M_padded = M + pad_m
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
-    scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
+    scales = torch.zeros((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
 
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, meta['BLOCK_SIZE_K']))
     device_index = tensor.device.index
