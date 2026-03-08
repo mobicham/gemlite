@@ -25,6 +25,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
     b_sizeof = nargs['b_sizeof']
     
     #Check cache
+    load_scales_as_block = kwargs['load_scales_as_block']
     if(MATMUL_TYPE in GEMLITE_TRITON_CONFIG_CACHE):
         signature = str(tuple([get_closest_m(m), n, k, g, e, t]))
         if(signature in GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE]):
@@ -38,16 +39,23 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_dec_producer', None)
             config.pop('reg_inc_consumer', None)
             config["NUM_STAGES"] = num_stages
-            
+
             config['EVEN_M'] = (m % config['BLOCK_SIZE_M'] == 0)
             config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
             config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
 
+            # Adjust 5D TMA compatibility for cached configs
+            if load_scales_as_block and n % 128 == 0 and (k // g) % 4 == 0:
+                config['BLOCK_SIZE_N'] = max(config['BLOCK_SIZE_N'], 128)
+                while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
+                    config['BLOCK_SIZE_K'] *= 2
+                config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
+                config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps)
             return
-    
+
     gpu_shared_memory = get_gpu_shared_memory()
-    load_scales_as_block = kwargs['load_scales_as_block']
     used = set()
     for config in configs:
         group_size_m = config.kwargs['GROUP_SIZE_M']
@@ -71,18 +79,16 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_n = next_power_of_2(block_size_n)
         
         #Constraints
-        if(load_scales_as_block):            
-            # FOR TMA 
-            # block_size_k = min(block_size_k, 256) #TODO: tmp MXFP TMA fix            
-            # if block_size_n % 128 > 0:
-            #     block_size_n = 128
-            # if block_size_k % 128 > 0:
-            #     block_size_k = 128
+        if(load_scales_as_block):
             if(e > 1):
                 block_size_k = max(block_size_k, 64) #m16n8k64
             else:
                 block_size_k = max(block_size_k, 32) #m16n8k32
-                #block_size_k = max(block_size_k, 128) #TMA
+            # 5D TMA scale compatibility: adjust block sizes for 5D TMA descriptor
+            if n % 128 == 0 and (k // g) % 4 == 0:
+                block_size_n = max(block_size_n, 128)
+                while (block_size_k // g) % 4 != 0:
+                    block_size_k *= 2
         else:
             block_size_k = min(block_size_k, g)
 
@@ -635,7 +641,7 @@ def gemm_INT_kernel_persistent_tma(
 @triton.jit
 def gemm_MX_kernel(
     a_ptr, b_ptr, c_ptr,
-    scales_ptr, zeros_ptr, scales_a_ptr, scales_5d_ptr,
+    scales_ptr, zeros_ptr, scales_a_ptr,
     #M, N, K, M_CLOSEST,
     M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, M_CLOSEST: tl.constexpr,
     ######### Quant parms #########
@@ -679,6 +685,7 @@ def gemm_MX_kernel(
     meta_scale_norm: tl.constexpr = (0.05 ** 2),
     #################################
     use_tma: tl.constexpr = True,
+    USE_5D_SCALES: tl.constexpr = False,
 ):
 
     pid = tl.program_id(axis=0)
@@ -722,8 +729,9 @@ def gemm_MX_kernel(
     BLOCK_SIZE_K_S: tl.constexpr = BLOCK_SIZE_K // group_size
     offs_k_scales = tl.arange(0, BLOCK_SIZE_K_S)
     offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
-    
+    if not USE_5D_SCALES:
+        scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
+
     if use_tma:
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
@@ -746,26 +754,8 @@ def gemm_MX_kernel(
             [BLOCK_SIZE_M, BLOCK_SIZE_N]
         )
         
-        # 2D TMA for activation scales (disabled: last dim < 16 bytes)
-        # if(channel_scale_mode == 4):
-        #     scales_a_desc = tl.make_tensor_descriptor(                                                                                                              
-        #         scales_a_ptr,                                                                                                                                       
-        #         [M, K // group_size],                                                                                                                               
-        #         [stride_meta_a_m, stride_meta_a_g],                   
-        #         [BLOCK_SIZE_M, BLOCK_SIZE_K_S],
-        #     )
-
-        scales_b_desc = tl.make_tensor_descriptor(
-            scales_ptr,
-            [K // group_size, N],
-            [stride_meta_g, stride_meta_n],
-            [BLOCK_SIZE_K_S, BLOCK_SIZE_N],
-        )
-            
     # 5D TMA Descriptors for Scales (preshuffled layout)
-    USE_5D_SCALES: tl.constexpr = use_tma and (N % 128 == 0) and (BLOCK_SIZE_K // group_size % 4 == 0) and (BLOCK_SIZE_M % 128 == 0) and (BLOCK_SIZE_N % 128 == 0)
     if USE_5D_SCALES:
-        rep_m: tl.constexpr = BLOCK_SIZE_M // 128
         rep_n: tl.constexpr = BLOCK_SIZE_N // 128
         rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
         scales_b_shape1: tl.constexpr = N // 128
@@ -776,7 +766,7 @@ def gemm_MX_kernel(
         stride_b1: tl.constexpr = 512 * scales_b_shape2
         stride_b0: tl.constexpr = stride_b1 * scales_b_shape1
         scales_b_5d_desc = tl.make_tensor_descriptor(
-            scales_5d_ptr,
+            scales_ptr,
             [1, scales_b_shape1, scales_b_shape2, 2, 256],
             [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
             [1, rep_n, rep_k, 2, 256]
@@ -853,10 +843,10 @@ def gemm_MX_kernel(
     
 
 PRINTED = False
-def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_5d: Tensor, scales_x: Tensor,
-                W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
-                input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
-                channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 
+def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
+                W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int,
+                input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int,
+                channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int,
                 ) -> Tensor:
     
     
@@ -876,9 +866,19 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_5
         stride_meta_a_m, stride_meta_a_g = None, None
 
     if(is_mx_dtype(input_dtype)):
+        use_5d_scales = (scales.ndim == 5)
+
+        # When autotuner has only 1 config (default mode), pruning is skipped entirely.
+        # Adjust block sizes directly to satisfy 5D TMA descriptor requirements.
+        if use_5d_scales and len(gemm_MX_kernel.configs) == 1:
+            cfg = gemm_MX_kernel.configs[0]
+            cfg.kwargs['BLOCK_SIZE_N'] = max(cfg.kwargs.get('BLOCK_SIZE_N', 64), 128)
+            while (cfg.kwargs.get('BLOCK_SIZE_K', 64) // group_size) % 4 != 0:
+                cfg.kwargs['BLOCK_SIZE_K'] *= 2
+
         gemm_MX_kernel[grid](
-            x, W_q, output, 
-            scales, zeros, scales_x, scales_5d,
+            x, W_q, output,
+            scales, zeros, scales_x,
             M, N, K, M_CLOSEST,
             W_nbits, group_size, unpack_mask, elements_per_sample,
             type_id, x.dtype.itemsize, W_q.dtype.itemsize,
@@ -886,7 +886,7 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_5
             W_q.stride(0), W_q.stride(1),
             output.stride(0), output.stride(1),
             stride_meta_a_m, stride_meta_a_g,
-            scales.stride(0), scales.stride(1),
+            0 if use_5d_scales else scales.stride(0), 0 if use_5d_scales else scales.stride(1),
             load_scales_as_block = True,
             input_dtype  = DTYPE_TO_TRITON[input_dtype],
             output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
@@ -896,6 +896,7 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_5
             W_group_mode       = W_group_mode,
             zero_is_scalar     = zeros.numel() == 1,
             data_contiguous    = data_contiguous,
+            USE_5D_SCALES      = use_5d_scales,
         )
     else:
         gemm_INT_kernel[grid](

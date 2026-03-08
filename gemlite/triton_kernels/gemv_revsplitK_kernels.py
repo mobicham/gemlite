@@ -399,7 +399,7 @@ def gemv_INT_revsplitK_kernel(
     
 KERNEL_CACHE = {}
 
-def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_5d: Tensor, scales_x: Tensor,
+def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
                                                    W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
                                                    input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
                                                    channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id: int,
