@@ -542,7 +542,7 @@ def gemm_splitK_MX_kernel(
     b_evict: tl.constexpr = 'evict_first',
     meta_scale_norm: tl.constexpr = (0.05 ** 2),
     #################################
-    use_tma: tl.constexpr = False,
+    use_tma: tl.constexpr = True,
     USE_5D_SCALES: tl.constexpr = False,
     SCALES_5D_SHAPE1: tl.constexpr = 0,
     SCALES_5D_SHAPE2: tl.constexpr = 0,
