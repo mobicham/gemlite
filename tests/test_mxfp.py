@@ -16,11 +16,12 @@ device        = 'cuda:0'
 compute_dtype = torch.bfloat16 #float16, bfloat16
 matmul_types  = ['GEMM', 'GEMM_SPLITK'] #TODO: improve GEMV mxfp accuracy.
 reset_config()
-#set_autotune(False)
+set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
 torch.random.manual_seed(0)
-in_features, out_features = 4032, 2048
+in_features, out_features = 4224, 2048 # test 5D TMA
+#in_features, out_features = 4032, 2048 # test 2D scales fall-back
 batch_sizes               = [1, 3, 16, 30, 32, 60, 100, 128]
 linear_layer              = torch.nn.Linear(in_features=in_features, out_features=out_features, device=device, dtype=compute_dtype, bias=False)
 linear_layer.weight.data /= 10.

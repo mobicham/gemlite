@@ -197,7 +197,7 @@ def get_fast_autotune_config_nvidia():
     return configs
 
 def get_default_config_nvidia():
-    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2),]
+    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2), triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2),]
 
 ########################################################################################################################################################################
 #AMD - Instinct MI300X
@@ -370,7 +370,8 @@ def gemm_splitK_INT_kernel(
     offs_ak = offs_k
     offs_bk = offs_k
 
-    b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn) 
+    b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn)
+    b_mask  = (offs_bk[:, None] < K).to(tl.int1)
     q_shift = ((offs_bk % elements_per_sample) * W_nbits).to(tl.int32)[:, None] 
 
     #Inputs
@@ -399,7 +400,10 @@ def gemm_splitK_INT_kernel(
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
+        if EVEN_K:
+            b = tl.load(b_ptrs, eviction_policy=b_evict)
+        else:
+            b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
         if(A_load_order == 1): #Early load
             if EVEN_M and EVEN_K:
@@ -448,6 +452,7 @@ def gemm_splitK_INT_kernel(
         
         if not EVEN_K:
             a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K * SPLIT_K) < K)).to(tl.int1)
+            b_mask = ((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_U) < K).to(tl.int1)
 
     #############################################################################################################
     #Channel-wise scaling

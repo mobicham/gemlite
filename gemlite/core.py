@@ -518,10 +518,10 @@ class GemLiteLinearTriton(torch.nn.Module):
                 group_size = self.W_q.numel() // self.scales.numel()
             
             # Preshuffle weight scales to 5D TMA layout for fast loading
-            # Original: [K_S, N] -> 5D: [1, N//128, K_S//4, 2, 256]
+            # Original: [K_S, N] -> transpose to [N, K_S] -> 5D: [1, N//128, K_S//4, 2, 256]
             K_S = K // group_size
             if N % 128 == 0 and K_S % 4 == 0:
-                self.scales = self.scales.reshape(N // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N // 128, K_S // 4, 2, 256).contiguous()
+                self.scales = self.scales.T.contiguous().reshape(N // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N // 128, K_S // 4, 2, 256).contiguous()
             else:
                 # Keep 2D transposed layout for pointer-based fallback
                 self.scales = self.scales.T
