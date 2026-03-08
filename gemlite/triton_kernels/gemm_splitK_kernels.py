@@ -93,7 +93,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 while (block_size_k // g) % 4 != 0:
                     block_size_k *= 2
         else:
-            block_size_k = min(block_size_k, g)
+            block_size_k = max(min(block_size_k, g), 32) #tl.dot minimum K
 
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
@@ -202,7 +202,7 @@ def get_fast_autotune_config_nvidia():
     return configs
 
 def get_default_config_nvidia():
-    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':64, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2)]
+    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2),]
 
 ########################################################################################################################################################################
 #AMD - Instinct MI300X
@@ -720,7 +720,6 @@ def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
                         ) -> Tensor: 
         
     M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
-    #M, K, N = x.shape[0], W_q.shape[1] * elements_per_sample, W_q.shape[0] #W.T
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
 
     M_CLOSEST = get_closest_m(M)
@@ -739,14 +738,6 @@ def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         gemm_splitK_kernel = gemm_splitK_MX_kernel
         load_scales_as_block = True
         use_5d_scales = (scales.ndim == 5)
-
-        # When autotuner has only 1 config (default mode), pruning is skipped entirely.
-        # Adjust block sizes directly to satisfy 5D TMA descriptor requirements.
-        if use_5d_scales and len(gemm_splitK_MX_kernel.configs) == 1:
-            cfg = gemm_splitK_MX_kernel.configs[0]
-            cfg.kwargs['BLOCK_SIZE_N'] = max(cfg.kwargs.get('BLOCK_SIZE_N', 64), 128)
-            while (cfg.kwargs.get('BLOCK_SIZE_K', 64) // group_size) % 4 != 0:
-                cfg.kwargs['BLOCK_SIZE_K'] *= 2
     else:
         gemm_splitK_kernel = gemm_splitK_INT_kernel
         load_scales_as_block = False

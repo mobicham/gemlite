@@ -6,6 +6,12 @@ import triton.language as tl
 from triton.runtime import driver
 from ..dtypes import *
 
+# TMA descriptors require a global memory allocation
+from typing import Optional
+def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+triton.set_allocator(alloc_fn)
+
 @triton.jit
 def swizzle_tile_v1(pid, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
     grid_m     = tl.cdiv(M, BLOCK_SIZE_M)

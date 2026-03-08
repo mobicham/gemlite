@@ -90,7 +90,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 while (block_size_k // g) % 4 != 0:
                     block_size_k *= 2
         else:
-            block_size_k = min(block_size_k, g)
+            block_size_k = max(min(block_size_k, g), 32) #tl.dot minimum K
 
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
 
@@ -202,7 +202,7 @@ def get_fast_autotune_config_nvidia():
     return configs
 
 def get_default_config_nvidia():
-    return [triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':64, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':4}, num_warps=4, num_stages=4),]
+    return [triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2),]
 
 ########################################################################################################################################################################
 #AMD - Instinct MI300X
@@ -323,6 +323,7 @@ def gemm_INT_kernel(
     meta_evict_policy: tl.constexpr = "evict_last",
     a_evict: tl.constexpr = "",
     b_evict: tl.constexpr = "evict_first",
+    USE_5D_SCALES: tl.constexpr = False,
 ):
     """
     Based on https://github.com/fpgaminer/GPTQ-triton
@@ -441,7 +442,6 @@ def gemm_INT_kernel(
         if not EVEN_K:
             a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
 
-
     #############################################################################################################
     #Channel-wise scaling
     if(channel_scale_mode == 1): #weight-only
@@ -466,171 +466,163 @@ def gemm_INT_kernel(
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
     tl.store(c_ptrs, acc, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N)) 
 
+# @triton.autotune(
+#     configs = get_autotune_config(),
+#     key = KEYS, 
+#     prune_configs_by = {'early_config_prune': kernel_config_pruner},
+#     use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
+# )
+# @triton.jit
+# def gemm_INT_kernel_persistent_tma(
+#     a_ptr, b_ptr, c_ptr,
+#     scales_ptr, zeros_ptr, scales_a_ptr,
+#     M, N, K, M_CLOSEST,
+#     ######### Quant parms #########
+#     W_nbits: tl.constexpr, 
+#     group_size: tl.constexpr, 
+#     unpack_mask: tl.constexpr, 
+#     elements_per_sample: tl.constexpr, 
+#     #################################
+#     type_id: tl.constexpr,
+#     a_sizeof: tl.constexpr,
+#     b_sizeof: tl.constexpr,
+#     ######### Strides #########
+#     stride_am: tl.constexpr, stride_ak: tl.constexpr,
+#     stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+#     stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+#     stride_meta_a_m: tl.constexpr, stride_meta_a_g: tl.constexpr,
+#     stride_meta_g: tl.constexpr, stride_meta_n: tl.constexpr,
+#     ######### Dtypes #########
+#     load_scales_as_block: tl.constexpr, #False
+#     input_dtype: tl.constexpr,
+#     output_dtype: tl.constexpr,
+#     acc_dtype: tl.constexpr,
+#     meta_dtype: tl.constexpr,
+#     ######### Meta-data mode #########
+#     channel_scale_mode: tl.constexpr,
+#     W_group_mode: tl.constexpr,
+#     zero_is_scalar: tl.constexpr,
+#     ######### tuning params #########
+#     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+#     GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr,
+#     #################################
+#     EVEN_M: tl.constexpr = False, 
+#     EVEN_K: tl.constexpr = False, 
+#     EVEN_N: tl.constexpr = False,
+#     #################################
+#     A_load_order: tl.constexpr = 0, 
+#     data_contiguous: tl.constexpr = True,
+#     #################################
+#     meta_evict_policy: tl.constexpr = '',
+#     a_evict: tl.constexpr = '',
+#     b_evict: tl.constexpr = '',
+#     NUM_SMS: tl.constexpr = 8,
+# ):
+#     """
+#     Persistent + TMA version.
+#     A: (M, K) fp16/bf16
+#     B_packed: (K//elements_per_sample, N) int32
+#     scales/zeros: (num_groups, N) or other depending on W_group_mode
+#     """
 
-
-# TMA descriptors require a global memory allocation
-from typing import Optional
-def alloc_fn(size: int, alignment: int, stream: Optional[int]):
-    return torch.empty(size, device="cuda", dtype=torch.int8)
-triton.set_allocator(alloc_fn)
-
-@triton.autotune(
-    configs = get_autotune_config(),
-    key = KEYS, 
-    prune_configs_by = {'early_config_prune': kernel_config_pruner},
-    use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
-)
-@triton.jit
-def gemm_INT_kernel_persistent_tma(
-    a_ptr, b_ptr, c_ptr,
-    scales_ptr, zeros_ptr, scales_a_ptr,
-    M, N, K, M_CLOSEST,
-    ######### Quant parms #########
-    W_nbits: tl.constexpr, 
-    group_size: tl.constexpr, 
-    unpack_mask: tl.constexpr, 
-    elements_per_sample: tl.constexpr, 
-    #################################
-    type_id: tl.constexpr,
-    a_sizeof: tl.constexpr,
-    b_sizeof: tl.constexpr,
-    ######### Strides #########
-    stride_am: tl.constexpr, stride_ak: tl.constexpr,
-    stride_bk: tl.constexpr, stride_bn: tl.constexpr,
-    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
-    stride_meta_a_m: tl.constexpr, stride_meta_a_g: tl.constexpr,
-    stride_meta_g: tl.constexpr, stride_meta_n: tl.constexpr,
-    ######### Dtypes #########
-    load_scales_as_block: tl.constexpr, #False
-    input_dtype: tl.constexpr,
-    output_dtype: tl.constexpr,
-    acc_dtype: tl.constexpr,
-    meta_dtype: tl.constexpr,
-    ######### Meta-data mode #########
-    channel_scale_mode: tl.constexpr,
-    W_group_mode: tl.constexpr,
-    zero_is_scalar: tl.constexpr,
-    ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr,
-    #################################
-    EVEN_M: tl.constexpr = False, 
-    EVEN_K: tl.constexpr = False, 
-    EVEN_N: tl.constexpr = False,
-    #################################
-    A_load_order: tl.constexpr = 0, 
-    data_contiguous: tl.constexpr = True,
-    #################################
-    meta_evict_policy: tl.constexpr = '',
-    a_evict: tl.constexpr = '',
-    b_evict: tl.constexpr = '',
-    NUM_SMS: tl.constexpr = 8,
-):
-    """
-    Persistent + TMA version.
-    A: (M, K) fp16/bf16
-    B_packed: (K//elements_per_sample, N) int32
-    scales/zeros: (num_groups, N) or other depending on W_group_mode
-    """
-
-    # ---------------------------
-    # Persistent tiling setup
-    # ---------------------------
-    start_pid = tl.program_id(0).to(tl.int32)
+#     # ---------------------------
+#     # Persistent tiling setup
+#     # ---------------------------
+#     start_pid = tl.program_id(0).to(tl.int32)
    
-    grid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    grid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_tiles = grid_m * grid_n
-    width = GROUP_SIZE_M * grid_n  # tiles per "group stripe"
+#     grid_m = tl.cdiv(M, BLOCK_SIZE_M)
+#     grid_n = tl.cdiv(N, BLOCK_SIZE_N)
+#     num_tiles = grid_m * grid_n
+#     width = GROUP_SIZE_M * grid_n  # tiles per "group stripe"
 
-    a_desc = tl.make_tensor_descriptor(
-        a_ptr,
-        [M, K],
-        [stride_am, stride_ak],
-        [BLOCK_SIZE_M, BLOCK_SIZE_K]
-    )
+#     a_desc = tl.make_tensor_descriptor(
+#         a_ptr,
+#         [M, K],
+#         [stride_am, stride_ak],
+#         [BLOCK_SIZE_M, BLOCK_SIZE_K]
+#     )
 
-    # b_desc = tl.make_tensor_descriptor(
-    #     b_ptr,
-    #     [K, N],
-    #     [stride_bk, stride_bn],
-    #     [BLOCK_SIZE_K, BLOCK_SIZE_N]
-    # )
+#     # b_desc = tl.make_tensor_descriptor(
+#     #     b_ptr,
+#     #     [K, N],
+#     #     [stride_bk, stride_bn],
+#     #     [BLOCK_SIZE_K, BLOCK_SIZE_N]
+#     # )
     
-    #transposed : use self.W_q = self.W_q.contiguous().t()
-    b_desc = tl.make_tensor_descriptor(
-        b_ptr,
-        [N, K],
-        [stride_bn, stride_bk],
-        [BLOCK_SIZE_N, BLOCK_SIZE_K]
-    )
+#     #transposed : use self.W_q = self.W_q.contiguous().t()
+#     b_desc = tl.make_tensor_descriptor(
+#         b_ptr,
+#         [N, K],
+#         [stride_bn, stride_bk],
+#         [BLOCK_SIZE_N, BLOCK_SIZE_K]
+#     )
         
-    # # Precompute unpack shifts (vector length = elements_per_sample)
-    # # shifts = [0, W_nbits, 2*W_nbits, ...]
-    # shifts = (tl.arange(0, elements_per_sample) * W_nbits).to(tl.int32)
+#     # # Precompute unpack shifts (vector length = elements_per_sample)
+#     # # shifts = [0, W_nbits, 2*W_nbits, ...]
+#     # shifts = (tl.arange(0, elements_per_sample) * W_nbits).to(tl.int32)
 
-    # # Optional scalar zero
-    # if zero_is_scalar:
-    #     zero_scalar = tl.load(zeros_ptr, eviction_policy="evict_last")
+#     # # Optional scalar zero
+#     # if zero_is_scalar:
+#     #     zero_scalar = tl.load(zeros_ptr, eviction_policy="evict_last")
 
-    #############################################################################################################
-    # Main loop
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
-        group_id = tile_id // width
-        first_m = group_id * GROUP_SIZE_M
-        gs = tl.minimum(grid_m - first_m, GROUP_SIZE_M)
+#     #############################################################################################################
+#     # Main loop
+#     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+#         group_id = tile_id // width
+#         first_m = group_id * GROUP_SIZE_M
+#         gs = tl.minimum(grid_m - first_m, GROUP_SIZE_M)
         
-        pid_m = first_m + (tile_id % gs)
-        pid_n = (tile_id % width) // gs
+#         pid_m = first_m + (tile_id % gs)
+#         pid_n = (tile_id % width) // gs
 
-        rm = pid_m * BLOCK_SIZE_M
-        rn = pid_n * BLOCK_SIZE_N
+#         rm = pid_m * BLOCK_SIZE_M
+#         rn = pid_n * BLOCK_SIZE_N
 
-        # Accumulator
-        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+#         # Accumulator
+#         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        # Column indices for this tile (used for metadata + store)
-        offs_n = rn + tl.arange(0, BLOCK_SIZE_N)
-        n_mask = offs_n < N
+#         # Column indices for this tile (used for metadata + store)
+#         offs_n = rn + tl.arange(0, BLOCK_SIZE_N)
+#         n_mask = offs_n < N
 
-        # K loop
-        for k in tl.range(0, K, BLOCK_SIZE_K):
-            a = tl.load_tensor_descriptor(a_desc, [rm, k])
+#         # K loop
+#         for k in tl.range(0, K, BLOCK_SIZE_K):
+#             a = tl.load_tensor_descriptor(a_desc, [rm, k])
 
-            k_packed = k // elements_per_sample
-            #b = tl.load_tensor_descriptor(b_desc, [k_packed, rn])
-            b = tl.load_tensor_descriptor(b_desc, [rn, k_packed]).T #Transposed 
+#             k_packed = k // elements_per_sample
+#             #b = tl.load_tensor_descriptor(b_desc, [k_packed, rn])
+#             b = tl.load_tensor_descriptor(b_desc, [rn, k_packed]).T #Transposed 
 
-            acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype)
+#             acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype)
 
-        #############################################################################################################
-        # Channel-wise scaling
-        offs_m = rm + tl.arange(0, BLOCK_SIZE_M)
-        m_mask = offs_m < M
-        if channel_scale_mode == 1:  # weight-only
-            # expects a 1D per-N scale at scales_ptr (same as your original)
-            scales_b = tl.load(scales_ptr + offs_n, mask=n_mask, other=1.0, eviction_policy=meta_evict_policy)
-            acc = acc.to(meta_dtype) * scales_b[None, :]
+#         #############################################################################################################
+#         # Channel-wise scaling
+#         offs_m = rm + tl.arange(0, BLOCK_SIZE_M)
+#         m_mask = offs_m < M
+#         if channel_scale_mode == 1:  # weight-only
+#             # expects a 1D per-N scale at scales_ptr (same as your original)
+#             scales_b = tl.load(scales_ptr + offs_n, mask=n_mask, other=1.0, eviction_policy=meta_evict_policy)
+#             acc = acc.to(meta_dtype) * scales_b[None, :]
 
-        if channel_scale_mode == 2:  # activation-only
-            scales_a = tl.load(scales_a_ptr + offs_m, mask=m_mask, other=1.0, eviction_policy=meta_evict_policy)
-            acc = acc.to(meta_dtype) * scales_a[:, None]
+#         if channel_scale_mode == 2:  # activation-only
+#             scales_a = tl.load(scales_a_ptr + offs_m, mask=m_mask, other=1.0, eviction_policy=meta_evict_policy)
+#             acc = acc.to(meta_dtype) * scales_a[:, None]
 
-        if channel_scale_mode == 3:  # weight + activation
-            scales_a = tl.load(scales_a_ptr + offs_m, mask=m_mask, other=1.0, eviction_policy=meta_evict_policy)
-            scales_b = tl.load(scales_ptr + offs_n, mask=n_mask, other=1.0, eviction_policy=meta_evict_policy)
-            acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+#         if channel_scale_mode == 3:  # weight + activation
+#             scales_a = tl.load(scales_a_ptr + offs_m, mask=m_mask, other=1.0, eviction_policy=meta_evict_policy)
+#             scales_b = tl.load(scales_ptr + offs_n, mask=n_mask, other=1.0, eviction_policy=meta_evict_policy)
+#             acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
 
-        acc = acc.to(output_dtype)
+#         acc = acc.to(output_dtype)
 
-        #############################################################################################################
-        # Store
-        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        mask = (m_mask[:, None] & n_mask[None, :]).to(tl.int1)
-        if EVEN_M and EVEN_N:
-            tl.store(c_ptrs, acc)
-        else:
-            tl.store(c_ptrs, acc, mask=mask)
+#         #############################################################################################################
+#         # Store
+#         c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+#         mask = (m_mask[:, None] & n_mask[None, :]).to(tl.int1)
+#         if EVEN_M and EVEN_N:
+#             tl.store(c_ptrs, acc)
+#         else:
+#             tl.store(c_ptrs, acc, mask=mask)
 
 @triton.autotune(
     configs = get_autotune_config(),
@@ -642,7 +634,6 @@ def gemm_INT_kernel_persistent_tma(
 def gemm_MX_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
-    #M, N, K, M_CLOSEST,
     M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, M_CLOSEST: tl.constexpr,
     ######### Quant parms #########
     W_nbits: tl.constexpr,
@@ -852,7 +843,6 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
     
     global PRINTED
     M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
-    #M, K, N = x.shape[0], W_q.shape[1] * elements_per_sample, W_q.shape[0] #W.T
     M_CLOSEST = get_closest_m(M)
     
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
@@ -866,60 +856,36 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         stride_meta_a_m, stride_meta_a_g = None, None
 
     if(is_mx_dtype(input_dtype)):
+        gemm_kernel = gemm_MX_kernel
+        load_scales_as_block = True
         use_5d_scales = (scales.ndim == 5)
-
-        # When autotuner has only 1 config (default mode), pruning is skipped entirely.
-        # Adjust block sizes directly to satisfy 5D TMA descriptor requirements.
-        if use_5d_scales and len(gemm_MX_kernel.configs) == 1:
-            cfg = gemm_MX_kernel.configs[0]
-            cfg.kwargs['BLOCK_SIZE_N'] = max(cfg.kwargs.get('BLOCK_SIZE_N', 64), 128)
-            while (cfg.kwargs.get('BLOCK_SIZE_K', 64) // group_size) % 4 != 0:
-                cfg.kwargs['BLOCK_SIZE_K'] *= 2
-
-        gemm_MX_kernel[grid](
-            x, W_q, output,
-            scales, zeros, scales_x,
-            M, N, K, M_CLOSEST,
-            W_nbits, group_size, unpack_mask, elements_per_sample,
-            type_id, x.dtype.itemsize, W_q.dtype.itemsize,
-            x.stride(0), x.stride(1),
-            W_q.stride(0), W_q.stride(1),
-            output.stride(0), output.stride(1),
-            stride_meta_a_m, stride_meta_a_g,
-            0 if use_5d_scales else scales.stride(0), 0 if use_5d_scales else scales.stride(1),
-            load_scales_as_block = True,
-            input_dtype  = DTYPE_TO_TRITON[input_dtype],
-            output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
-            acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
-            meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
-            channel_scale_mode = channel_scale_mode,
-            W_group_mode       = W_group_mode,
-            zero_is_scalar     = zeros.numel() == 1,
-            data_contiguous    = data_contiguous,
-            USE_5D_SCALES      = use_5d_scales,
-        )
     else:
-        gemm_INT_kernel[grid](
-            x, W_q, output, 
-            scales, zeros, scales_x,
-            M, N, K, M_CLOSEST,
-            W_nbits, group_size, unpack_mask, elements_per_sample,
-            type_id, x.dtype.itemsize, W_q.dtype.itemsize,
-            x.stride(0), x.stride(1),
-            W_q.stride(0), W_q.stride(1),
-            output.stride(0), output.stride(1),
-            stride_meta_a_m, stride_meta_a_g,
-            scales.stride(0), scales.stride(1),
-            load_scales_as_block = False,
-            input_dtype  = DTYPE_TO_TRITON[input_dtype],
-            output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
-            acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
-            meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
-            channel_scale_mode = channel_scale_mode,
-            W_group_mode       = W_group_mode,
-            zero_is_scalar     = zeros.numel() == 1,
-            data_contiguous    = data_contiguous,
-        )
+        gemm_kernel = gemm_INT_kernel
+        load_scales_as_block = False
+        use_5d_scales = False
+
+    gemm_kernel[grid](
+        x, W_q, output,
+        scales, zeros, scales_x,
+        M, N, K, M_CLOSEST,
+        W_nbits, group_size, unpack_mask, elements_per_sample,
+        type_id, x.dtype.itemsize, W_q.dtype.itemsize,
+        x.stride(0), x.stride(1),
+        W_q.stride(0), W_q.stride(1),
+        output.stride(0), output.stride(1),
+        stride_meta_a_m, stride_meta_a_g,
+        0 if use_5d_scales else scales.stride(0), 0 if use_5d_scales else scales.stride(1),
+        load_scales_as_block = load_scales_as_block,
+        input_dtype  = DTYPE_TO_TRITON[input_dtype],
+        output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
+        acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
+        meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
+        channel_scale_mode = channel_scale_mode,
+        W_group_mode       = W_group_mode,
+        zero_is_scalar     = zeros.numel() == 1,
+        data_contiguous    = data_contiguous,
+        USE_5D_SCALES      = use_5d_scales,
+    )
     
     return output
 
