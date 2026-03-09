@@ -836,7 +836,7 @@ class A4W4_MXFP_dynamic:
         assert weight.dtype in [torch.uint8], f"Invalid weight.dtype, should be an MXPF8 valid dtype, got {weight.dtype}."
         assert scales.dtype in [torch.float8_e8m0fnu, torch.uint8], f"Invalid scales.dtype, should be e8m0 / view(uint8), got {scales.dtype}."
         assert self.dtype is not None, f"Input dtype should be either torch.float16 or torch.bfloat16, not None."
-        assert self.group_size == 32, f"Only group_size=16 is supported for MXFP4, got {self.group_size}"
+        assert self.group_size == 32, f"Only group_size=32 is supported for MXFP4, got {self.group_size}"
 
         dtype = self.dtype 
         gemlite_dtype = TORCH_TO_DTYPE[dtype]

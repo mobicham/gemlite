@@ -39,6 +39,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_dec_producer', None)
             config.pop('reg_inc_consumer', None)
 
+            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
+
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps, pre_hook=pre_hook)
             return
 
@@ -76,6 +78,9 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         if(block_size_k < e):
             continue
 
+
+        even_n = (n % block_size_n == 0)
+
         key = (block_size_m, block_size_n, block_size_k, A_load_order, dot_prod_mode, num_stages, num_warps)
 
         new_config = {
@@ -84,6 +89,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             'BLOCK_SIZE_K': block_size_k,
             'A_load_order': A_load_order,
             'dot_prod_mode': dot_prod_mode,
+            'EVEN_N': even_n,
         }
 
         if IS_HIP:
@@ -272,6 +278,7 @@ def gemv_INT_revsplitK_kernel(
     atomic_mode: tl.constexpr = 'relaxed',
     a_evict: tl.constexpr = 'evict_last',
     b_evict: tl.constexpr = 'evict_first',
+    EVEN_N: tl.constexpr = False,
 ):
     """
     GEMV for C = matmul(A, dequantize(B, scales, zeros)). This is optimized for M==1
@@ -303,6 +310,8 @@ def gemv_INT_revsplitK_kernel(
     a_ptrs  = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak  
     b_ptrs  = b_ptr + ((offs_k[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn) 
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
+    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N)).to(tl.int1)
 
     #Stage 0: Load scales/zeros
     #-----------------------------------------------------------------------------------------------------------
@@ -328,12 +337,12 @@ def gemv_INT_revsplitK_kernel(
     #-----------------------------------------------------------------------------------------------------------
     #Load
     if(A_load_order == 0):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     
-    b = tl.load(b_ptrs, eviction_policy=b_evict) 
+    b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
     if(A_load_order == 1):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
 
     # Unpack and dequantize    
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
@@ -350,16 +359,18 @@ def gemv_INT_revsplitK_kernel(
     #Advance and load next chunk
     a_ptrs += BLOCK_SIZE_K * stride_ak
     b_ptrs += (BLOCK_SIZE_K // elements_per_sample) * stride_bk
+    a_mask  = ((offs_am[:, None] < M) & ((offs_ak[None, :] + BLOCK_SIZE_K) < K)).to(tl.int1)
+    b_mask  = (((offs_bk[:, None] + BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N)).to(tl.int1)
 
     #Stage 2
     #-----------------------------------------------------------------------------------------------------------
     if(A_load_order == 0):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     
-    b = tl.load(b_ptrs, eviction_policy=b_evict) 
+    b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
     if(A_load_order == 1):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
 
     # Unpack and dequantize    
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
@@ -395,7 +406,11 @@ def gemv_INT_revsplitK_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+    if EVEN_N:
+        tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+    else:
+        mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode)
     
 KERNEL_CACHE = {}
 
@@ -464,7 +479,7 @@ def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor
         W_group_mode       = W_group_mode,
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
-        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype in [DType.FP16.value] and W_nbits == 8) else 0, #Warning: Only use with INT8
+        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype == tl.float16 and W_nbits == 8) else 0, #Warning: Only use with INT8
     )
 
     if(not native_atomic):

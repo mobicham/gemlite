@@ -214,13 +214,15 @@ class WeightQuantizerMXFP:
 
         return W_q, scales
 
-    def dequantize(self, W_q, scales, shape = None, dtype = None):
+    def dequantize(self, W_q, scales, shape = None, dtype = None, meta_scales = None):
         if(W_q.dtype == torch.uint8): #from indices
             device_index = W_q.device.index
             W_q = fp4_values[device_index][W_q.int()]
 
         group_size = W_q.numel() // scales.numel()
         out = (W_q.view([-1, group_size]).float() * scales.float())
+        if meta_scales is not None:
+            out = out * meta_scales
         if(shape is not None):
             out = out.view(shape)
         return out.to(self.compute_dtype if dtype is None else dtype)
@@ -1478,7 +1480,7 @@ def scale_activations_nvfp4_triton(tensor: torch.Tensor) -> Tuple[torch.Tensor, 
 @triton.jit
 def scale_activations_mxfp4_triton_kernel_v2(
     tensor_ptr, out_ptr, scales_ptr, thr_pos_ptr,
-    M, K,
+    M, M_padded, K,
     stride_m_t: tl.constexpr, stride_k_t: tl.constexpr,
     stride_m_s: tl.constexpr, stride_k_s: tl.constexpr,
     stride_m_o: tl.constexpr, stride_k_o: tl.constexpr,
@@ -1568,7 +1570,7 @@ def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
 
     scale_activations_mxfp4_triton_kernel_v2[grid](
         tensor, out, scales, thr_pos[device_index],
-        M, K,
+        M, M_padded, K,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),
@@ -1595,7 +1597,7 @@ def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
 @triton.jit
 def scale_activations_nvfp4_triton_kernel_v2(
     tensor_ptr, out_ptr, scales_ptr, thr_pos_ptr,
-    M, K,
+    M, M_padded, K,
     stride_m_t: tl.constexpr, stride_k_t: tl.constexpr,
     stride_m_s: tl.constexpr, stride_k_s: tl.constexpr,
     stride_m_o: tl.constexpr, stride_k_o: tl.constexpr,
@@ -1690,7 +1692,7 @@ def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor) -> Tuple[torch.Tenso
 
     scale_activations_nvfp4_triton_kernel_v2[grid](
         tensor, out, scales, thr_pos[device_index],
-        M, K,
+        M, M_padded, K,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),

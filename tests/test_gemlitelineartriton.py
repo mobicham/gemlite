@@ -1,4 +1,9 @@
 #python -m unittest test_gemlitelineartriton.py
+# Usage: python3 test_file.py [--autotune]
+import sys
+_autotune = '--autotune' in sys.argv
+if _autotune: sys.argv.remove('--autotune')
+
 
 import unittest
 import torch
@@ -18,8 +23,9 @@ compute_dtype = torch.bfloat16 #float16, bfloat16
 fp8_dtype     = torch.float8_e4m3fn #float8_e4m3fn / torch.float8_e5m2 (Nvidia)
 gemlite_dtype = TORCH_TO_DTYPE[compute_dtype]
 matmul_types  = ['GEMV_REVSPLITK', 'GEMV', 'GEMV_SPLITK', 'GEMM_SPLITK', 'GEMM']
+
 reset_config()
-set_autotune(False)
+if _autotune is False: set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
 in_features, out_features = 4032, 2032
@@ -358,3 +364,5 @@ class TestGemLiteLinearTriton(unittest.TestCase):
             return torch.matmul(x.to(compute_dtype), W.T)
 
         self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn) #needs higher tolerance with fp8
+if __name__ == '__main__':
+    unittest.main()

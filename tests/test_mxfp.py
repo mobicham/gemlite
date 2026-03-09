@@ -1,4 +1,8 @@
 #python -m unittest test_mxfp.py
+# Usage: python3 test_file.py [--autotune]
+import sys
+_autotune = '--autotune' in sys.argv
+if _autotune: sys.argv.remove('--autotune')
 
 import unittest
 import torch
@@ -15,8 +19,9 @@ def is_fp8_supported(device_index=0):
 device        = 'cuda:0'
 compute_dtype = torch.bfloat16 #float16, bfloat16
 matmul_types  = ['GEMM', 'GEMM_SPLITK'] #TODO: improve GEMV mxfp accuracy.
+
 reset_config()
-set_autotune(False)
+if _autotune is False: set_autotune(False)
 KERNEL.ENABLE_CACHING = False
 
 torch.random.manual_seed(0)
@@ -93,3 +98,6 @@ class TestGemliteMXFP(unittest.TestCase):
 		self.eval(gemlite_linear, tol = 2e-3)
 
 
+
+if __name__ == '__main__':
+    unittest.main()

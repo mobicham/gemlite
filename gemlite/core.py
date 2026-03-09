@@ -66,7 +66,7 @@ GEMLITE_MATMUL_TYPES         = [kernel.matmul_type for kernel in GEMLITE_TRITON_
 GEMLITE_MATMUL_TYPES_MAPPING = {GEMLITE_MATMUL_TYPES[i]: i for i in range(len(GEMLITE_MATMUL_TYPES))}
 GEMLITE_TRITON_CONFIG_CACHE  = {} #Global config cache for all the kernels
 _GROUP_SIZE_WARNED           = False
-GEMLITE_USE_TMA              = True
+GEMLITE_USE_TMA              = True # Set to False for faster MXFP8 on sm_120
 
 ###################################################################################
 #Utils

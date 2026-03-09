@@ -340,6 +340,7 @@ def gemv_INT_splitK_kernel(
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)  
     b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn)
     a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
+    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N)).to(tl.int1)
         
     #Meta data stuff
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
@@ -369,7 +370,10 @@ def gemv_INT_splitK_kernel(
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
 
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
+        if EVEN_K and EVEN_N:
+            b = tl.load(b_ptrs, eviction_policy=b_evict)
+        else:
+            b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
         if(A_load_order == 1): #Early load
             if EVEN_M and EVEN_K:
@@ -422,6 +426,7 @@ def gemv_INT_splitK_kernel(
         #Update mask
         if not EVEN_K:
             a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_U) < K)).to(tl.int1)
+            b_mask = ((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_U < K) & (offs_bn[None, :] < N)).to(tl.int1)
 
     if(dot_prod_mode == 0):
         acc = tl.sum(acc, axis=0, keep_dims=True) 
@@ -514,7 +519,7 @@ def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         W_group_mode       = W_group_mode,
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
-        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype == DType.FP16.value and W_nbits == 8) else 0, #Warning: Only use with INT8
+        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype == tl.float16 and W_nbits == 8) else 0, #Warning: Only use with INT8
     )
 
     if(not native_atomic):

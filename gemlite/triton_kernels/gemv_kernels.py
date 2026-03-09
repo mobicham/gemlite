@@ -51,6 +51,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_inc_consumer', None)
             config['NUM_STAGES'] = num_stages
 
+            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
+
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps, pre_hook=pre_hook)
             return
 
@@ -79,6 +81,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         num_stages    = config.num_stages
         num_warps     = config.num_warps
 
+        even_n = (n % block_size_n == 0)
+
         key = (block_size_m, block_size_n, block_size_k, A_load_order, dot_prod_mode, num_stages, num_warps)
 
         new_config = {
@@ -88,6 +92,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             'A_load_order': A_load_order,
             'dot_prod_mode': dot_prod_mode,
             'NUM_STAGES': num_stages,
+            'EVEN_N': even_n,
         }
 
         if IS_HIP:
@@ -278,6 +283,7 @@ def gemv_INT_kernel(
     join_version: tl.constexpr = False,
     #################################
     load_scales_as_block: tl.constexpr = False,
+    EVEN_N: tl.constexpr = False,
 ):
     """
     GEMV for C = matmul(A, dequantize(B, scales, zeros)). This is optimized for M==1
@@ -322,14 +328,12 @@ def gemv_INT_kernel(
     ###################################################################
     #Load
     if(A_load_order == 0):
-        a = tl.load(a_ptrs, eviction_policy=a_evict)
-        #a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
-    b = tl.load(b_ptrs, eviction_policy=b_evict)
-    #b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+    b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
     if(A_load_order == 1):
-        a = tl.load(a_ptrs, eviction_policy=a_evict)
+        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
     
     if(W_group_mode > 0):
         k_m = (pid_k * (BLOCK_SIZE_K / group_size)).to(tl.int32)
@@ -348,7 +352,7 @@ def gemv_INT_kernel(
         zeros = None
     
     if(A_load_order == 2):
-        a = tl.load(a_ptrs, eviction_policy=a_evict)
+        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
     #tl.join() version
     if(join_version):
@@ -365,7 +369,7 @@ def gemv_INT_kernel(
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
     if(A_load_order == 3):
-        a = tl.load(a_ptrs, eviction_policy=a_evict)
+        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
     if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
         
@@ -398,7 +402,11 @@ def gemv_INT_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    tl.atomic_add(c_ptrs, acc, sem=atomic_mode) 
+    if EVEN_N:
+        tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+    else:
+        mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode)
 
 
 @triton.autotune(
@@ -459,6 +467,7 @@ def gemv_MX_kernel(
     join_version: tl.constexpr = False,
     #################################
     load_scales_as_block: tl.constexpr = False,
+    EVEN_N: tl.constexpr = False,
 ):
     """
     GEMV for C = matmul(A, dequantize(B, scales, zeros)). This is optimized for M==1
@@ -507,8 +516,7 @@ def gemv_MX_kernel(
     if(A_load_order == 0):
         a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
-    b = tl.load(b_ptrs, eviction_policy=b_evict)
-    #b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+    b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
     if(A_load_order == 1):
         a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
@@ -572,7 +580,11 @@ def gemv_MX_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    tl.atomic_add(c_ptrs, acc, sem=atomic_mode) 
+    if EVEN_N:
+        tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+    else:
+        mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode)
 
 #TODO: gemv not generating correct reuslts with mxfp dtypes use except for A16W4.
 def gemv_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
@@ -654,7 +666,7 @@ def gemv_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         W_group_mode       = W_group_mode,
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
-        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype == DType.FP16.value and W_nbits == 8) else 0, #Warning: Only use with INT8
+        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype == tl.float16 and W_nbits == 8) else 0, #Warning: Only use with INT8
     )
 
     if(not native_atomic):
