@@ -12,6 +12,7 @@ from .core import (
     set_acc_dtype,
     set_autotune,
     set_kernel_caching,
+    enable_tma,
     forward_functional,
 )
 

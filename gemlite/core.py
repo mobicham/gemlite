@@ -66,6 +66,7 @@ GEMLITE_MATMUL_TYPES         = [kernel.matmul_type for kernel in GEMLITE_TRITON_
 GEMLITE_MATMUL_TYPES_MAPPING = {GEMLITE_MATMUL_TYPES[i]: i for i in range(len(GEMLITE_MATMUL_TYPES))}
 GEMLITE_TRITON_CONFIG_CACHE  = {} #Global config cache for all the kernels
 _GROUP_SIZE_WARNED           = False
+GEMLITE_USE_TMA              = True
 
 ###################################################################################
 #Utils
@@ -95,6 +96,11 @@ def set_acc_dtype(dtype):
     global GEMLITE_ACC_DTYPE
     assert dtype in [DType.FP16, DType.FP32], "Invalid dtype (should be DType.FP16 or DType.FP32)."
     GEMLITE_ACC_DTYPE[DType.FP16] = dtype
+
+#Enable/disable TMA for MX kernel data loading
+def enable_tma(enabled: bool = True):
+    global GEMLITE_USE_TMA
+    GEMLITE_USE_TMA = enabled
 
 #Return the default gemv kernel to use for M==1
 def get_default_gemv(W_nbits: int, mx_dtype: bool = False) -> str:
@@ -341,7 +347,7 @@ class GemLiteLinearTriton(torch.nn.Module):
             if s.ndim == 2:
                 s_2d = s.T.contiguous()  # [K_S, N] contiguous
                 N_dim, K_S = s_2d.shape[1], s_2d.shape[0]
-                if N_dim % 128 == 0 and K_S % 4 == 0:
+                if GEMLITE_USE_TMA and N_dim % 128 == 0 and K_S % 4 == 0:
                     self.scales = s_2d.reshape(N_dim // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N_dim // 128, K_S // 4, 2, 256).contiguous()
 
     #Make sure to feed UINT8 W_q for packing
@@ -520,7 +526,7 @@ class GemLiteLinearTriton(torch.nn.Module):
             # Preshuffle weight scales to 5D TMA layout for fast loading
             # Original: [K_S, N] -> transpose to [N, K_S] -> 5D: [1, N//128, K_S//4, 2, 256]
             K_S = K // group_size
-            if N % 128 == 0 and K_S % 4 == 0:
+            if GEMLITE_USE_TMA and N % 128 == 0 and K_S % 4 == 0:
                 self.scales = self.scales.T.contiguous().reshape(N // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N // 128, K_S // 4, 2, 256).contiguous()
             else:
                 # Keep 2D transposed layout for pointer-based fallback

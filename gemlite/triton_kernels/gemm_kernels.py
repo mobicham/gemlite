@@ -314,6 +314,7 @@ def gemm_INT_kernel(
     a_evict: tl.constexpr = "",
     b_evict: tl.constexpr = "evict_first",
     USE_5D_SCALES: tl.constexpr = False,
+    use_tma: tl.constexpr = True,
 ):
     """
     Based on https://github.com/fpgaminer/GPTQ-triton
@@ -848,6 +849,7 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
     
     
     global PRINTED
+    from ..core import GEMLITE_USE_TMA
     M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
     M_CLOSEST = get_closest_m(M)
     
@@ -891,6 +893,7 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
         USE_5D_SCALES      = use_5d_scales,
+        use_tma            = GEMLITE_USE_TMA,
     )
     
     return output

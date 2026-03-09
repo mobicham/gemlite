@@ -328,6 +328,7 @@ def gemm_splitK_INT_kernel(
     USE_5D_SCALES: tl.constexpr = False,
     SCALES_5D_SHAPE1: tl.constexpr = 0,
     SCALES_5D_SHAPE2: tl.constexpr = 0,
+    use_tma: tl.constexpr = True,
 ):
     """
     Based on https://github.com/foundation-model-stack/foundation-model-stack/blob/triton/triton/kernels/gptq/splitk_dequant_gemm.py
@@ -736,6 +737,7 @@ def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
                         channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 
                         ) -> Tensor: 
         
+    from ..core import GEMLITE_USE_TMA
     M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
 
@@ -787,6 +789,7 @@ def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         USE_5D_SCALES      = use_5d_scales,
         SCALES_5D_SHAPE1   = N // 128 if use_5d_scales else 0,
         SCALES_5D_SHAPE2   = K // group_size // 4 if use_5d_scales else 0,
+        use_tma            = GEMLITE_USE_TMA,
     )
 
     if(not native_atomic):
