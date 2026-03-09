@@ -11,7 +11,7 @@ import triton
 device, dtype = 'cuda:0', torch.bfloat16
 repeat = 32
 
-#gemlite.reset_cache()
+gemlite.reset_config()
 #gemlite.set_autotune("max")
 #gemlite.core.enable_activation_scaling(2)
 
@@ -320,14 +320,23 @@ def run_benchmark(proc_name, M, K, N):
         old_cudagraph = _inductor_config.triton.cudagraph_trees
         _inductor_config.triton.cudagraph_trees = False
 
+        # NOTE: flashinfer's CUTLASS NVFP4 kernel requires M to be a multiple of 128.
+        # When M < 128, we pad M up to 128 so the kernel doesn't crash. The TFLOP/s
+        # are computed using the padded M to keep the comparison fair (same actual work).
+        M_padded = max(M, 128)
+        M_padded = ((M_padded + 127) // 128) * 128
+
         model = get_model(K, N, repeat=repeat)
         patch_model_flashinfer_nvfp4(model)
         model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
 
-        perf_time_ms = eval_model(model, M, K) / repeat
+        perf_time_ms = eval_model(model, M_padded, K) / repeat
         tflops = get_flops(M, K, N, perf_time_ms)
         label = "flashinfer NVFP4 (dynamic)"
-        print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
+        if M_padded != M:
+            print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s  (M padded to {M_padded} internally)")
+        else:
+            print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
 
         cleanup(model)
         _inductor_config.triton.cudagraph_trees = old_cudagraph

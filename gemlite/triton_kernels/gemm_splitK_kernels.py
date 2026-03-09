@@ -643,9 +643,13 @@ def gemm_splitK_MX_kernel(
             [1, rep_n, rep_k, 2, 256]
         )
 
-    # Used in channel-wise MXPF8 version
-    scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
-    scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+
+    if group_size == 16:
+        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
+        scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
+    else:
+        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+        scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
     
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k):

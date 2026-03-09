@@ -174,8 +174,15 @@ def get_fast_autotune_config_nvidia():
     #Large M×N tiles (pruner adapts M for large batch sizes)
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=3))
+    # NVFP4-friendly configs: BSK=128 allows stages=3/4 within 99KB smem (NVFP4 g=16 cant fit BSK=256 stages=3)
+    configs.append(triton.Config({"BLOCK_SIZE_M":128, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":0}, num_warps=8, num_stages=3))
+    configs.append(triton.Config({"BLOCK_SIZE_M":128, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":0}, num_warps=8, num_stages=4))
+    configs.append(triton.Config({"BLOCK_SIZE_M":128, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":2}, num_warps=8, num_stages=3))
+    configs.append(triton.Config({"BLOCK_SIZE_M":128, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":2}, num_warps=8, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=3))
-    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=3))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=2))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     #Extra coverage
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
@@ -750,9 +757,13 @@ def gemm_MX_kernel(
     if(channel_scale_mode == 4):
         scales_a_ptrs = scales_a_ptr + offs_am[:, None] * stride_meta_a_m + offs_k_scales[None, :] * stride_meta_a_g
     
-    # Used in channel-wise MXPF8 version
-    scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
-    scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+    # _1s dtype must match actual scale dtype: uint8 for MXFP (E8M0), float8e4nv for NVFP4 (E4M3)
+    if group_size == 16:
+        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
+        scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
+    else:
+        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+        scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
@@ -788,6 +799,10 @@ def gemm_MX_kernel(
                 scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, mask=_scale_a_k_mask, other=0.0, eviction_policy=meta_evict_policy)
         else:
             scales_a = scales_a_1s
+
+        #scales_b = scales_b_1s
+        #scales_a = scales_a_1s
+
         ####################################################################################
         
         acc = tl.dot_scaled(a, scales_a, a_dtype, b, scales_b, b_dtype, acc)
