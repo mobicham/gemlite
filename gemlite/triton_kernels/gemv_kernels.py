@@ -43,7 +43,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config     = copy.deepcopy(GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE][signature])
             num_stages = config.pop('num_stages')
             num_warps  = config.pop('num_warps')
-            num_ctas   = config.pop('num_ctas')
+            num_ctas   = config.pop('num_ctas', 1)
 
             config.pop('num_buffers_warp_spec', None)
             config.pop('num_consumer_groups', None)

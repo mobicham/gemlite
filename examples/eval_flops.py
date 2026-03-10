@@ -12,6 +12,7 @@ device, dtype = 'cuda:0', torch.bfloat16
 repeat = 32
 
 gemlite.reset_config()
+#gemlite.enable_cudagraph_autotune(True)
 #gemlite.set_autotune("max")
 #gemlite.core.enable_activation_scaling(2)
 

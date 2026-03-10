@@ -137,8 +137,7 @@ def estimate_shared_memory_per_block(block_size_m, block_size_n, block_size_k, a
         # scales_b: (BLOCK_N, BLOCK_K // group_size), scales_a: (BLOCK_M, BLOCK_K // group_size)
         sb_smem = block_size_n * (block_size_k // g) * 1
         sa_smem = block_size_m * (block_size_k // g) * 1
-        # 1.25x margin accounts for Triton alignment padding, barriers, and TMA descriptors
-        loop_smem = int((a_smem + b_smem + sb_smem + sa_smem) * max(num_stages - 1, 1) * 1.25)
+        loop_smem = (a_smem + b_smem + sb_smem + sa_smem) * max(num_stages - 1, 1)
         # Triton overlaps output buffer with loop data (reuses same SMEM)
         output_smem = block_size_m * block_size_n * 2  # bf16 output via TMA store
         estimated_smem = max(loop_smem, output_smem)

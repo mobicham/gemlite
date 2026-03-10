@@ -13,6 +13,7 @@ from .core import (
     set_autotune,
     set_kernel_caching,
     enable_tma,
+    enable_cudagraph_autotune,
     forward_functional,
 )
 

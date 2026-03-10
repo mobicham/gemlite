@@ -32,7 +32,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config     = copy.deepcopy(GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE][signature])
             num_stages = config.pop('num_stages')
             num_warps  = config.pop('num_warps')
-            num_ctas   = config.pop('num_ctas')
+            num_ctas   = config.pop('num_ctas', 1)
 
             config.pop('num_buffers_warp_spec', None)
             config.pop('num_consumer_groups', None)
@@ -181,7 +181,6 @@ def get_fast_autotune_config_nvidia():
     #Medium N tiles (N=128 — workhorse for MX/INT types)
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
     #Large N tiles
@@ -194,6 +193,16 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':64,  'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':2,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
     configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64,  'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
+    #Additional M=16 configs for MX kernel coverage
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':2,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=3))
+    configs.append(triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=3))
+    #M=32 tiles (for M=32..64 batch sizes)
+    configs.append(triton.Config({'BLOCK_SIZE_M':32, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':32, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':32, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':1,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':32, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':4,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({'BLOCK_SIZE_M':32, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'SPLIT_K':2,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=3))
     return configs
 
 def get_default_config_nvidia():

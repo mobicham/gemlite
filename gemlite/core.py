@@ -102,6 +102,10 @@ def enable_tma(enabled: bool = True):
     global GEMLITE_USE_TMA
     GEMLITE_USE_TMA = enabled
 
+#Enable/disable CUDA graph-based autotuning (more accurate but slower)
+def enable_cudagraph_autotune(enabled: bool = True):
+    set_autotune("fast", use_cuda_graph=enabled)
+
 #Return the default gemv kernel to use for M==1
 def get_default_gemv(W_nbits: int, mx_dtype: bool = False) -> str:
     #TODO: adapt mx for IS_HIP = True
@@ -112,7 +116,8 @@ def get_default_gemv(W_nbits: int, mx_dtype: bool = False) -> str:
 
 #matmul type selection logic
 def get_matmul_type(batch_size: int, W_nbits: int, mx_dtype: bool = False):
-    if batch_size > 64:
+    gemm_limit = 64
+    if batch_size >= gemm_limit:
         return "GEMM"
     gemv_limit = 4 if (W_nbits < 8 and not mx_dtype) else 2 # previous 1
     if batch_size > gemv_limit:
