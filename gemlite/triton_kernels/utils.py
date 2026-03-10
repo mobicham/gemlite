@@ -131,10 +131,17 @@ def estimate_shared_memory_per_block(block_size_m, block_size_n, block_size_k, a
     a_smem = block_size_m * block_size_k * a_sizeof
     if load_scales_as_block:
         # MX kernels: dot_scaled handles scaling natively, no dequant buffer
+        # A tile: packed elements (e.g. NVFP4 packs 2 per byte, so K_A = K // e)
+        a_smem = block_size_m * (block_size_k // e) * a_sizeof
         b_smem = (block_size_k // e) * block_size_n * b_sizeof
-        # scales: (BLOCK_N, BLOCK_K // group_size) × meta_sizeof
-        s_smem = block_size_n * (block_size_k // g) * 1  # uint8 or e4m3 = 1 byte
-        estimated_smem = (a_smem + b_smem + s_smem) * max(num_stages - 1, 1)
+        # scales_b: (BLOCK_N, BLOCK_K // group_size), scales_a: (BLOCK_M, BLOCK_K // group_size)
+        sb_smem = block_size_n * (block_size_k // g) * 1
+        sa_smem = block_size_m * (block_size_k // g) * 1
+        # 1.25x margin accounts for Triton alignment padding, barriers, and TMA descriptors
+        loop_smem = int((a_smem + b_smem + sb_smem + sa_smem) * max(num_stages - 1, 1) * 1.25)
+        # Triton overlaps output buffer with loop data (reuses same SMEM)
+        output_smem = block_size_m * block_size_n * 2  # bf16 output via TMA store
+        estimated_smem = max(loop_smem, output_smem)
     elif e > 1:
         # INT packed: need packed B + dequantized B for MMA
         b_smem = (block_size_k // e) * block_size_n * b_sizeof
