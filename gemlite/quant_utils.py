@@ -1987,7 +1987,10 @@ def scale_activations_mxfp4_triton_kernel_v5(
     GROUP_SIZE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    ptx_pack: tl.constexpr = True,
+    # Requires CUDA 13.0+ ptxas (Triton bundles 12.9 as of v3.3). To enable, replace
+    # the bundled ptxas-blackwell with the system one: cp /usr/local/cuda/bin/ptxas
+    # /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas-blackwell
+    ptx_pack: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -2132,7 +2135,10 @@ def scale_activations_nvfp4_triton_kernel_v5(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     meta_scales: tl.constexpr = NVFP4_META_SCALE,
-    ptx_pack: tl.constexpr = True,
+    # Requires CUDA 13.0+ ptxas (Triton bundles 12.9 as of v3.3). To enable, replace
+    # the bundled ptxas-blackwell with the system one: cp /usr/local/cuda/bin/ptxas
+    # /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas-blackwell
+    ptx_pack: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
