@@ -334,10 +334,9 @@ def gemm_splitK_INT_kernel(
     atomic_mode: tl.constexpr = 'relaxed',
     a_evict: tl.constexpr = 'evict_last',
     b_evict: tl.constexpr = 'evict_first',
-    USE_5D_SCALES: tl.constexpr = False,
-    SCALES_5D_SHAPE1: tl.constexpr = 0,
-    SCALES_5D_SHAPE2: tl.constexpr = 0,
+    ################################# dmmy
     use_tma: tl.constexpr = True,
+    use_5d_scales: tl.constexpr = False,
 ):
     """
     Based on https://github.com/foundation-model-stack/foundation-model-stack/blob/triton/triton/kernels/gptq/splitk_dequant_gemm.py
@@ -558,9 +557,7 @@ def gemm_splitK_MX_kernel(
     meta_scale_norm: tl.constexpr = (0.05 ** 2),
     #################################
     use_tma: tl.constexpr = True,
-    USE_5D_SCALES: tl.constexpr = False,
-    SCALES_5D_SHAPE1: tl.constexpr = 0,
-    SCALES_5D_SHAPE2: tl.constexpr = 0,
+    use_5d_scales: tl.constexpr = False,
 ):
     pid   = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -608,7 +605,7 @@ def gemm_splitK_MX_kernel(
     offs_k_scales = tl.arange(0, BLOCK_SIZE_K_S)
     offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     #B scales: [BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
-    if not USE_5D_SCALES:
+    if not use_5d_scales:
         scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g
 
     #A scales
@@ -638,17 +635,17 @@ def gemm_splitK_MX_kernel(
         )
 
     # 5D TMA Descriptors for Scales (preshuffled layout)
-    if USE_5D_SCALES:
+    if use_5d_scales:
         rep_n: tl.constexpr = BLOCK_SIZE_N // 128
         rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
         stride_b4: tl.constexpr = 1
         stride_b3: tl.constexpr = 256
         stride_b2: tl.constexpr = 512
-        stride_b1: tl.constexpr = 512 * SCALES_5D_SHAPE2
-        stride_b0: tl.constexpr = 512 * SCALES_5D_SHAPE2 * SCALES_5D_SHAPE1
+        stride_b1: tl.constexpr = 512 * (K // group_size // 4)
+        stride_b0: tl.constexpr = stride_b1 * (N // 128)
         scales_b_5d_desc = tl.make_tensor_descriptor(
             scales_ptr,
-            [1, SCALES_5D_SHAPE1, SCALES_5D_SHAPE2, 2, 256],
+            [1, N // 128, K // group_size // 4, 2, 256],
             [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
             [1, rep_n, rep_k, 2, 256]
         )
@@ -679,7 +676,7 @@ def gemm_splitK_MX_kernel(
 
         #k_m = ((k * SPLIT_K + pid_k) * stride_mul).to(tl.int32)
         k_m = (k * SPLIT_K + pid_k) * BLOCK_SIZE_K_S #OK for BLOCK_SIZE_K >=group_size
-        if USE_5D_SCALES:
+        if use_5d_scales:
             scale_b_raw = tl.load_tensor_descriptor(scales_b_5d_desc, [0, pid_n * rep_n, (k * SPLIT_K + pid_k) * rep_k, 0, 0])
             scales_b = scale_b_raw.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
         else:
@@ -795,10 +792,8 @@ def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         W_group_mode       = W_group_mode,
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
-        USE_5D_SCALES      = use_5d_scales,
-        SCALES_5D_SHAPE1   = N // 128 if use_5d_scales else 0,
-        SCALES_5D_SHAPE2   = K // group_size // 4 if use_5d_scales else 0,
-        use_tma            = GEMLITE_USE_TMA,
+        use_tma            = use_5d_scales,
+        use_5d_scales      = use_5d_scales,
     )
 
     if(not native_atomic):

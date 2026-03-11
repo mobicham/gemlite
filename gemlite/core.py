@@ -352,7 +352,7 @@ class GemLiteLinearTriton(torch.nn.Module):
             if s.ndim == 2:
                 s_2d = s.T.contiguous()  # [K_S, N] contiguous
                 N_dim, K_S = s_2d.shape[1], s_2d.shape[0]
-                if GEMLITE_USE_TMA and N_dim % 128 == 0 and K_S % 4 == 0:
+                if GEMLITE_USE_TMA and self.elements_per_sample > 1 and N_dim % 128 == 0 and K_S % 4 == 0:
                     self.scales = s_2d.reshape(N_dim // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N_dim // 128, K_S // 4, 2, 256).contiguous()
 
     #Make sure to feed UINT8 W_q for packing
@@ -531,7 +531,8 @@ class GemLiteLinearTriton(torch.nn.Module):
             # Preshuffle weight scales to 5D TMA layout for fast loading
             # Original: [K_S, N] -> transpose to [N, K_S] -> 5D: [1, N//128, K_S//4, 2, 256]
             K_S = K // group_size
-            if GEMLITE_USE_TMA and N % 128 == 0 and K_S % 4 == 0:
+            if GEMLITE_USE_TMA and self.elements_per_sample > 1 and N % 128 == 0 and K_S % 4 == 0:
+                # Currently TMA only enabled for MXFP4/NVFP4 NOT for MXFP8 because of poor performance on sm_120 (self.elements_per_sample > 1 check)
                 self.scales = self.scales.T.contiguous().reshape(N // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N // 128, K_S // 4, 2, 256).contiguous()
             else:
                 # Keep 2D transposed layout for pointer-based fallback

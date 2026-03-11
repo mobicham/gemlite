@@ -313,8 +313,9 @@ def gemm_INT_kernel(
     meta_evict_policy: tl.constexpr = "evict_last",
     a_evict: tl.constexpr = "",
     b_evict: tl.constexpr = "evict_first",
-    USE_5D_SCALES: tl.constexpr = False,
+    #################################
     use_tma: tl.constexpr = True,
+    use_5d_scales: tl.constexpr = False,
 ):
     """
     Based on https://github.com/fpgaminer/GPTQ-triton
@@ -667,7 +668,7 @@ def gemm_MX_kernel(
     meta_scale_norm: tl.constexpr = (0.05 ** 2),
     #################################
     use_tma: tl.constexpr = True,
-    USE_5D_SCALES: tl.constexpr = False,
+    use_5d_scales: tl.constexpr = False,
 ):
 
     pid = tl.program_id(axis=0)
@@ -711,7 +712,7 @@ def gemm_MX_kernel(
     BLOCK_SIZE_K_S: tl.constexpr = BLOCK_SIZE_K // group_size
     offs_k_scales = tl.arange(0, BLOCK_SIZE_K_S)
     offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    if not USE_5D_SCALES:
+    if not use_5d_scales:
         scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
 
     if use_tma:
@@ -737,7 +738,7 @@ def gemm_MX_kernel(
         )
         
     # 5D TMA Descriptors for Scales (preshuffled layout)
-    if USE_5D_SCALES:
+    if use_5d_scales:
         rep_n: tl.constexpr = BLOCK_SIZE_N // 128
         rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
         scales_b_shape1: tl.constexpr = N // 128
@@ -781,7 +782,7 @@ def gemm_MX_kernel(
             b = tl.load(b_ptrs, eviction_policy=b_evict)
         ####################################################################################
         k_m = k * BLOCK_SIZE_K_S
-        if USE_5D_SCALES:
+        if use_5d_scales:
             # 5D TMA scale loads (preshuffled layout)
             scale_b_raw = tl.load_tensor_descriptor(scales_b_5d_desc, [0, pid_n * rep_n, k * rep_k, 0, 0])
             scales_b = scale_b_raw.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
@@ -892,8 +893,8 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         W_group_mode       = W_group_mode,
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
-        USE_5D_SCALES      = use_5d_scales,
-        use_tma            = GEMLITE_USE_TMA,
+        use_tma            = use_5d_scales,
+        use_5d_scales      = use_5d_scales,
     )
     
     return output

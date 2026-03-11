@@ -12,7 +12,8 @@ device, dtype = 'cuda:0', torch.bfloat16
 repeat = 32
 
 gemlite.reset_config()
-#gemlite.enable_cudagraph_autotune(True)
+gemlite.enable_cudagraph_autotune(True)
+gemlite.enable_tma(True)
 #gemlite.set_autotune("max")
 #gemlite.core.enable_activation_scaling(2)
 
@@ -262,29 +263,6 @@ def patch_model_flashinfer_nvfp4(model):
             model[i] = FlashinferNVFP4Dynamic(layer)
 
 
-def bench_flashinfer_nvfp4(M, N, K):
-    """
-    Benchmark flashinfer NVFP4 matmul (CUTLASS backend) - raw single matmul, no activation quant.
-    """
-    from flashinfer import nvfp4_quantize, mm_fp4, SfLayout
-
-    a_bf16 = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    b_bf16 = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
-
-    a_global_sf = (448.0 * 6.0) / a_bf16.float().abs().nan_to_num().max()
-    b_global_sf = (448.0 * 6.0) / b_bf16.float().abs().nan_to_num().max()
-
-    a_fp4, a_sf = nvfp4_quantize(a_bf16, a_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=False)
-    b_fp4, b_sf = nvfp4_quantize(b_bf16, b_global_sf, sfLayout=SfLayout.layout_128x4, do_shuffle=True)
-
-    alpha = 1.0 / (a_global_sf * b_global_sf)
-
-    ms = triton.testing.do_bench(
-        lambda: mm_fp4(a_fp4, b_fp4.T, a_sf, b_sf.T, alpha, torch.bfloat16),
-        warmup=500, rep=500,
-    )
-    return ms
-
 
 ###########################################################################################################################
 def run_benchmark(proc_name, M, K, N):
@@ -293,24 +271,6 @@ def run_benchmark(proc_name, M, K, N):
     Handles gemlite processors, native PyTorch INT8/FP8, and flashinfer NVFP4.
     """
     has_flashinfer, fi_err = _get_flashinfer()
-
-    # ---- flashinfer NVFP4 raw (single matmul, no activation quant, triton.do_bench) ----
-    if proc_name == "flashinfer_nvfp4_raw":
-        if not has_flashinfer:
-            print(f"  Skipping {proc_name}: {fi_err}")
-            return None
-        M_a = ((M + 127) // 128) * 128
-        N_a = ((N + 127) // 128) * 128
-        K_a = ((K + 127) // 128) * 128
-        try:
-            ms = bench_flashinfer_nvfp4(M_a, N_a, K_a)
-            tflops = get_flops(M_a, K_a, N_a, ms)
-            label = "flashinfer NVFP4 (raw)"
-            print(f"  {label} | {M_a}, {K_a}, {N_a} | {tflops:.2f} TFLOP/s  ({ms:.3f} ms)")
-            return (label, M_a, K_a, N_a, tflops)
-        except Exception as e:
-            print(f"  flashinfer NVFP4 raw failed: {e}")
-            return None
 
     # ---- flashinfer NVFP4 dynamic (torch.compile + activation quant) ----
     if proc_name == "flashinfer_nvfp4_dynamic":
@@ -423,7 +383,6 @@ ALL_PROCESSORS = [
     "native_int8",
     "native_fp8",
     "flashinfer_nvfp4_dynamic",
-    "flashinfer_nvfp4_raw",
 ]
 
 
@@ -436,7 +395,7 @@ Examples:
   python eval_flops.py
 
   # Run with specific dimensions:
-  python eval_flops.py --M 128 --K 4096 --N 4096
+  python eval_flops.py --M 8192 --K 8192 --N 8192
 
   # Run only specific processors (comma-separated):
   python eval_flops.py --processor A4W4_MXFP_dynamic,flashinfer_nvfp4_dynamic,native_fp8
@@ -450,15 +409,15 @@ Examples:
   #               A8W8_MXFP_dynamic_post_scale, A8W8_MXFP_dynamic,
   #               A4W4_MXFP_dynamic, A4W4_NVFP_dynamic
   #   PyTorch:    native_int8, native_fp8
-  #   flashinfer: flashinfer_nvfp4_dynamic, flashinfer_nvfp4_raw
+  #   flashinfer: flashinfer_nvfp4_dynamic
   #   Baseline:   none / fp16 (BF16, no quantization)
   #   Use "all" to run every processor.
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--M", type=int, default=8192, help="Batch/sequence dimension")
-    parser.add_argument("--K", type=int, default=16384, help="Input feature dimension")
-    parser.add_argument("--N", type=int, default=16384, help="Output feature dimension")
+    parser.add_argument("--K", type=int, default=8192, help="Input feature dimension")
+    parser.add_argument("--N", type=int, default=8192, help="Output feature dimension")
     parser.add_argument("--processor", type=str, default="all",
                         help='Comma-separated processor names or "all" (default: all)')
     args = parser.parse_args()
