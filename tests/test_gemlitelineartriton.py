@@ -1,5 +1,4 @@
-#python -m unittest test_gemlitelineartriton.py
-# Usage: python3 test_file.py [--autotune]
+# Usage: python3 test_gemlitelineartriton.py [--autotune]
 import sys
 _autotune = '--autotune' in sys.argv
 if _autotune: sys.argv.remove('--autotune')

@@ -59,7 +59,6 @@ def linear_tile(pid, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexp
     pid_n = pid // tl.cdiv(M, BLOCK_SIZE_M)
     return pid_m, pid_n
 
-#################################################################################################################
 @triton.jit
 def dequantize(
     b,
@@ -114,9 +113,16 @@ def is_divisible(dividend, divisor):
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
-def gpu_has_more_shared_memory(ref_gpus = ["a100", "h100", "h200", "h20", "h800", "b100", "b200", "b300", "6000"]): 
+def gpu_has_more_shared_memory(
+    ref_gpus=(
+        "a100",
+        "h100", "h200", "h20", "h800",
+        "b100", "b200", "b300",
+        "6000",
+    ),
+):
     gpu_name = torch.cuda.get_device_properties(0).name.lower()
-    return True in [g in gpu_name for g in ref_gpus]
+    return any(g in gpu_name for g in ref_gpus)
 
 def gpu_supports_float16_acc(
     ref_gpus=["5090", "5080", "5070", "5060", 
