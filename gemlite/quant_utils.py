@@ -1987,6 +1987,7 @@ def scale_activations_mxfp4_triton_kernel_v5(
     GROUP_SIZE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    ptx_pack: tl.constexpr = True,
 ):
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -1995,15 +1996,6 @@ def scale_activations_mxfp4_triton_kernel_v5(
     GROUPS_PER_BLOCK: tl.constexpr = BLOCK_SIZE_K // GROUP_SIZE
     FLAT_M: tl.constexpr = BLOCK_SIZE_M * GROUPS_PER_BLOCK
     out_dtype: tl.constexpr = out_ptr.dtype.element_ty
-
-    thr0 = tl.load(thr_pos_ptr + 0)
-    thr1 = tl.load(thr_pos_ptr + 1)
-    thr2 = tl.load(thr_pos_ptr + 2)
-    thr3 = tl.load(thr_pos_ptr + 3)
-    thr4 = tl.load(thr_pos_ptr + 4)
-    thr5 = tl.load(thr_pos_ptr + 5)
-    thr6 = tl.load(thr_pos_ptr + 6)
-    thr7 = tl.load(thr_pos_ptr + 7)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
@@ -2018,16 +2010,53 @@ def scale_activations_mxfp4_triton_kernel_v5(
     )
 
     wq = tensor_flat / scales
-    abs_wq = tl.abs(wq)
-    idx_abs = ((abs_wq > thr0).to(tl.int32) + (abs_wq > thr1).to(tl.int32) +
-               (abs_wq > thr2).to(tl.int32) + (abs_wq > thr3).to(tl.int32) +
-               (abs_wq > thr4).to(tl.int32) + (abs_wq > thr5).to(tl.int32) +
-               (abs_wq > thr6).to(tl.int32) + (abs_wq > thr7).to(tl.int32))
-    out = tl.where(wq >= 0, idx_abs, idx_abs + 8).to(out_dtype)
 
-    out = tl.reshape(out, (BLOCK_SIZE_M, BLOCK_SIZE_K))
-    lo, hi = tl.split(out.reshape((BLOCK_SIZE_M, HALF_BLOCK_K, 2), can_reorder=False))
-    out = lo | (hi << 4)
+    if ptx_pack:
+        # PTX path: hardware e2m1x2 quantization + nibble packing
+        wq_2d = tl.reshape(wq, (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        wq_pairs = wq_2d.reshape((BLOCK_SIZE_M, HALF_BLOCK_K, 2), can_reorder=False)
+        lo_val, hi_val = tl.split(wq_pairs)
+        lo_f16 = lo_val.to(tl.float16)
+        hi_f16 = hi_val.to(tl.float16)
+        lo_bits = lo_f16.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        hi_bits = (hi_f16.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) << 16
+        packed_f16x2 = lo_bits | hi_bits
+        packed_e2m1 = tl.inline_asm_elementwise(
+            asm="""
+            {
+                .reg .b8       tmp_out;
+                .reg .f16x2    tmp_in;
+                mov.b32                          tmp_in, $1;
+                cvt.rn.satfinite.e2m1x2.f16x2    tmp_out, tmp_in;
+                cvt.u32.u8                       $0, tmp_out;
+            }
+            """,
+            constraints="=r,r",
+            args=[packed_f16x2],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+        out = packed_e2m1.to(tl.uint8)
+    else:
+        # Threshold path: 8 comparisons + manual nibble packing
+        thr0 = tl.load(thr_pos_ptr + 0)
+        thr1 = tl.load(thr_pos_ptr + 1)
+        thr2 = tl.load(thr_pos_ptr + 2)
+        thr3 = tl.load(thr_pos_ptr + 3)
+        thr4 = tl.load(thr_pos_ptr + 4)
+        thr5 = tl.load(thr_pos_ptr + 5)
+        thr6 = tl.load(thr_pos_ptr + 6)
+        thr7 = tl.load(thr_pos_ptr + 7)
+        abs_wq = tl.abs(wq)
+        idx_abs = ((abs_wq > thr0).to(tl.int32) + (abs_wq > thr1).to(tl.int32) +
+                   (abs_wq > thr2).to(tl.int32) + (abs_wq > thr3).to(tl.int32) +
+                   (abs_wq > thr4).to(tl.int32) + (abs_wq > thr5).to(tl.int32) +
+                   (abs_wq > thr6).to(tl.int32) + (abs_wq > thr7).to(tl.int32))
+        out = tl.where(wq >= 0, idx_abs, idx_abs + 8).to(out_dtype)
+        out = tl.reshape(out, (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        lo, hi = tl.split(out.reshape((BLOCK_SIZE_M, HALF_BLOCK_K, 2), can_reorder=False))
+        out = lo | (hi << 4)
 
     offs_k_out = pid_k * HALF_BLOCK_K + tl.arange(0, HALF_BLOCK_K)
     out_mask = ((offs_m[:, None] < M) & (offs_k_out[None, :] < (K // 2))).to(tl.int1)
@@ -2074,6 +2103,8 @@ def scale_activations_mxfp4_triton_v5(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     return out, scales
 
 
+
+
 ####################################################################################################################
 # NVFP4 v5: 2D grid with multi-group BLOCK_SIZE_K (fewer blocks, better bandwidth)
 ####################################################################################################################
@@ -2101,6 +2132,7 @@ def scale_activations_nvfp4_triton_kernel_v5(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     meta_scales: tl.constexpr = NVFP4_META_SCALE,
+    ptx_pack: tl.constexpr = True,
 ):
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -2111,15 +2143,6 @@ def scale_activations_nvfp4_triton_kernel_v5(
     GROUPS_PER_BLOCK: tl.constexpr = BLOCK_SIZE_K // GROUP_SIZE
     FLAT_M: tl.constexpr = BLOCK_SIZE_M * GROUPS_PER_BLOCK
     out_dtype: tl.constexpr = out_ptr.dtype.element_ty
-
-    thr0 = tl.load(thr_pos_ptr + 0)
-    thr1 = tl.load(thr_pos_ptr + 1)
-    thr2 = tl.load(thr_pos_ptr + 2)
-    thr3 = tl.load(thr_pos_ptr + 3)
-    thr4 = tl.load(thr_pos_ptr + 4)
-    thr5 = tl.load(thr_pos_ptr + 5)
-    thr6 = tl.load(thr_pos_ptr + 6)
-    thr7 = tl.load(thr_pos_ptr + 7)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
@@ -2136,16 +2159,53 @@ def scale_activations_nvfp4_triton_kernel_v5(
     scales_full = tl.maximum(scales_fp8.to(tl.float32) * meta_scales, eps)
 
     wq = tensor_flat / scales_full
-    abs_wq = tl.abs(wq)
-    idx_abs = ((abs_wq > thr0).to(tl.int32) + (abs_wq > thr1).to(tl.int32) +
-               (abs_wq > thr2).to(tl.int32) + (abs_wq > thr3).to(tl.int32) +
-               (abs_wq > thr4).to(tl.int32) + (abs_wq > thr5).to(tl.int32) +
-               (abs_wq > thr6).to(tl.int32) + (abs_wq > thr7).to(tl.int32))
-    out = tl.where(wq >= 0, idx_abs, idx_abs + 8).to(out_dtype)
 
-    out = tl.reshape(out, (BLOCK_SIZE_M, BLOCK_SIZE_K))
-    lo, hi = tl.split(out.reshape((BLOCK_SIZE_M, HALF_BLOCK_K, 2), can_reorder=False))
-    out = lo | (hi << 4)
+    if ptx_pack:
+        # PTX path: hardware e2m1x2 quantization + nibble packing
+        wq_2d = tl.reshape(wq, (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        wq_pairs = wq_2d.reshape((BLOCK_SIZE_M, HALF_BLOCK_K, 2), can_reorder=False)
+        lo_val, hi_val = tl.split(wq_pairs)
+        lo_f16 = lo_val.to(tl.float16)
+        hi_f16 = hi_val.to(tl.float16)
+        lo_bits = lo_f16.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+        hi_bits = (hi_f16.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) << 16
+        packed_f16x2 = lo_bits | hi_bits
+        packed_e2m1 = tl.inline_asm_elementwise(
+            asm="""
+            {
+                .reg .b8       tmp_out;
+                .reg .f16x2    tmp_in;
+                mov.b32                          tmp_in, $1;
+                cvt.rn.satfinite.e2m1x2.f16x2    tmp_out, tmp_in;
+                cvt.u32.u8                       $0, tmp_out;
+            }
+            """,
+            constraints="=r,r",
+            args=[packed_f16x2],
+            dtype=tl.int32,
+            is_pure=True,
+            pack=1,
+        )
+        out = packed_e2m1.to(tl.uint8)
+    else:
+        # Threshold path: 8 comparisons + manual nibble packing
+        thr0 = tl.load(thr_pos_ptr + 0)
+        thr1 = tl.load(thr_pos_ptr + 1)
+        thr2 = tl.load(thr_pos_ptr + 2)
+        thr3 = tl.load(thr_pos_ptr + 3)
+        thr4 = tl.load(thr_pos_ptr + 4)
+        thr5 = tl.load(thr_pos_ptr + 5)
+        thr6 = tl.load(thr_pos_ptr + 6)
+        thr7 = tl.load(thr_pos_ptr + 7)
+        abs_wq = tl.abs(wq)
+        idx_abs = ((abs_wq > thr0).to(tl.int32) + (abs_wq > thr1).to(tl.int32) +
+                   (abs_wq > thr2).to(tl.int32) + (abs_wq > thr3).to(tl.int32) +
+                   (abs_wq > thr4).to(tl.int32) + (abs_wq > thr5).to(tl.int32) +
+                   (abs_wq > thr6).to(tl.int32) + (abs_wq > thr7).to(tl.int32))
+        out = tl.where(wq >= 0, idx_abs, idx_abs + 8).to(out_dtype)
+        out = tl.reshape(out, (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        lo, hi = tl.split(out.reshape((BLOCK_SIZE_M, HALF_BLOCK_K, 2), can_reorder=False))
+        out = lo | (hi << 4)
 
     offs_k_out = pid_k * HALF_BLOCK_K + tl.arange(0, HALF_BLOCK_K)
     out_mask = ((offs_m[:, None] < M) & (offs_k_out[None, :] < (K // 2))).to(tl.int1)
@@ -2191,6 +2251,7 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor) -> Tuple[torch.Tenso
         GROUP_SIZE=group_size,
     )
     return out, scales
+
 
 
 
