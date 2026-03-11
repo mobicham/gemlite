@@ -1990,6 +1990,8 @@ def scale_activations_mxfp4_triton_kernel_v5(
     # Requires CUDA 13.0+ ptxas (Triton bundles 12.9 as of v3.3). To enable, replace
     # the bundled ptxas-blackwell with the system one: cp /usr/local/cuda/bin/ptxas
     # /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas-blackwell
+    # TODO: once Triton ships CUDA 13.0+ ptxas, set default to True and add ptx_pack
+    # to the autotuner configs so it can pick the best path per shape.
     ptx_pack: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
@@ -2138,6 +2140,8 @@ def scale_activations_nvfp4_triton_kernel_v5(
     # Requires CUDA 13.0+ ptxas (Triton bundles 12.9 as of v3.3). To enable, replace
     # the bundled ptxas-blackwell with the system one: cp /usr/local/cuda/bin/ptxas
     # /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas-blackwell
+    # TODO: once Triton ships CUDA 13.0+ ptxas, set default to True and add ptx_pack
+    # to the autotuner configs so it can pick the best path per shape.
     ptx_pack: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
