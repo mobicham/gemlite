@@ -67,6 +67,7 @@ GEMLITE_MATMUL_TYPES_MAPPING = {GEMLITE_MATMUL_TYPES[i]: i for i in range(len(GE
 GEMLITE_TRITON_CONFIG_CACHE  = {} #Global config cache for all the kernels
 _GROUP_SIZE_WARNED           = False
 GEMLITE_USE_TMA              = True # Set to False for faster MXFP8 on sm_120
+GEMLITE_ENABLE_PTX_FP4_PACK      = False # Set to True for hardware e2m1x2 FP4 packing (requires CUDA 13.0+ ptxas)
 
 ###################################################################################
 #Utils
@@ -101,6 +102,13 @@ def set_acc_dtype(dtype):
 def enable_tma(enabled: bool = True):
     global GEMLITE_USE_TMA
     GEMLITE_USE_TMA = enabled
+
+#Enable/disable hardware PTX FP4 packing in activation quantization (requires CUDA 13.0+ ptxas)
+def set_ptx_fp4_pack(enabled: bool = True):
+    global GEMLITE_ENABLE_PTX_FP4_PACK
+    GEMLITE_ENABLE_PTX_FP4_PACK = enabled
+    from .quant_utils import set_ptx_fp4_pack_flag
+    set_ptx_fp4_pack_flag(enabled)
 
 #Enable/disable CUDA graph-based autotuning (more accurate but slower)
 def enable_cudagraph_autotune(enabled: bool = True):

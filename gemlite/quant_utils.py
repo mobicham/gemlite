@@ -10,6 +10,11 @@ from triton.language.extra import libdevice
 from .triton_kernels.utils import IS_HIP, get_num_SMs, next_power_of_2
 from .dtypes import *
 
+GEMLITE_ENABLE_PTX_FP4_PACK = False # Enable with CUDA13+ ptxas
+def set_ptx_fp4_pack_flag(enabled: bool):
+    global GEMLITE_ENABLE_PTX_FP4_PACK
+    GEMLITE_ENABLE_PTX_FP4_PACK = enabled
+
 #Get dtype min/max range based on compute dtype
 def get_dtype_range(compute_dtype: torch.dtype) -> float:
     if(compute_dtype.is_floating_point):
@@ -1992,7 +1997,7 @@ def scale_activations_mxfp4_triton_kernel_v5(
     # /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas-blackwell
     # TODO: once Triton ships CUDA 13.0+ ptxas, set default to True and add ptx_pack
     # to the autotuner configs so it can pick the best path per shape.
-    ptx_pack: tl.constexpr = False,
+    ptx_pack: tl.constexpr = GEMLITE_ENABLE_PTX_FP4_PACK,
 ):
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -2137,12 +2142,10 @@ def scale_activations_nvfp4_triton_kernel_v5(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     meta_scales: tl.constexpr = NVFP4_META_SCALE,
-    # Requires CUDA 13.0+ ptxas (Triton bundles 12.9 as of v3.3). To enable, replace
-    # the bundled ptxas-blackwell with the system one: cp /usr/local/cuda/bin/ptxas
-    # /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas-blackwell
-    # TODO: once Triton ships CUDA 13.0+ ptxas, set default to True and add ptx_pack
-    # to the autotuner configs so it can pick the best path per shape.
-    ptx_pack: tl.constexpr = False,
+    # Requires CUDA 13.0+ ptxas (Triton bundles 12.9 as of v3.3). To enable, set
+    # the environment variable TRITON_CUDA_ARCH_LIST to include CUDA 13.0+ ptxas, 
+    # and override the bundled ptxas-blackwell.
+    ptx_pack: tl.constexpr = GEMLITE_ENABLE_PTX_FP4_PACK,
 ):
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
