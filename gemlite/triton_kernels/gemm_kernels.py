@@ -701,6 +701,8 @@ def gemm_MX_kernel(
     BLOCK_SIZE_K_A: tl.constexpr = BLOCK_SIZE_K // elements_per_sample_a
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_ak = tl.arange(0, BLOCK_SIZE_K_A)
+    if not use_tma:
+        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
     a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K // elements_per_sample_a)).to(tl.int1)
 
@@ -708,7 +710,14 @@ def gemm_MX_kernel(
     BLOCK_SIZE_K_B: tl.constexpr = BLOCK_SIZE_K // elements_per_sample
     offs_bk = tl.arange(0, BLOCK_SIZE_K_B)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    if not use_tma:
+        if data_contiguous:
+            offs_bn_load = offs_bn
+        else:
+            offs_bn_load = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    else:
+        offs_bn_load = offs_bn
+    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn_load[None, :] * stride_bn
 
     #Scales
     stride_mul: tl.constexpr = BLOCK_SIZE_K / group_size
@@ -836,6 +845,7 @@ def gemm_MX_kernel(
     else:
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
         mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
         if EVEN_M and EVEN_N:
