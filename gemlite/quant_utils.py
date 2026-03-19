@@ -1972,11 +1972,6 @@ def prune_large_blocks_2d(configs, named_args, **kwargs):
         triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 128}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 256}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_K': 256}, num_warps=8, num_stages=1),
-        #ptx_pack=True configs (hardware e2m1x2 conversion, requires CUDA 13.0+ ptxas)
-        triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 64,  'ptx_pack': True}, num_warps=4, num_stages=1),
-        triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 128, 'ptx_pack': True}, num_warps=4, num_stages=1),
-        triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 256, 'ptx_pack': True}, num_warps=4, num_stages=1),
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_K': 256, 'ptx_pack': True}, num_warps=8, num_stages=1),
     ],
     key=['M', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks_2d},
@@ -2126,11 +2121,6 @@ def scale_activations_mxfp4_triton_v5(tensor: Tensor) -> Tuple[Tensor, Tensor]:
         triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 128}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 256}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_K': 256}, num_warps=8, num_stages=1),
-        #ptx_pack=True configs (hardware e2m1x2 conversion, requires CUDA 13.0+ ptxas)
-        triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 64,  'ptx_pack': True}, num_warps=4, num_stages=1),
-        triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 128, 'ptx_pack': True}, num_warps=4, num_stages=1),
-        triton.Config({'BLOCK_SIZE_M': 16,  'BLOCK_SIZE_K': 256, 'ptx_pack': True}, num_warps=4, num_stages=1),
-        triton.Config({'BLOCK_SIZE_M': 32,  'BLOCK_SIZE_K': 256, 'ptx_pack': True}, num_warps=8, num_stages=1),
     ],
     key=['M', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks_2d},
