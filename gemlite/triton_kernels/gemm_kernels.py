@@ -187,6 +187,9 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
     configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=4))
+    #Small M tiles (for M=32..64 where more tiles improve SM utilization)
+    configs.append(triton.Config({"BLOCK_SIZE_M":32, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":0}, num_warps=4, num_stages=4))
+    configs.append(triton.Config({"BLOCK_SIZE_M":32, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":256, "GROUP_SIZE_M":8, "A_load_order":0}, num_warps=4, num_stages=3))
     return configs
 
 def get_default_config_nvidia():
