@@ -318,6 +318,16 @@ class GemLiteLinearTriton(torch.nn.Module):
         #Default forward        
         self.forward = self.forward_auto_no_warmup
 
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # Rebuild metadata from live attributes to ensure consistency
+        # (helpers may override channel_scale_mode/W_group_mode after pack())
+        if hasattr(self, 'metadata') and self.metadata is not None and hasattr(self, 'W_nbits'):
+            self.metadata = torch.nn.Parameter(
+                torch.tensor(self.get_meta_args(), device=self.metadata.device, dtype=torch.int32),
+                requires_grad=False,
+            )
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
         self.W_q        = state_dict.pop("W_q", None)
         self.bias       = state_dict.pop("bias", None)
