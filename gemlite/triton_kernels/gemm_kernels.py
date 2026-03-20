@@ -274,7 +274,7 @@ else:
 def gemm_INT_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
-    M, N, K, M_CLOSEST,
+    M, N: tl.constexpr, K: tl.constexpr, M_CLOSEST,
     ######### Quant parms #########
     W_nbits: tl.constexpr, 
     group_size: tl.constexpr, 
@@ -629,7 +629,7 @@ def gemm_INT_kernel(
 def gemm_MX_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, M_CLOSEST: tl.constexpr,
+    M, N: tl.constexpr, K: tl.constexpr, M_CLOSEST,
     ######### Quant parms #########
     W_nbits: tl.constexpr,
     group_size: tl.constexpr,

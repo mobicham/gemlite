@@ -238,7 +238,7 @@ def gemv_INT_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
     mapping_ptr,
-    M, N, K, 
+    M, N: tl.constexpr, K: tl.constexpr, 
     ######### Quant parms #########
     W_nbits: tl.constexpr, 
     group_size: tl.constexpr, 
@@ -422,7 +422,7 @@ def gemv_MX_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
     mapping_ptr,
-    M, N, K, 
+    M, N: tl.constexpr, K: tl.constexpr, 
     ######### Quant parms #########
     W_nbits: tl.constexpr, 
     group_size: tl.constexpr, 
