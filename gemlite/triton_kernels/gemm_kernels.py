@@ -622,6 +622,7 @@ def gemm_MX_kernel(
         scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
         #scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
 
+    _meta_scale_norm = tl.load(meta_scale_norm_ptr, eviction_policy='evict_last') if group_size == 16 else 1.0
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
         # Load A and B tiles        
@@ -669,7 +670,7 @@ def gemm_MX_kernel(
 
     #NVFP4 meta-scale
     if(group_size == 16):
-        acc = acc.to(tl.float32) * tl.load(meta_scale_norm_ptr, eviction_policy='evict_last')
+        acc = acc.to(tl.float32) * _meta_scale_norm
 
     #############################################################################################################
     #Channel-wise scaling    

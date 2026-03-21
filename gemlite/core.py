@@ -193,9 +193,9 @@ def forward_functional(
             x, scales_x = scale_activations_mxfp4(x)
 
         elif(input_dtype in [DType.NVFP4] and channel_scale_mode == 4): #NVPF4: TODO
-            meta_scale = tensor_args[3]
+            meta_scale_w = tensor_args[3]
             x, scales_x, meta_scale_a = scale_activations_nvfp4(x)
-            meta_scale = meta_scale * meta_scale_a  # combine weight and activation meta_scales
+            meta_scale = meta_scale_w * meta_scale_a  # combine weight and activation meta_scales
     
     x = x.view(-1, x.shape[-1])
 

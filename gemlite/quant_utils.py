@@ -1168,7 +1168,7 @@ def scale_activations_mxfp4_torch(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     return W_q, scales
 
 @torch.compile(fullgraph=True)
-def scale_activations_nvfp4_torch(tensor: Tensor) -> Tuple[Tensor, Tensor]:
+def scale_activations_nvfp4_torch(tensor: Tensor, meta_scale=None) -> Tuple[Tensor, Tensor]:
     group_size: int = 16
     eps: float = 1e-6
     max_val: float = 6
@@ -1187,7 +1187,7 @@ def scale_activations_nvfp4_torch(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     W_flat = tensor.view(-1, group_size).float()
     scales = W_flat.abs().amax(dim=1, keepdim=True)
     scales /= max_val
-    meta_scales = scales.max().clamp_(min=eps)
+    meta_scales = meta_scale if meta_scale is not None else scales.max().clamp_(min=eps)
     scales /= meta_scales
     scales = scales.clamp(max=max_fp8).to(fp8_dtype).to(W_flat.dtype)
 
@@ -1435,11 +1435,11 @@ def scale_activations_nvfp4_triton_kernel(
     tl.store(scales_ptr + (offs_m[:, None] * stride_m_s + offs_k[None, :] * stride_k_s), scales)
 
 
-def scale_activations_nvfp4_triton(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def scale_activations_nvfp4_triton(tensor: torch.Tensor, meta_scale=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn #Nvidia only
-    meta_scale = (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
+    meta_scale = meta_scale if meta_scale is not None else (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
 
     tensor = tensor.contiguous()
     tensor = tensor.view(-1, tensor.shape[-1])
@@ -1680,11 +1680,11 @@ def scale_activations_nvfp4_triton_kernel_v2(
             out_bp = tl.advance(out_bp, (0, HALF_BLOCK_K))
 
 
-def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor, meta_scale=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn
-    meta_scale = (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
+    meta_scale = meta_scale if meta_scale is not None else (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
 
     tensor = tensor.contiguous()
     tensor = tensor.view(-1, tensor.shape[-1])
@@ -1920,11 +1920,11 @@ def scale_activations_nvfp4_triton_kernel_v3(
     tl.store(scales_ptr + (offs_m[:, None] * stride_m_s + offs_k[None, :] * stride_k_s), scales)
 
 
-def scale_activations_nvfp4_triton_v3(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def scale_activations_nvfp4_triton_v3(tensor: torch.Tensor, meta_scale=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn
-    meta_scale = (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
+    meta_scale = meta_scale if meta_scale is not None else (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
 
     tensor = tensor.contiguous()
     tensor = tensor.view(-1, tensor.shape[-1])
@@ -2242,12 +2242,12 @@ def scale_activations_nvfp4_triton_kernel_v5(
     )
 
 
-def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn
     # Compute per-tensor meta_scale from activation data
-    meta_scale = (tensor.view(-1, group_size).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
+    meta_scale = meta_scale if meta_scale is not None else (tensor.view(-1, group_size).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
 
     tensor = tensor.contiguous()
     tensor = tensor.view(-1, tensor.shape[-1])
