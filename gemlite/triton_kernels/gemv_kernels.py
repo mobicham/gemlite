@@ -591,6 +591,7 @@ def gemv_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
                                          W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
                                          input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int,  
                                          channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id: int,
+                                         meta_scale: float = 0.0,
                                          ) -> Tensor:
     
     global KERNEL_CACHE

@@ -334,6 +334,7 @@ def gemm_splitK_INT_kernel(
     atomic_mode: tl.constexpr = 'relaxed',
     a_evict: tl.constexpr = 'evict_last',
     b_evict: tl.constexpr = 'evict_first',
+    meta_scale_norm_ptr = None,
     ################################# dmmy
     use_tma: tl.constexpr = True,
     use_5d_scales: tl.constexpr = False,
@@ -480,6 +481,7 @@ def gemm_splitK_INT_kernel(
 
     #############################################################################################################
     #Output
+    acc     = acc.to(output_dtype)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
@@ -554,7 +556,7 @@ def gemm_splitK_MX_kernel(
     atomic_mode: tl.constexpr = 'relaxed',
     a_evict: tl.constexpr = 'evict_last',
     b_evict: tl.constexpr = 'evict_first',
-    meta_scale_norm: tl.constexpr = (0.05 ** 2),
+    meta_scale_norm_ptr = None,
     #################################
     use_tma: tl.constexpr = True,
     use_5d_scales: tl.constexpr = False,
@@ -707,17 +709,17 @@ def gemm_splitK_MX_kernel(
 
     #NVFP4 meta-scale
     if(group_size == 16):
-        acc *= meta_scale_norm
+        acc = acc.to(tl.float32) * tl.load(meta_scale_norm_ptr, eviction_policy='evict_last')
 
     #############################################################################################################
     #Channel-wise scaling  
     if channel_scale_mode == 2:  # activation-only
-        dtype: tl.constexpr = c_ptr.dtype.element_ty
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1.0, eviction_policy=meta_evict_policy)
-        acc = acc.to(dtype) * scales_a[:, None]
-        
+        acc = acc * scales_a[:, None]
+    
     #############################################################################################################
     #Output
+    acc     = acc.to(output_dtype)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
@@ -741,6 +743,7 @@ def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
                         W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int,
                         input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
                         channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 
+                        meta_scale: Tensor = None,
                         ) -> Tensor: 
         
     from ..core import GEMLITE_USE_TMA
@@ -788,12 +791,13 @@ def gemm_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
         meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
         ################################################
-        channel_scale_mode = channel_scale_mode,
-        W_group_mode       = W_group_mode,
-        zero_is_scalar     = zeros.numel() == 1,
-        data_contiguous    = data_contiguous,
-        use_tma            = use_5d_scales,
-        use_5d_scales      = use_5d_scales,
+        channel_scale_mode  = channel_scale_mode,
+        W_group_mode        = W_group_mode,
+        zero_is_scalar      = zeros.numel() == 1,
+        data_contiguous     = data_contiguous,
+        use_tma             = use_5d_scales,
+        use_5d_scales       = use_5d_scales,
+        meta_scale_norm_ptr = meta_scale,
     )
 
     if(not native_atomic):

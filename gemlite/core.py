@@ -175,6 +175,7 @@ def forward_functional(
     scaled_activations = bool(meta_args[0]) and enable_activation_scaling(batch_size)
     #Dynamic activation quantization
     scales_x = None
+    meta_scale = 0.0
     if(scaled_activations):
         input_dtype = DType(meta_args[5])
         channel_scale_mode = meta_args[9]
@@ -192,7 +193,9 @@ def forward_functional(
             x, scales_x = scale_activations_mxfp4(x)
 
         elif(input_dtype in [DType.NVFP4] and channel_scale_mode == 4): #NVPF4: TODO
-            x, scales_x = scale_activations_nvfp4(x)
+            meta_scale = tensor_args[3]
+            x, scales_x, meta_scale_a = scale_activations_nvfp4(x)
+            meta_scale = meta_scale * meta_scale_a  # combine weight and activation meta_scales
     
     x = x.view(-1, x.shape[-1])
 
@@ -204,7 +207,7 @@ def forward_functional(
     out = (
         GEMLITE_TRITON_MAPPING[matmul_type_str]
         .forward(
-            x, *tensor_args, scales_x, *meta_args[1:-1], data_contiguous, type_id
+            x, *tensor_args[:3], scales_x, *meta_args[1:-1], data_contiguous, type_id, meta_scale=meta_scale
         )
         .view(out_shape)
     )
@@ -318,6 +321,9 @@ class GemLiteLinearTriton(torch.nn.Module):
         #Default forward        
         self.forward = self.forward_auto_no_warmup
 
+        #Meta-scale for NVFP4 (0.0 = not used)
+        self.meta_scale = 0.0
+
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         # Rebuild metadata from live attributes to ensure consistency
         # (helpers may override channel_scale_mode/W_group_mode after pack())
@@ -335,6 +341,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.zeros      = state_dict.pop("zeros", None)
         self.metadata   = state_dict.pop("metadata", None)
         self.orig_shape = state_dict.pop("orig_shape", None)
+        _meta_scale     = state_dict.pop("meta_scale", None)
 
         self.metadata   = [v.item() for v in self.metadata]
         self.orig_shape = (v.item() for v in self.orig_shape)
@@ -356,6 +363,12 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.output_dtype = DType(self.output_dtype)
         self.acc_dtype    = DType(self.acc_dtype)
         self.meta_dtype   = DType(self.meta_dtype)
+
+        # Restore meta_scale with backward compat for old checkpoints
+        if _meta_scale is not None:
+            self.meta_scale = _meta_scale.float()
+        else:
+            self.meta_scale = 0.05 if self.input_dtype == DType.NVFP4 else 0.0  # backward compat default for old checkpoints
 
         self.out_features, self.in_features = self.orig_shape
         self.compute_dtype = DTYPE_TO_TORCH[self.input_dtype.value]
@@ -577,11 +590,20 @@ class GemLiteLinearTriton(torch.nn.Module):
             requires_grad=False,
         )
         
+
+        self.meta_scale = torch.nn.Parameter(
+            torch.tensor(self.meta_scale, device=self.device, dtype=torch.float32),
+            requires_grad=False,
+        )
+
         return self
 
     #Return the main arguments
     def get_tensor_args(self):
-        return [self.W_q, self.scales, self.zeros]
+        meta_scale = self.meta_scale
+        if not isinstance(meta_scale, torch.Tensor):
+            meta_scale = torch.tensor(meta_scale, dtype=torch.float32, device=self.W_q.device)
+        return [self.W_q, self.scales, self.zeros, meta_scale]
 
     def get_meta_args(self):
         return [int(self.scaled_activations),

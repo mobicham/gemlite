@@ -888,7 +888,7 @@ class A4W4_NVFP_dynamic:
         self.group_size = 16
         self.input_dtype = DType.NVFP4
 
-    def from_weights(self, weight, bias=None, scales=None):
+    def from_weights(self, weight, bias=None, scales=None, meta_scale=None):
         if(isinstance(weight, torch.nn.Parameter)):
             weight = weight.data
         if(isinstance(bias, torch.nn.Parameter)):
@@ -923,6 +923,11 @@ class A4W4_NVFP_dynamic:
         gemlite_linear.pack(W_q, scales, zeros=None, bias=bias)
         gemlite_linear.W_group_mode       = 0
         gemlite_linear.channel_scale_mode = 4
+        if meta_scale is not None:
+            gemlite_linear.meta_scale = torch.nn.Parameter(
+                meta_scale.to(dtype=torch.float32, device=gemlite_linear.W_q.device).reshape(()),
+                requires_grad=False,
+            )
         return gemlite_linear
 
 
@@ -933,11 +938,11 @@ class A4W4_NVFP_dynamic:
         W = linear_layer.weight.data
         bias = linear_layer.bias.clone() if (linear_layer.bias is not None) else None 
         N, K = W.shape
-        W_q, scales = self.quantizer_mx.quantize_nvfp4(W, index=True)
+        W_q, scales, _meta_scale = self.quantizer_mx.quantize_nvfp4(W, index=True)
         W_q, scales = W_q.view([N, K]), scales.view(N, K // self.group_size)
         cleanup_linear(linear_layer, del_orig)
 
-        out_layer = self.from_weights(weight=W_q, scales=scales, bias=bias)
+        out_layer = self.from_weights(weight=W_q, scales=scales, bias=bias, meta_scale=_meta_scale)
 
         #Clean-uo
         del W_q

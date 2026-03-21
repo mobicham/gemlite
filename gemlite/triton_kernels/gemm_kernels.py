@@ -316,6 +316,7 @@ def gemm_INT_kernel(
     meta_evict_policy: tl.constexpr = "evict_last",
     a_evict: tl.constexpr = "",
     b_evict: tl.constexpr = "evict_first",
+    meta_scale_norm_ptr = None,
     #################################
     use_tma: tl.constexpr = True,
     use_5d_scales: tl.constexpr = False,
@@ -451,15 +452,309 @@ def gemm_INT_kernel(
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
-
-    acc = acc.to(output_dtype)
     #############################################################################################################
+    
     #Output
+    acc = acc.to(output_dtype)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
     tl.store(c_ptrs, acc, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N)) 
+
+@triton.autotune(
+    configs = get_autotune_config(),
+    key = KEYS, 
+    prune_configs_by = {'early_config_prune': kernel_config_pruner},
+    use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
+)
+@triton.jit
+def gemm_MX_kernel(
+    a_ptr, b_ptr, c_ptr,
+    scales_ptr, zeros_ptr, scales_a_ptr,
+    M, N: tl.constexpr, K: tl.constexpr, M_CLOSEST,
+    ######### Quant parms #########
+    W_nbits: tl.constexpr,
+    group_size: tl.constexpr,
+    unpack_mask: tl.constexpr,
+    elements_per_sample: tl.constexpr, 
+    #################################
+    type_id: tl.constexpr,
+    a_sizeof: tl.constexpr,
+    b_sizeof: tl.constexpr,
+    ######### Strides #########
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+    stride_meta_a_m: tl.constexpr, stride_meta_a_g: tl.constexpr,
+    stride_meta_n: tl.constexpr, stride_meta_g: tl.constexpr,
+    ######### Dtypes #########
+    load_scales_as_block, #True
+    input_dtype: tl.constexpr,
+    output_dtype: tl.constexpr,
+    meta_dtype: tl.constexpr,
+    acc_dtype: tl.constexpr,
+    ######### Meta-data mode #########
+    channel_scale_mode: tl.constexpr,
+    W_group_mode: tl.constexpr,
+    zero_is_scalar: tl.constexpr,
+    ######### tuning params #########
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
+    GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr,
+    A_load_order: tl.constexpr,
+    data_contiguous: tl.constexpr,
+    #################################
+    EVEN_M: tl.constexpr = False, 
+    EVEN_K: tl.constexpr = False, 
+    EVEN_N: tl.constexpr = False,
+    #################################
+    meta_evict_policy: tl.constexpr = "evict_last",
+    a_evict: tl.constexpr = "",
+    b_evict: tl.constexpr = "",
+    meta_scale_norm_ptr = None,
+    #################################
+    use_tma: tl.constexpr = True,
+    use_5d_scales: tl.constexpr = False,
+):
+
+    pid = tl.program_id(axis=0)
+    pid_m, pid_n = swizzle_tile(pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
+    num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
+
+    a_ptr_dtype: tl.constexpr = a_ptr.dtype.element_ty
+    if(a_ptr_dtype == tl.float16):
+        a_dtype: tl.constexpr = "fp16"
+        elements_per_sample_a: tl.constexpr = 1
+    if(a_ptr_dtype == tl.bfloat16):
+        a_dtype: tl.constexpr = "bf16"
+        elements_per_sample_a: tl.constexpr = 1
+    if(a_ptr_dtype == tl.float8e4nv):
+        a_dtype: tl.constexpr = "e4m3"
+        elements_per_sample_a: tl.constexpr = 1
+    if(a_ptr_dtype == tl.uint8):
+        a_dtype: tl.constexpr = "e2m1" #FP4
+        elements_per_sample_a: tl.constexpr = 2
+
+    if(elements_per_sample == 1): #FP8
+        b_dtype: tl.constexpr = "e4m3"
+    if(elements_per_sample == 2): #FP4
+        b_dtype: tl.constexpr = "e2m1"
+
+    #A
+    BLOCK_SIZE_K_A: tl.constexpr = BLOCK_SIZE_K // elements_per_sample_a
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_ak = tl.arange(0, BLOCK_SIZE_K_A)
+    if not use_tma:
+        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K // elements_per_sample_a)).to(tl.int1)
+
+    #B
+    BLOCK_SIZE_K_B: tl.constexpr = BLOCK_SIZE_K // elements_per_sample
+    offs_bk = tl.arange(0, BLOCK_SIZE_K_B)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if not use_tma:
+        if data_contiguous:
+            offs_bn_load = offs_bn
+        else:
+            offs_bn_load = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    else:
+        offs_bn_load = offs_bn
+    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn_load[None, :] * stride_bn
+
+    #Scales
+    stride_mul: tl.constexpr = BLOCK_SIZE_K / group_size
+    BLOCK_SIZE_K_S: tl.constexpr = BLOCK_SIZE_K // group_size
+    offs_k_scales = tl.arange(0, BLOCK_SIZE_K_S)
+    offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if not use_5d_scales:
+        scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
+
+    if use_tma:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            [M, K // elements_per_sample_a],
+            [stride_am, stride_ak],
+            [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
+        )
+        
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            [N, K // elements_per_sample],
+            [stride_bn, stride_bk],
+            [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
+        )
+        
+        c_desc = tl.make_tensor_descriptor(
+            c_ptr,
+            [M, N],
+            [stride_cm, stride_cn],
+            [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        )
+        
+    # 5D TMA Descriptors for Scales (preshuffled layout)
+    if use_5d_scales:
+        rep_n: tl.constexpr = BLOCK_SIZE_N // 128
+        rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
+        scales_b_shape1: tl.constexpr = N // 128
+        scales_b_shape2: tl.constexpr = K // group_size // 4
+        stride_b4: tl.constexpr = 1
+        stride_b3: tl.constexpr = 256
+        stride_b2: tl.constexpr = 512
+        stride_b1: tl.constexpr = 512 * scales_b_shape2
+        stride_b0: tl.constexpr = stride_b1 * scales_b_shape1
+        scales_b_5d_desc = tl.make_tensor_descriptor(
+            scales_ptr,
+            [1, scales_b_shape1, scales_b_shape2, 2, 256],
+            [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
+            [1, rep_n, rep_k, 2, 256]
+        )
+    
+    #B-scales
+    if(channel_scale_mode == 4):
+        scales_a_ptrs = scales_a_ptr + offs_am[:, None] * stride_meta_a_m + offs_k_scales[None, :] * stride_meta_a_g
+    
+    # _1s dtype must match actual scale dtype: uint8 for MXFP (E8M0), float8e4nv for NVFP4 (E4M3)
+    if group_size == 16:
+        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
+        #scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
+    else:
+        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+        #scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+    for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
+        # Load A and B tiles        
+        if use_tma:
+            a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
+            b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_B]).T
+        else:
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs, eviction_policy=a_evict) 
+            else:
+                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+
+            b = tl.load(b_ptrs, eviction_policy=b_evict)
+        ####################################################################################
+        k_m = k * BLOCK_SIZE_K_S
+        if use_5d_scales:
+            # 5D TMA scale loads (preshuffled layout)
+            scale_b_raw = tl.load_tensor_descriptor(scales_b_5d_desc, [0, pid_n * rep_n, k * rep_k, 0, 0])
+            scales_b = scale_b_raw.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
+        else:
+            if EVEN_K:
+                scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
+            else:
+                _scale_k_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
+                scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, mask=_scale_k_mask, other=0.0, eviction_policy=meta_evict_policy)
+        
+        if(channel_scale_mode == 4):
+            if EVEN_K:
+                scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
+            else:
+                _scale_a_k_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
+                scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, mask=_scale_a_k_mask, other=0.0, eviction_policy=meta_evict_policy)
+        else:
+            scales_a = scales_a_1s
+
+        ####################################################################################
+        
+        acc = tl.dot_scaled(a, scales_a, a_dtype, b, scales_b, b_dtype, acc)
+
+        if not use_tma:
+            a_ptrs += BLOCK_SIZE_K_A * stride_ak
+            b_ptrs += BLOCK_SIZE_K_B * stride_bk     
+            if not EVEN_K:
+                a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
+
+    #NVFP4 meta-scale
+    if(group_size == 16):
+        acc = acc.to(tl.float32) * tl.load(meta_scale_norm_ptr, eviction_policy='evict_last')
+
+    #############################################################################################################
+    #Channel-wise scaling    
+    if channel_scale_mode == 2:  # activation-only
+        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1.0, eviction_policy=meta_evict_policy)
+        acc = acc * scales_a[:, None]
+        
+    #############################################################################################################
+    #Output
+    acc = acc.to(output_dtype)
+    if use_tma:
+        tl.store_tensor_descriptor(c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], value=acc)
+    else:
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+        mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
+        if EVEN_M and EVEN_N:
+            tl.store(c_ptrs, acc)
+        else:
+            tl.store(c_ptrs, acc, mask=mask)
+    
+
+PRINTED = False
+def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
+                W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int,
+                input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int,
+                channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int,
+                meta_scale: Tensor = None,
+                ) -> Tensor:
+    
+    
+    global PRINTED
+    from ..core import GEMLITE_USE_TMA
+    M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
+    M_CLOSEST = get_closest_m(M)
+    
+    #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
+    output = torch.empty((M, N), device=W_q.device, dtype=DTYPE_TO_TORCH[output_dtype])
+
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
+
+    if(scales_x is not None):
+        stride_meta_a_m, stride_meta_a_g = scales_x.stride(0), scales_x.stride(1)
+    else:
+        stride_meta_a_m, stride_meta_a_g = None, None
+
+    if(is_mx_dtype(input_dtype)):
+        gemm_kernel = gemm_MX_kernel
+        load_scales_as_block = True
+        use_5d_scales = (scales.ndim == 5)
+    else:
+        gemm_kernel = gemm_INT_kernel
+        load_scales_as_block = False
+        use_5d_scales = False
+
+    gemm_kernel[grid](
+        x, W_q, output,
+        scales, zeros, scales_x,
+        M, N, K, M_CLOSEST,
+        W_nbits, group_size, unpack_mask, elements_per_sample,
+        type_id, x.dtype.itemsize, W_q.dtype.itemsize,
+        x.stride(0), x.stride(1),
+        W_q.stride(0), W_q.stride(1),
+        output.stride(0), output.stride(1),
+        stride_meta_a_m, stride_meta_a_g,
+        0 if use_5d_scales else scales.stride(0), 0 if use_5d_scales else scales.stride(1),
+        load_scales_as_block = load_scales_as_block,
+        input_dtype  = DTYPE_TO_TRITON[input_dtype],
+        output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
+        acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
+        meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
+        channel_scale_mode  = channel_scale_mode,
+        W_group_mode        = W_group_mode,
+        zero_is_scalar      = zeros.numel() == 1,
+        data_contiguous     = data_contiguous,
+        use_tma             = use_5d_scales,
+        use_5d_scales       = use_5d_scales,
+        meta_scale_norm_ptr = meta_scale,
+    )
+    
+    return output
+
+
 
 # @triton.autotune(
 #     configs = get_autotune_config(),
@@ -618,299 +913,6 @@ def gemm_INT_kernel(
 #             tl.store(c_ptrs, acc)
 #         else:
 #             tl.store(c_ptrs, acc, mask=mask)
-
-@triton.autotune(
-    configs = get_autotune_config(),
-    key = KEYS, 
-    prune_configs_by = {'early_config_prune': kernel_config_pruner},
-    use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
-)
-@triton.jit
-def gemm_MX_kernel(
-    a_ptr, b_ptr, c_ptr,
-    scales_ptr, zeros_ptr, scales_a_ptr,
-    M, N: tl.constexpr, K: tl.constexpr, M_CLOSEST,
-    ######### Quant parms #########
-    W_nbits: tl.constexpr,
-    group_size: tl.constexpr,
-    unpack_mask: tl.constexpr,
-    elements_per_sample: tl.constexpr, 
-    #################################
-    type_id: tl.constexpr,
-    a_sizeof: tl.constexpr,
-    b_sizeof: tl.constexpr,
-    ######### Strides #########
-    stride_am: tl.constexpr, stride_ak: tl.constexpr,
-    stride_bk: tl.constexpr, stride_bn: tl.constexpr,
-    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
-    stride_meta_a_m: tl.constexpr, stride_meta_a_g: tl.constexpr,
-    stride_meta_n: tl.constexpr, stride_meta_g: tl.constexpr,
-    ######### Dtypes #########
-    load_scales_as_block, #True
-    input_dtype: tl.constexpr,
-    output_dtype: tl.constexpr,
-    meta_dtype: tl.constexpr,
-    acc_dtype: tl.constexpr,
-    ######### Meta-data mode #########
-    channel_scale_mode: tl.constexpr,
-    W_group_mode: tl.constexpr,
-    zero_is_scalar: tl.constexpr,
-    ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
-    GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr,
-    A_load_order: tl.constexpr,
-    data_contiguous: tl.constexpr,
-    #################################
-    EVEN_M: tl.constexpr = False, 
-    EVEN_K: tl.constexpr = False, 
-    EVEN_N: tl.constexpr = False,
-    #################################
-    meta_evict_policy: tl.constexpr = "evict_last",
-    a_evict: tl.constexpr = "",
-    b_evict: tl.constexpr = "",
-    meta_scale_norm: tl.constexpr = (0.05 ** 2),
-    #################################
-    use_tma: tl.constexpr = True,
-    use_5d_scales: tl.constexpr = False,
-):
-
-    pid = tl.program_id(axis=0)
-    pid_m, pid_n = swizzle_tile(pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
-    num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
-
-    a_ptr_dtype: tl.constexpr = a_ptr.dtype.element_ty
-    if(a_ptr_dtype == tl.float16):
-        a_dtype: tl.constexpr = "fp16"
-        elements_per_sample_a: tl.constexpr = 1
-    if(a_ptr_dtype == tl.bfloat16):
-        a_dtype: tl.constexpr = "bf16"
-        elements_per_sample_a: tl.constexpr = 1
-    if(a_ptr_dtype == tl.float8e4nv):
-        a_dtype: tl.constexpr = "e4m3"
-        elements_per_sample_a: tl.constexpr = 1
-    if(a_ptr_dtype == tl.uint8):
-        a_dtype: tl.constexpr = "e2m1" #FP4
-        elements_per_sample_a: tl.constexpr = 2
-
-    if(elements_per_sample == 1): #FP8
-        b_dtype: tl.constexpr = "e4m3"
-    if(elements_per_sample == 2): #FP4
-        b_dtype: tl.constexpr = "e2m1"
-
-    #A
-    BLOCK_SIZE_K_A: tl.constexpr = BLOCK_SIZE_K // elements_per_sample_a
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_ak = tl.arange(0, BLOCK_SIZE_K_A)
-    if not use_tma:
-        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
-    a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K // elements_per_sample_a)).to(tl.int1)
-
-    #B
-    BLOCK_SIZE_K_B: tl.constexpr = BLOCK_SIZE_K // elements_per_sample
-    offs_bk = tl.arange(0, BLOCK_SIZE_K_B)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    if not use_tma:
-        if data_contiguous:
-            offs_bn_load = offs_bn
-        else:
-            offs_bn_load = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-    else:
-        offs_bn_load = offs_bn
-    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn_load[None, :] * stride_bn
-
-    #Scales
-    stride_mul: tl.constexpr = BLOCK_SIZE_K / group_size
-    BLOCK_SIZE_K_S: tl.constexpr = BLOCK_SIZE_K // group_size
-    offs_k_scales = tl.arange(0, BLOCK_SIZE_K_S)
-    offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    if not use_5d_scales:
-        scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
-
-    if use_tma:
-        a_desc = tl.make_tensor_descriptor(
-            a_ptr,
-            [M, K // elements_per_sample_a],
-            [stride_am, stride_ak],
-            [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
-        )
-        
-        b_desc = tl.make_tensor_descriptor(
-            b_ptr,
-            [N, K // elements_per_sample],
-            [stride_bn, stride_bk],
-            [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
-        )
-        
-        c_desc = tl.make_tensor_descriptor(
-            c_ptr,
-            [M, N],
-            [stride_cm, stride_cn],
-            [BLOCK_SIZE_M, BLOCK_SIZE_N]
-        )
-        
-    # 5D TMA Descriptors for Scales (preshuffled layout)
-    if use_5d_scales:
-        rep_n: tl.constexpr = BLOCK_SIZE_N // 128
-        rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
-        scales_b_shape1: tl.constexpr = N // 128
-        scales_b_shape2: tl.constexpr = K // group_size // 4
-        stride_b4: tl.constexpr = 1
-        stride_b3: tl.constexpr = 256
-        stride_b2: tl.constexpr = 512
-        stride_b1: tl.constexpr = 512 * scales_b_shape2
-        stride_b0: tl.constexpr = stride_b1 * scales_b_shape1
-        scales_b_5d_desc = tl.make_tensor_descriptor(
-            scales_ptr,
-            [1, scales_b_shape1, scales_b_shape2, 2, 256],
-            [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
-            [1, rep_n, rep_k, 2, 256]
-        )
-    
-    #B-scales
-    if(channel_scale_mode == 4):
-        scales_a_ptrs = scales_a_ptr + offs_am[:, None] * stride_meta_a_m + offs_k_scales[None, :] * stride_meta_a_g
-    
-    # _1s dtype must match actual scale dtype: uint8 for MXFP (E8M0), float8e4nv for NVFP4 (E4M3)
-    if group_size == 16:
-        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
-        scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
-    else:
-        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
-        scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
-
-    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-    for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
-        # Load A and B tiles        
-        if use_tma:
-            a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
-            b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_B]).T
-        else:
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict) 
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
-
-            b = tl.load(b_ptrs, eviction_policy=b_evict)
-        ####################################################################################
-        k_m = k * BLOCK_SIZE_K_S
-        if use_5d_scales:
-            # 5D TMA scale loads (preshuffled layout)
-            scale_b_raw = tl.load_tensor_descriptor(scales_b_5d_desc, [0, pid_n * rep_n, k * rep_k, 0, 0])
-            scales_b = scale_b_raw.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
-        else:
-            if EVEN_K:
-                scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
-            else:
-                _scale_k_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
-                scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, mask=_scale_k_mask, other=0.0, eviction_policy=meta_evict_policy)
-        
-        if(channel_scale_mode == 4):
-            if EVEN_K:
-                scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
-            else:
-                _scale_a_k_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
-                scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, mask=_scale_a_k_mask, other=0.0, eviction_policy=meta_evict_policy)
-        else:
-            scales_a = scales_a_1s
-
-        #scales_b = scales_b_1s
-        #scales_a = scales_a_1s
-
-        ####################################################################################
-        
-        acc = tl.dot_scaled(a, scales_a, a_dtype, b, scales_b, b_dtype, acc)
-
-        if not use_tma:
-            a_ptrs += BLOCK_SIZE_K_A * stride_ak
-            b_ptrs += BLOCK_SIZE_K_B * stride_bk     
-            if not EVEN_K:
-                a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
-
-    #NVFP4 meta-scale
-    if(group_size == 16):
-        acc *= meta_scale_norm
-
-    #############################################################################################################
-    #Channel-wise scaling    
-    if channel_scale_mode == 2:  # activation-only
-        dtype: tl.constexpr = c_ptr.dtype.element_ty
-        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1.0, eviction_policy=meta_evict_policy)
-        acc = acc.to(dtype) * scales_a[:, None]
-        
-    #############################################################################################################
-    #Output
-    if use_tma:
-        tl.store_tensor_descriptor(c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], value=acc)
-    else:
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
-        c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-        mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
-        if EVEN_M and EVEN_N:
-            tl.store(c_ptrs, acc)
-        else:
-            tl.store(c_ptrs, acc, mask=mask)
-    
-
-PRINTED = False
-def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
-                W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int,
-                input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int,
-                channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int,
-                ) -> Tensor:
-    
-    
-    global PRINTED
-    from ..core import GEMLITE_USE_TMA
-    M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
-    M_CLOSEST = get_closest_m(M)
-    
-    #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
-    output = torch.empty((M, N), device=W_q.device, dtype=DTYPE_TO_TORCH[output_dtype])
-
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
-
-    if(scales_x is not None):
-        stride_meta_a_m, stride_meta_a_g = scales_x.stride(0), scales_x.stride(1)
-    else:
-        stride_meta_a_m, stride_meta_a_g = None, None
-
-    if(is_mx_dtype(input_dtype)):
-        gemm_kernel = gemm_MX_kernel
-        load_scales_as_block = True
-        use_5d_scales = (scales.ndim == 5)
-    else:
-        gemm_kernel = gemm_INT_kernel
-        load_scales_as_block = False
-        use_5d_scales = False
-
-    gemm_kernel[grid](
-        x, W_q, output,
-        scales, zeros, scales_x,
-        M, N, K, M_CLOSEST,
-        W_nbits, group_size, unpack_mask, elements_per_sample,
-        type_id, x.dtype.itemsize, W_q.dtype.itemsize,
-        x.stride(0), x.stride(1),
-        W_q.stride(0), W_q.stride(1),
-        output.stride(0), output.stride(1),
-        stride_meta_a_m, stride_meta_a_g,
-        0 if use_5d_scales else scales.stride(0), 0 if use_5d_scales else scales.stride(1),
-        load_scales_as_block = load_scales_as_block,
-        input_dtype  = DTYPE_TO_TRITON[input_dtype],
-        output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
-        acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
-        meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
-        channel_scale_mode = channel_scale_mode,
-        W_group_mode       = W_group_mode,
-        zero_is_scalar     = zeros.numel() == 1,
-        data_contiguous    = data_contiguous,
-        use_tma            = use_5d_scales,
-        use_5d_scales      = use_5d_scales,
-    )
-    
-    return output
 
 # # Persistent version
 # NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
