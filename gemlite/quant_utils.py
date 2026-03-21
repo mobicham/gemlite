@@ -2122,6 +2122,183 @@ def scale_activations_mxfp4_triton_v5(tensor: Tensor) -> Tuple[Tensor, Tensor]:
 
 
 ####################################################################################################################
+# Pre-allocated per-device buffers for dynamic NVFP4 meta_scale computation
+_nvfp4_meta_scale_bufs = []  # meta_scale output (float32 scalar)
+_nvfp4_amax_bufs = []        # atomic max scratch (float32 scalar)
+_nvfp4_counter_bufs = []     # grid sync counter (int32 scalar)
+
+def _get_nvfp4_bufs(device_index):
+    """Get or create pre-allocated buffers for the given device."""
+    global _nvfp4_meta_scale_bufs, _nvfp4_amax_bufs, _nvfp4_counter_bufs
+    for buf_list in [_nvfp4_meta_scale_bufs, _nvfp4_amax_bufs, _nvfp4_counter_bufs]:
+        while len(buf_list) <= device_index:
+            buf_list.append(None)
+    if _nvfp4_meta_scale_bufs[device_index] is None:
+        dev = f"cuda:{device_index}"
+        _nvfp4_meta_scale_bufs[device_index] = torch.zeros(1, device=dev, dtype=torch.float32)
+        _nvfp4_amax_bufs[device_index] = torch.zeros(1, device=dev, dtype=torch.float32)
+        _nvfp4_counter_bufs[device_index] = torch.zeros(1, device=dev, dtype=torch.int32)
+    return _nvfp4_meta_scale_bufs[device_index], _nvfp4_amax_bufs[device_index], _nvfp4_counter_bufs[device_index]
+
+####################################################################################################################
+# Fused persistent NVFP4 v6: Single-kernel amax + quantize
+# Phase 1: all blocks compute tile amax, atomicMax to global, grid barrier
+# Phase 2: all blocks quantize tiles using computed meta_scale
+# Grid limited to num_SMs so all blocks run concurrently (spin-wait safe)
+####################################################################################################################
+@triton.jit
+def scale_activations_nvfp4_fused_kernel_v6(
+    tensor_ptr, out_ptr, scales_ptr, thr_pos_ptr,
+    M, M_padded, K,
+    stride_m_t: tl.constexpr, stride_k_t: tl.constexpr,
+    stride_m_s: tl.constexpr, stride_k_s: tl.constexpr,
+    stride_m_o: tl.constexpr, stride_k_o: tl.constexpr,
+    eps: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    meta_scales_ptr,  # output: computed meta_scale
+    amax_ptr,         # scratch: atomic max accumulator
+    counter_ptr,      # scratch: grid sync counter
+    num_tiles_m, num_tiles_k,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    ptx_pack: tl.constexpr = False,
+):
+    pid = tl.program_id(0)
+    num_pids = tl.num_programs(0)
+    total_tiles = num_tiles_m * num_tiles_k
+
+    fp8_dtype: tl.constexpr = tl.float8e4nv
+    max_fp8: tl.constexpr = 448.
+    HALF_BLOCK_K: tl.constexpr = BLOCK_SIZE_K // 2
+    GROUPS_PER_BLOCK: tl.constexpr = BLOCK_SIZE_K // GROUP_SIZE
+    FLAT_M: tl.constexpr = BLOCK_SIZE_M * GROUPS_PER_BLOCK
+    out_dtype: tl.constexpr = out_ptr.dtype.element_ty
+
+    # Load thresholds once
+    thr0 = tl.load(thr_pos_ptr + 0)
+    thr1 = tl.load(thr_pos_ptr + 1)
+    thr2 = tl.load(thr_pos_ptr + 2)
+    thr3 = tl.load(thr_pos_ptr + 3)
+    thr4 = tl.load(thr_pos_ptr + 4)
+    thr5 = tl.load(thr_pos_ptr + 5)
+    thr6 = tl.load(thr_pos_ptr + 6)
+    thr7 = tl.load(thr_pos_ptr + 7)
+
+    # ---- Phase 1: Compute amax across all tiles ----
+    local_amax = tl.full((1,), value=0.0, dtype=tl.float32)
+    for tile_idx in range(pid, total_tiles, num_pids):
+        tile_m = tile_idx // num_tiles_k
+        tile_k = tile_idx % num_tiles_k
+
+        offs_m = tile_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_k = tile_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+        mask = ((offs_m[:, None] < M) & (offs_k[None, :] < K)).to(tl.int1)
+        tensor_ptrs = tensor_ptr + (offs_m[:, None] * stride_m_t + offs_k[None, :] * stride_k_t)
+        tensor = tl.load(tensor_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        tile_max = tl.max(tl.abs(tensor))
+        local_amax = tl.maximum(local_amax, tile_max)
+
+    # Atomic max to global (release: ensures atomicMax is visible before counter increment)
+    tl.atomic_max(amax_ptr, tl.max(local_amax, axis=0), sem='relaxed')
+
+    # Grid barrier: last block computes meta_scale and signals
+    # acq_rel: acquires all prior releases (sees all other blocks' atomicMax)
+    old_count = tl.atomic_add(counter_ptr, 1, sem='relaxed')
+    if old_count == num_pids - 1:
+        final_amax = tl.load(amax_ptr)
+        tl.store(meta_scales_ptr, tl.maximum(final_amax / 6.0, eps))
+        # Reset scratch for next call
+        tl.store(amax_ptr, 0.0)
+        # Signal ready by setting counter to -num_pids (distinguishable from 0..num_pids-1)
+        tl.store(counter_ptr, -1)
+
+    # Spin-wait for ready signal (safe: grid <= num_SMs, all blocks run concurrently)
+    while tl.atomic_add(counter_ptr, 0, sem='relaxed') >= 0:
+        pass
+
+    # ---- Phase 2: Quantize using computed meta_scale ----
+    meta_scales = tl.load(meta_scales_ptr)
+
+    for tile_idx in range(pid, total_tiles, num_pids):
+        tile_m = tile_idx // num_tiles_k
+        tile_k = tile_idx % num_tiles_k
+
+        offs_m = tile_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_k = tile_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+
+        # Reload tile (L2 cached from Phase 1)
+        mask = ((offs_m[:, None] < M) & (offs_k[None, :] < K)).to(tl.int1)
+        tensor_ptrs = tensor_ptr + (offs_m[:, None] * stride_m_t + offs_k[None, :] * stride_k_t)
+        tensor = tl.load(tensor_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        tensor_flat = tl.reshape(tensor, (FLAT_M, GROUP_SIZE))
+        abs_max = tl.max(tl.abs(tensor_flat), axis=1, keep_dims=True)
+        scales_raw = abs_max / (6. * meta_scales)
+        scales_fp8 = tl.minimum(scales_raw, max_fp8).to(fp8_dtype)
+        scales_full = tl.maximum(scales_fp8.to(tl.float32) * meta_scales, eps)
+
+        wq = tensor_flat / scales_full
+
+        if ptx_pack:
+            wq_2d = tl.reshape(wq, (BLOCK_SIZE_M, BLOCK_SIZE_K))
+            wq_pairs = wq_2d.reshape((BLOCK_SIZE_M, HALF_BLOCK_K, 2), can_reorder=False)
+            lo_val, hi_val = tl.split(wq_pairs)
+            lo_f16 = lo_val.to(tl.float16)
+            hi_f16 = hi_val.to(tl.float16)
+            lo_bits = lo_f16.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+            hi_bits = (hi_f16.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF) << 16
+            packed_f16x2 = lo_bits | hi_bits
+            packed_e2m1 = tl.inline_asm_elementwise(
+                asm="""
+                {
+                    .reg .b8       tmp_out;
+                    .reg .f16x2    tmp_in;
+                    mov.b32                          tmp_in, $1;
+                    cvt.rn.satfinite.e2m1x2.f16x2    tmp_out, tmp_in;
+                    cvt.u32.u8                       $0, tmp_out;
+                }
+                """,
+                constraints="=r,r",
+                args=[packed_f16x2],
+                dtype=tl.int32,
+                is_pure=True,
+                pack=1,
+            )
+            out = packed_e2m1.to(tl.uint8)
+        else:
+            abs_wq = tl.abs(wq)
+            idx_abs = ((abs_wq > thr0).to(tl.int32) + (abs_wq > thr1).to(tl.int32) +
+                       (abs_wq > thr2).to(tl.int32) + (abs_wq > thr3).to(tl.int32) +
+                       (abs_wq > thr4).to(tl.int32) + (abs_wq > thr5).to(tl.int32) +
+                       (abs_wq > thr6).to(tl.int32) + (abs_wq > thr7).to(tl.int32))
+            out = tl.where(wq >= 0, idx_abs, idx_abs + 8).to(out_dtype)
+            out = tl.reshape(out, (BLOCK_SIZE_M, BLOCK_SIZE_K))
+            lo, hi = tl.split(out.reshape((BLOCK_SIZE_M, HALF_BLOCK_K, 2), can_reorder=False))
+            out = lo | (hi << 4)
+
+        # Store quantized output
+        offs_k_out = tile_k * HALF_BLOCK_K + tl.arange(0, HALF_BLOCK_K)
+        out_mask = ((offs_m[:, None] < M) & (offs_k_out[None, :] < (K // 2))).to(tl.int1)
+        tl.store(out_ptr + (offs_m[:, None] * stride_m_o + offs_k_out[None, :] * stride_k_o), out, mask=out_mask)
+
+        # Store scales
+        scales_2d = tl.reshape(scales_fp8, (BLOCK_SIZE_M, GROUPS_PER_BLOCK))
+        scales_2d = tl.where(offs_m[:, None] < M, scales_2d, tl.full(scales_2d.shape, 1.0, dtype=tl.float32).to(fp8_dtype))
+        base_group = tile_k * GROUPS_PER_BLOCK
+        offs_g = base_group + tl.arange(0, GROUPS_PER_BLOCK)
+        g_mask = offs_g < tl.cdiv(K, GROUP_SIZE)
+        tl.store(
+            scales_ptr + offs_m[:, None] * stride_m_s + offs_g[None, :] * stride_k_s,
+            scales_2d, mask=(offs_m[:, None] < M_padded) & g_mask[None, :]
+        )
+
+    # Last block resets counter for next call
+    if old_count == num_pids - 1:
+        tl.store(counter_ptr, 0)
+
+####################################################################################################################
 # NVFP4 v5: 2D grid with multi-group BLOCK_SIZE_K (fewer blocks, better bandwidth)
 ####################################################################################################################
 @triton.autotune(
@@ -2246,8 +2423,6 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> 
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn
-    # Compute per-tensor meta_scale from activation data
-    meta_scale = meta_scale if meta_scale is not None else (tensor.view(-1, group_size).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
 
     tensor = tensor.contiguous()
     tensor = tensor.view(-1, tensor.shape[-1])
@@ -2258,20 +2433,49 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> 
 
     out = torch.empty((M, K // 2), device=tensor.device, dtype=torch.uint8)
     scales = torch.empty((M_padded, K // group_size), device=tensor.device, dtype=fp8_dtype)
-
-    grid = lambda meta: (triton.cdiv(M_padded, meta['BLOCK_SIZE_M']), triton.cdiv(K, meta['BLOCK_SIZE_K']))
     device_index = tensor.device.index
 
-    scale_activations_nvfp4_triton_kernel_v5[grid](
-        tensor, out, scales, thr_pos[device_index],
-        M, M_padded, K,
-        tensor.stride(0), tensor.stride(1),
-        scales.stride(0), scales.stride(1),
-        out.stride(0), out.stride(1),
-        eps=eps,
-        GROUP_SIZE=group_size,
-        meta_scales_ptr=meta_scale,
-    )
+    if meta_scale is None:
+        # Fused path: single kernel computes amax + quantizes
+        meta_scale, amax_buf, counter_buf = _get_nvfp4_bufs(device_index)
+        BLOCK_M = 16
+        BLOCK_K = 256
+        num_tiles_m = triton.cdiv(M_padded, BLOCK_M)
+        num_tiles_k = triton.cdiv(K, BLOCK_K)
+        total_tiles = num_tiles_m * num_tiles_k
+        num_SMs = torch.cuda.get_device_properties(device_index).multi_processor_count
+        num_blocks = min(total_tiles, num_SMs)
+
+        scale_activations_nvfp4_fused_kernel_v6[(num_blocks,)](
+            tensor, out, scales, thr_pos[device_index],
+            M, M_padded, K,
+            tensor.stride(0), tensor.stride(1),
+            scales.stride(0), scales.stride(1),
+            out.stride(0), out.stride(1),
+            eps=eps,
+            GROUP_SIZE=group_size,
+            meta_scales_ptr=meta_scale,
+            amax_ptr=amax_buf,
+            counter_ptr=counter_buf,
+            num_tiles_m=num_tiles_m,
+            num_tiles_k=num_tiles_k,
+            BLOCK_SIZE_M=BLOCK_M,
+            BLOCK_SIZE_K=BLOCK_K,
+        )
+    else:
+        # Static path: meta_scale already provided, use v5 kernel directly
+        grid = lambda meta: (triton.cdiv(M_padded, meta['BLOCK_SIZE_M']), triton.cdiv(K, meta['BLOCK_SIZE_K']))
+        scale_activations_nvfp4_triton_kernel_v5[grid](
+            tensor, out, scales, thr_pos[device_index],
+            M, M_padded, K,
+            tensor.stride(0), tensor.stride(1),
+            scales.stride(0), scales.stride(1),
+            out.stride(0), out.stride(1),
+            eps=eps,
+            GROUP_SIZE=group_size,
+            meta_scales_ptr=meta_scale,
+        )
+
     return out, scales, meta_scale
 
 
