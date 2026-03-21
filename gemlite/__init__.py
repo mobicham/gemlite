@@ -15,6 +15,7 @@ from .core import (
     enable_tma,
     set_ptx_fp4_pack,
     enable_cudagraph_autotune,
+    set_fast_nvfp4,
     forward_functional,
 )
 

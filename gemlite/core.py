@@ -67,7 +67,9 @@ GEMLITE_MATMUL_TYPES_MAPPING = {GEMLITE_MATMUL_TYPES[i]: i for i in range(len(GE
 GEMLITE_TRITON_CONFIG_CACHE  = {} #Global config cache for all the kernels
 _GROUP_SIZE_WARNED           = False
 GEMLITE_USE_TMA              = True # Set to False for faster MXFP8 on sm_120
-GEMLITE_ENABLE_PTX_FP4_PACK      = False # Set to True for hardware e2m1x2 FP4 packing (requires CUDA 13.0+ ptxas)
+GEMLITE_ENABLE_PTX_FP4_PACK  = False # Set to True for hardware e2m1x2 FP4 packing (requires CUDA 13.0+ ptxas)
+GEMLITE_FAST_NVFP4           = False
+GEMLITE_NVFP4_META_SCALES    = []  # Pre-allocated per-GPU meta_scale tensors
 
 ###################################################################################
 #Utils
@@ -111,6 +113,17 @@ def set_ptx_fp4_pack(enabled: bool = True):
     set_ptx_fp4_pack_flag(enabled)
 
 #Enable/disable CUDA graph-based autotuning (more accurate but slower)
+#Enable/disable fast NVFP4 mode (pre-allocated static meta_scale, skips dynamic computation)
+def set_fast_nvfp4(enabled: bool = True, default_value: float = 0.05):
+    global GEMLITE_FAST_NVFP4, GEMLITE_NVFP4_META_SCALES
+    GEMLITE_FAST_NVFP4 = enabled
+    if enabled and len(GEMLITE_NVFP4_META_SCALES) == 0:
+        num_gpus = torch.cuda.device_count()
+        GEMLITE_NVFP4_META_SCALES = [
+            torch.full((1,), fill_value=default_value, device=f"cuda:{i}", dtype=torch.float32)
+            for i in range(num_gpus)
+        ]
+
 def enable_cudagraph_autotune(enabled: bool = True):
     set_autotune("fast", use_cuda_graph=enabled)
 
@@ -193,9 +206,10 @@ def forward_functional(
             x, scales_x = scale_activations_mxfp4(x)
 
         elif(input_dtype in [DType.NVFP4] and channel_scale_mode == 4): #NVPF4: TODO
-            meta_scale_w = tensor_args[3]
-            x, scales_x, meta_scale_a = scale_activations_nvfp4(x)
-            meta_scale = meta_scale_w * meta_scale_a  # combine weight and activation meta_scales
+            meta_scale = tensor_args[3]
+            _static_meta = GEMLITE_NVFP4_META_SCALES[x.device.index] if GEMLITE_FAST_NVFP4 else None
+            x, scales_x, meta_scale_a = scale_activations_nvfp4(x, meta_scale=_static_meta)
+            meta_scale = meta_scale * meta_scale_a  # combine weight and activation meta_scales
     
     x = x.view(-1, x.shape[-1])
 
