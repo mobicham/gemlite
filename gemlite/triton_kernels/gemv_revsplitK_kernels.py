@@ -11,7 +11,6 @@ from .utils import *
 
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
 MATMUL_TYPE   = "GEMV_REVSPLITK"
-NATIVE_ATOMIC = gpu_supports_bfloat16_atomicadd()
 
 def kernel_config_pruner(configs, nargs, **kwargs):
     global KEYS
@@ -22,6 +21,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
     k = nargs['K'] 
     g = nargs['group_size']
     e = nargs['elements_per_sample']
+    split_k = 2 # Fixed
 
     pre_hook = init_to_zero("c_ptr") if nargs['use_prehook'] else None
 
@@ -39,6 +39,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_dec_producer', None)
             config.pop('reg_inc_consumer', None)
 
+            config['EVEN_K'] = (k % (config['BLOCK_SIZE_K'] * split_k) == 0)
             config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
 
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps, pre_hook=pre_hook)
@@ -49,7 +50,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_m = 1 #next_power_of_2(m) #Only 1 allowed here
         block_size_n = min(n, config.kwargs['BLOCK_SIZE_N'])
         block_size_k = min(k, config.kwargs['BLOCK_SIZE_K'])
-        split_k      = 2
 
         A_load_order  = config.kwargs['A_load_order']
         dot_prod_mode = config.kwargs['dot_prod_mode']
@@ -80,6 +80,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
 
         even_n = (n % block_size_n == 0)
+        even_k = (k % (block_size_k * 2) == 0)
 
         key = (block_size_m, block_size_n, block_size_k, A_load_order, dot_prod_mode, num_stages, num_warps)
 
@@ -89,6 +90,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             'BLOCK_SIZE_K': block_size_k,
             'A_load_order': A_load_order,
             'dot_prod_mode': dot_prod_mode,
+            'EVEN_K': even_k,
             'EVEN_N': even_n,
         }
 
@@ -278,6 +280,7 @@ def gemv_INT_revsplitK_kernel(
     atomic_mode: tl.constexpr = 'relaxed',
     a_evict: tl.constexpr = 'evict_last',
     b_evict: tl.constexpr = 'evict_first',
+    EVEN_K: tl.constexpr = False,
     EVEN_N: tl.constexpr = False,
 ):
     """
@@ -337,12 +340,21 @@ def gemv_INT_revsplitK_kernel(
     #-----------------------------------------------------------------------------------------------------------
     #Load
     if(A_load_order == 0):
-        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        if EVEN_K:
+            a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     
-    b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+    if EVEN_K and EVEN_N:
+        b = tl.load(b_ptrs, eviction_policy=b_evict)
+    else:
+        b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
     if(A_load_order == 1):
-        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        if EVEN_K:
+            a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
 
     # Unpack and dequantize    
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
@@ -359,18 +371,28 @@ def gemv_INT_revsplitK_kernel(
     #Advance and load next chunk
     a_ptrs += BLOCK_SIZE_K * stride_ak
     b_ptrs += (BLOCK_SIZE_K // elements_per_sample) * stride_bk
-    a_mask  = ((offs_am[:, None] < M) & ((offs_ak[None, :] + BLOCK_SIZE_K) < K)).to(tl.int1)
-    b_mask  = (((offs_bk[:, None] + BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N)).to(tl.int1)
+    if not EVEN_K:
+        a_mask  = ((offs_am[:, None] < M) & ((offs_ak[None, :] + BLOCK_SIZE_K) < K)).to(tl.int1)
+        b_mask  = (((offs_bk[:, None] + BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N)).to(tl.int1)
 
     #Stage 2
     #-----------------------------------------------------------------------------------------------------------
     if(A_load_order == 0):
-        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        if EVEN_K:
+            a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     
-    b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+    if EVEN_K and EVEN_N:
+        b = tl.load(b_ptrs, eviction_policy=b_evict)
+    else:
+        b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
     if(A_load_order == 1):
-        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        if EVEN_K:
+            a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        else:
+            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
 
     # Unpack and dequantize    
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
@@ -409,7 +431,7 @@ def gemv_INT_revsplitK_kernel(
     if EVEN_N:
         tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
     else:
-        mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        mask = (offs_cn[None, :] < N) # BLOCK_SIZE_M is always 1
         tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode)
     
 KERNEL_CACHE = {}
@@ -426,7 +448,7 @@ def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor
     M, K, N = x.shape[0], x.shape[1], W_q.shape[1]
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
 
-    native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or NATIVE_ATOMIC
+    native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or gpu_supports_bfloat16_atomicadd()
     kernel_output_dtype = (DTYPE_TO_TORCH[output_dtype] if native_atomic else torch.float32)
 
     if KERNEL.ENABLE_CACHING and M == 1:

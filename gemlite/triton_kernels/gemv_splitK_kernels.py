@@ -11,7 +11,6 @@ from .utils import *
 
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
 MATMUL_TYPE   = "GEMV_SPLITK"
-NATIVE_ATOMIC = gpu_supports_bfloat16_atomicadd()
 
 def kernel_config_pruner(configs, nargs, **kwargs):
     global KEYS
@@ -38,8 +37,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_inc_consumer', None)
 
             config['EVEN_M'] = (m % config['BLOCK_SIZE_M'] == 0)
-            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
             config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
 
             yield triton.Config(config,
                 num_stages=num_stages,
@@ -475,7 +474,7 @@ def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
 
     native_atomic = True 
-    #native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or NATIVE_ATOMIC
+    #native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or gpu_supports_bfloat16_atomicadd()
     #WARNING: change this to the second check if SPLIT_K > 1 
     
     output = torch.empty((M, N), device=W_q.device, dtype=DTYPE_TO_TORCH[output_dtype] if native_atomic else torch.float32) 

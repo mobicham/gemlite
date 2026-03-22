@@ -6,6 +6,9 @@ import triton.language as tl
 from triton.runtime import driver
 from ..dtypes import *
 
+GEMLITE_USE_NATIVE_ATOMIC_BFP16 = True
+GPU_COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
 # TMA descriptors require a global memory allocation
 from typing import Optional
 def alloc_fn(size: int, alignment: int, stream: Optional[int]):
@@ -160,7 +163,7 @@ def estimate_shared_memory_per_block(block_size_m, block_size_n, block_size_k, a
 
 def gpu_supports_bfloat16_atomicadd():
     #Triton tl.atomic_add doens't support bfloat16 on older GPUs.
-    return torch.cuda.get_device_capability()[0] >= 9 #Hopper and above
+    return (GPU_COMPUTE_CAPABILITY >= 9) and GEMLITE_USE_NATIVE_ATOMIC_BFP16
 
 NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 def get_num_SMs(device):
@@ -213,6 +216,4 @@ def get_gpu_shared_memory():
 
 ###################################################################################
 #Cached results to avoid runtime driver calls
-
-IS_HIP = is_hip() 
-NATIVE_ATOMIC = gpu_supports_bfloat16_atomicadd()
+IS_HIP = is_hip()

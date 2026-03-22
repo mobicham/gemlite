@@ -41,16 +41,16 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config["NUM_STAGES"] = num_stages
 
             config['EVEN_M'] = (m % config['BLOCK_SIZE_M'] == 0)
-            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
             config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
 
             # Adjust 5D TMA compatibility for cached configs
             if load_scales_as_block and n % 128 == 0 and (k // g) % 4 == 0:
                 config['BLOCK_SIZE_N'] = max(config['BLOCK_SIZE_N'], 128)
                 while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
                     config['BLOCK_SIZE_K'] *= 2
-                config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
                 config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+                config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
 
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps)
             return
@@ -112,8 +112,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         key = (block_size_m, block_size_n, block_size_k, group_size_m, A_load_order, num_stages, num_warps)
         
         even_m = (m % block_size_m == 0)
-        even_n = (n % block_size_n == 0)
         even_k = (k % block_size_k == 0)
+        even_n = (n % block_size_n == 0)
 
         new_config = {
             "BLOCK_SIZE_M": block_size_m,
@@ -361,6 +361,7 @@ def gemm_INT_kernel(
     offs_bk = offs_k
 
     b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn) 
+    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N)).to(tl.int1)
     q_shift = ((offs_bk % elements_per_sample) * W_nbits).to(tl.int32)[:, None] 
 
     #Inputs
@@ -388,7 +389,10 @@ def gemm_INT_kernel(
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
+        if EVEN_K and EVEN_N:
+            b = tl.load(b_ptrs, eviction_policy=b_evict)
+        else:
+            b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
         if(A_load_order == 1): #Early load
             if EVEN_M and EVEN_K:
@@ -437,6 +441,7 @@ def gemm_INT_kernel(
         
         if not EVEN_K:
             a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
+            b_mask = (((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N)).to(tl.int1)
 
     #############################################################################################################
     #Channel-wise scaling
@@ -561,6 +566,7 @@ def gemm_MX_kernel(
     else:
         offs_bn_load = offs_bn
     b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn_load[None, :] * stride_bn
+    b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N)).to(tl.int1)
 
     #Scales
     stride_mul: tl.constexpr = BLOCK_SIZE_K / group_size
@@ -635,7 +641,10 @@ def gemm_MX_kernel(
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
 
-            b = tl.load(b_ptrs, eviction_policy=b_evict)
+            if EVEN_K and EVEN_N:
+                b = tl.load(b_ptrs, eviction_policy=b_evict)
+            else:
+                b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
         ####################################################################################
         k_m = k * BLOCK_SIZE_K_S
         if use_5d_scales:
@@ -667,6 +676,7 @@ def gemm_MX_kernel(
             b_ptrs += BLOCK_SIZE_K_B * stride_bk     
             if not EVEN_K:
                 a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K) < K)).to(tl.int1)
+                b_mask = (((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N)).to(tl.int1)
 
     #NVFP4 meta-scale
     if(group_size == 16):
