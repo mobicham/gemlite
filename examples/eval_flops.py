@@ -14,7 +14,7 @@ repeat = 32
 gemlite.reset_config()
 gemlite.enable_cudagraph_autotune(True)
 gemlite.enable_tma(True)
-#gemlite.set_ptx_fp4_pack(True) 
+#gemlite.set_ptx_fp4_pack(True) # Requires ptxas CUDA 13+
 #gemlite.set_autotune("max")
 #gemlite.core.enable_activation_scaling(2)
 
