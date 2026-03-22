@@ -438,6 +438,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         fma_mode: bool = True,
         contiguous: Union[int, None] = None,
         packing_bitwidth: Union[int, None] = None,
+        packed: bool = False,
     ):  
 
         #Check inputs
@@ -476,8 +477,18 @@ class GemLiteLinearTriton(torch.nn.Module):
             if(contiguous is None): 
                 contiguous = False
 
+        # Pre-packed weights (already nibble-packed, shape [N, K//elements_per_sample])
+        if packed and W_q.dtype == torch.uint8:
+            if packing_bitwidth is None:
+                packing_bitwidth = 8 if is_mx_dtype(self.input_dtype) else GemLiteLinearTriton.PACKING_BITWIDTH
+            self.elements_per_sample = packing_bitwidth // self.W_nbits
+            self.W_q = W_q.view(self.out_features, self.in_features // self.elements_per_sample).t()
+
+            if contiguous is None:
+                contiguous = not is_mx_dtype(self.input_dtype)
+
         # Packed weigths
-        if W_q.dtype == torch.uint8:  
+        elif W_q.dtype == torch.uint8:  
             _pack_weights_over_cols = pack_weights_over_cols_triton if (W_q.device.type == "cuda") else pack_weights_over_cols_torch
 
             self.W_q, self.elements_per_sample = _pack_weights_over_cols(
