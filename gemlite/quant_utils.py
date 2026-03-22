@@ -2122,22 +2122,20 @@ def scale_activations_mxfp4_triton_v5(tensor: Tensor) -> Tuple[Tensor, Tensor]:
 
 
 ####################################################################################################################
-# Pre-allocated per-device buffers for dynamic NVFP4 meta_scale computation
+# Pre-allocated per-device buffers for dynamic NVFP4 meta_scale computation.
+# Eagerly allocated at import time so they live outside CUDAGraph capture scope.
 _nvfp4_meta_scale_bufs = []  # meta_scale output (float32 scalar)
 _nvfp4_amax_bufs = []        # atomic max scratch (float32 scalar)
 _nvfp4_counter_bufs = []     # grid sync counter (int32 scalar)
 
+if torch.cuda.is_available():
+    for _i in range(torch.cuda.device_count()):
+        _dev = f"cuda:{_i}"
+        _nvfp4_meta_scale_bufs.append(torch.zeros(1, device=_dev, dtype=torch.float32))
+        _nvfp4_amax_bufs.append(torch.zeros(1, device=_dev, dtype=torch.float32))
+        _nvfp4_counter_bufs.append(torch.zeros(1, device=_dev, dtype=torch.int32))
+
 def _get_nvfp4_bufs(device_index):
-    """Get or create pre-allocated buffers for the given device."""
-    global _nvfp4_meta_scale_bufs, _nvfp4_amax_bufs, _nvfp4_counter_bufs
-    for buf_list in [_nvfp4_meta_scale_bufs, _nvfp4_amax_bufs, _nvfp4_counter_bufs]:
-        while len(buf_list) <= device_index:
-            buf_list.append(None)
-    if _nvfp4_meta_scale_bufs[device_index] is None:
-        dev = f"cuda:{device_index}"
-        _nvfp4_meta_scale_bufs[device_index] = torch.zeros(1, device=dev, dtype=torch.float32)
-        _nvfp4_amax_bufs[device_index] = torch.zeros(1, device=dev, dtype=torch.float32)
-        _nvfp4_counter_bufs[device_index] = torch.zeros(1, device=dev, dtype=torch.int32)
     return _nvfp4_meta_scale_bufs[device_index], _nvfp4_amax_bufs[device_index], _nvfp4_counter_bufs[device_index]
 
 ####################################################################################################################
@@ -2438,13 +2436,12 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> 
     if meta_scale is None:
         # Fused path: single kernel computes amax + quantizes
         meta_scale, amax_buf, counter_buf = _get_nvfp4_bufs(device_index)
-        BLOCK_M = 16
+        BLOCK_M = 32 if M >= 32 else 16
         BLOCK_K = 256
         num_tiles_m = triton.cdiv(M_padded, BLOCK_M)
         num_tiles_k = triton.cdiv(K, BLOCK_K)
-        total_tiles = num_tiles_m * num_tiles_k
         num_SMs = torch.cuda.get_device_properties(device_index).multi_processor_count
-        num_blocks = min(total_tiles, num_SMs)
+        num_blocks = min(num_tiles_m * num_tiles_k, num_SMs)
 
         scale_activations_nvfp4_fused_kernel_v6[(num_blocks,)](
             tensor, out, scales, thr_pos[device_index],

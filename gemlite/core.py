@@ -105,6 +105,11 @@ def enable_tma(enabled: bool = True):
     global GEMLITE_USE_TMA
     GEMLITE_USE_TMA = enabled
 
+#Enable/disable BF16 native atomic add (disable for higher FP8/INT8 accuracy)
+def set_native_atomic_bfp16(enabled: bool = True):
+    from .triton_kernels import utils as _utils
+    _utils.GEMLITE_USE_NATIVE_ATOMIC_BFP16 = enabled
+
 #Enable/disable hardware PTX FP4 packing in activation quantization (requires CUDA 13.0+ ptxas)
 def set_ptx_fp4_pack(enabled: bool = True):
     global GEMLITE_ENABLE_PTX_FP4_PACK
@@ -343,7 +348,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         # (helpers may override channel_scale_mode/W_group_mode after pack())
         if hasattr(self, 'metadata') and self.metadata is not None and hasattr(self, 'W_nbits'):
             self.metadata = torch.nn.Parameter(
-                torch.tensor(self.get_meta_args(), device=self.metadata.device, dtype=torch.int32),
+                torch.tensor(self.get_meta_args(), device=self.W_q.device if isinstance(self.W_q, (torch.Tensor, torch.nn.Parameter)) else 'cpu', dtype=torch.int32),
                 requires_grad=False,
             )
         super()._save_to_state_dict(destination, prefix, keep_vars)
@@ -358,7 +363,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         _meta_scale     = state_dict.pop("meta_scale", None)
 
         self.metadata   = [v.item() for v in self.metadata]
-        self.orig_shape = (v.item() for v in self.orig_shape)
+        self.orig_shape = tuple(v.item() for v in self.orig_shape)
 
         (self.scaled_activations,
         self.W_nbits,
@@ -395,10 +400,33 @@ class GemLiteLinearTriton(torch.nn.Module):
         if is_mx_dtype(self.input_dtype) and self.scales is not None:
             s = self.scales.data if isinstance(self.scales, torch.nn.Parameter) else self.scales
             if s.ndim == 2:
-                s_2d = s.T.contiguous()  # [K_S, N] contiguous
-                N_dim, K_S = s_2d.shape[1], s_2d.shape[0]
+                s_2d = s.contiguous()  # [N, K_S] contiguous (matches pack's self.scales.T.contiguous())
+                N_dim, K_S = s_2d.shape[0], s_2d.shape[1]
                 if GEMLITE_USE_TMA and self.elements_per_sample > 1 and N_dim % 128 == 0 and K_S % 4 == 0:
                     self.scales = s_2d.reshape(N_dim // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N_dim // 128, K_S // 4, 2, 256).contiguous()
+
+        # Re-register tensors as nn.Parameter for proper state_dict / .to() / .parameters() support
+        _device = self.W_q.device
+        self.W_q = torch.nn.Parameter(self.W_q, requires_grad=False)
+        self.bias = torch.nn.Parameter(self.bias, requires_grad=False) if self.bias is not None else None
+        self.scales = torch.nn.Parameter(self.scales, requires_grad=False)
+        self.zeros = torch.nn.Parameter(self.zeros, requires_grad=False)
+        self.metadata = torch.nn.Parameter(
+            torch.tensor(self.get_meta_args(), device=_device, dtype=torch.int32),
+            requires_grad=False,
+        )
+        self.orig_shape = torch.nn.Parameter(
+            torch.tensor([self.out_features, self.in_features], device=_device, dtype=torch.int32),
+            requires_grad=False,
+        )
+        if not isinstance(self.meta_scale, torch.nn.Parameter):
+            _ms = self.meta_scale.item() if isinstance(self.meta_scale, torch.Tensor) else float(self.meta_scale)
+            self.meta_scale = torch.nn.Parameter(
+                torch.tensor(_ms, device=_device, dtype=torch.float32),
+                requires_grad=False,
+            )
+
+
 
     #Make sure to feed UINT8 W_q for packing
     def pack(
