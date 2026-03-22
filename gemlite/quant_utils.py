@@ -182,8 +182,8 @@ class WeightQuantizerMXFP:
         W_flat = W.view(-1, group_size).float()
         ideal_scale = W_flat.abs().amax(dim=1, keepdim=True)
         ideal_scale /= max_val
-        meta_scales = ideal_scale.max().clamp_(min=eps).float()
-        ideal_scale /= meta_scales
+        meta_scales = (max_fp8 / ideal_scale.max().clamp_(min=eps)).float()
+        ideal_scale *= meta_scales
         ideal_scale = ideal_scale.clamp_(max=max_fp8).to(fp8_dtype)
 
         if(window_size == 0):
@@ -205,12 +205,12 @@ class WeightQuantizerMXFP:
             candidate_scales = candidate_scales.view(fp8_dtype).float()
             candidate_scales[candidate_scales < eps] = eps
 
-            W_q_candidates = self.round_to_closest_fp4(W_flat.unsqueeze(1) / (candidate_scales * meta_scales).unsqueeze(-1))
-            W_r_candidates = W_q_candidates * candidate_scales.unsqueeze(-1)
+            W_q_candidates = self.round_to_closest_fp4(W_flat.unsqueeze(1) * (meta_scales / candidate_scales).unsqueeze(-1))
+            W_r_candidates = W_q_candidates * (candidate_scales / meta_scales).unsqueeze(-1)
             errors = (W_flat.unsqueeze(1) - W_r_candidates).abs().mean(dim=-1)
             scales = torch.gather(candidate_scales, 1, torch.argmin(errors, dim=1, keepdim=True)).to(fp8_dtype)
 
-        scales_full = (scales.to(W_flat.dtype) * meta_scales).clamp_(min=eps)
+        scales_full = (scales.to(W_flat.dtype) / meta_scales).clamp_(min=eps)
         W_q = self.round_to_closest_fp4(W_flat / scales_full)
 
         if(index):
@@ -1187,11 +1187,11 @@ def scale_activations_nvfp4_torch(tensor: Tensor, meta_scale=None) -> Tuple[Tens
     W_flat = tensor.view(-1, group_size).float()
     scales = W_flat.abs().amax(dim=1, keepdim=True)
     scales /= max_val
-    meta_scales = meta_scale if meta_scale is not None else scales.max().clamp_(min=eps)
-    scales /= meta_scales
+    meta_scales = meta_scale if meta_scale is not None else (max_fp8 / scales.max().clamp_(min=eps)).float()
+    scales *= meta_scales
     scales = scales.clamp(max=max_fp8).to(fp8_dtype).to(W_flat.dtype)
 
-    W_q = W_flat / (scales * meta_scales)
+    W_q = W_flat / (scales / meta_scales)
     if(pad_rows > 0):
         W_q = W_q.view(post_pad_shape)[:inter_shape[0], :]
 
@@ -1410,11 +1410,11 @@ def scale_activations_nvfp4_triton_kernel(
         
     #FP8 scales
     meta_scales = tl.load(meta_scales_ptr, eviction_policy='evict_last')
-    scales = tl.max(tl.abs(tensor), axis=1, keep_dims=True) / (6. * meta_scales)
+    scales = tl.max(tl.abs(tensor), axis=1, keep_dims=True) * meta_scales / 6.
     scales = tl.minimum(scales, max_fp8).to(fp8_dtype)
 
     #Map to index
-    scales_full = tl.maximum(scales.to(tl.float32) * meta_scales, eps)
+    scales_full = tl.maximum(scales.to(tl.float32) / meta_scales, eps)
     wq = tensor / scales_full
     idx_abs = tl.sum(tl.abs(wq[:, :, None]) > thr_pos[None, :, :], axis=2)
     out = tl.where(wq >= 0, idx_abs, idx_abs + 8).to(out_dtype)
@@ -1439,7 +1439,7 @@ def scale_activations_nvfp4_triton(tensor: torch.Tensor, meta_scale=None) -> Tup
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn #Nvidia only
-    meta_scale = meta_scale if meta_scale is not None else (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
+    meta_scale = meta_scale if meta_scale is not None else (448.0 / (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().clamp_(min=1e-6)).float()
 
     tensor = tensor.contiguous()
     tensor = tensor.view(-1, tensor.shape[-1])
@@ -1650,9 +1650,9 @@ def scale_activations_nvfp4_triton_kernel_v2(
 
             # Per-group FP8 scale
             abs_max = tl.max(tl.abs(tensor_flat), axis=1, keep_dims=True)
-            scales_raw = abs_max / (6. * meta_scales)
+            scales_raw = abs_max * meta_scales / 6.
             scales_fp8 = tl.minimum(scales_raw, max_fp8).to(fp8_dtype)
-            scales_full = tl.maximum(scales_fp8.to(tl.float32) * meta_scales, eps)
+            scales_full = tl.maximum(scales_fp8.to(tl.float32) / meta_scales, eps)
 
             # Map to FP4 index via threshold comparison
             wq = tensor_flat / scales_full
@@ -1684,7 +1684,7 @@ def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor, meta_scale=None) -> 
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn
-    meta_scale = meta_scale if meta_scale is not None else (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
+    meta_scale = meta_scale if meta_scale is not None else (448.0 / (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().clamp_(min=1e-6)).float()
 
     tensor = tensor.contiguous()
     tensor = tensor.view(-1, tensor.shape[-1])
@@ -1894,11 +1894,11 @@ def scale_activations_nvfp4_triton_kernel_v3(
 
     #FP8 scales
     meta_scales = tl.load(meta_scales_ptr, eviction_policy='evict_last')
-    scales = tl.max(tl.abs(tensor), axis=1, keep_dims=True) / (6. * meta_scales)
+    scales = tl.max(tl.abs(tensor), axis=1, keep_dims=True) * meta_scales / 6.
     scales = tl.minimum(scales, max_fp8).to(fp8_dtype)
 
     #Map to index via scalar threshold comparisons (avoids 3D intermediate)
-    scales_full = tl.maximum(scales.to(tl.float32) * meta_scales, eps)
+    scales_full = tl.maximum(scales.to(tl.float32) / meta_scales, eps)
     wq = tensor / scales_full
     abs_wq = tl.abs(wq)
     idx_abs = ((abs_wq > thr0).to(tl.int32) + (abs_wq > thr1).to(tl.int32) +
@@ -1924,7 +1924,7 @@ def scale_activations_nvfp4_triton_v3(tensor: torch.Tensor, meta_scale=None) -> 
     group_size: int = 16
     eps: float = 1e-6
     fp8_dtype = torch.float8_e4m3fn
-    meta_scale = meta_scale if meta_scale is not None else (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().float().clamp_(min=eps)
+    meta_scale = meta_scale if meta_scale is not None else (448.0 / (tensor.view(-1, 16).abs().amax(dim=1) / 6.0).max().clamp_(min=1e-6)).float()
 
     tensor = tensor.contiguous()
     tensor = tensor.view(-1, tensor.shape[-1])
@@ -2206,7 +2206,7 @@ def scale_activations_nvfp4_fused_kernel_v6(
     old_count = tl.atomic_add(counter_ptr, 1, sem='relaxed')
     if old_count == num_pids - 1:
         final_amax = tl.load(amax_ptr)
-        tl.store(meta_scales_ptr, tl.maximum(final_amax / 6.0, eps))
+        tl.store(meta_scales_ptr, max_fp8 * 6.0 / tl.maximum(final_amax, eps))
         # Reset scratch for next call
         tl.store(amax_ptr, 0.0)
         # Signal ready by setting counter to -num_pids (distinguishable from 0..num_pids-1)
@@ -2233,9 +2233,9 @@ def scale_activations_nvfp4_fused_kernel_v6(
 
         tensor_flat = tl.reshape(tensor, (FLAT_M, GROUP_SIZE))
         abs_max = tl.max(tl.abs(tensor_flat), axis=1, keep_dims=True)
-        scales_raw = abs_max / (6. * meta_scales)
+        scales_raw = abs_max * meta_scales / 6.
         scales_fp8 = tl.minimum(scales_raw, max_fp8).to(fp8_dtype)
-        scales_full = tl.maximum(scales_fp8.to(tl.float32) * meta_scales, eps)
+        scales_full = tl.maximum(scales_fp8.to(tl.float32) / meta_scales, eps)
 
         wq = tensor_flat / scales_full
 
@@ -2348,9 +2348,9 @@ def scale_activations_nvfp4_triton_kernel_v5(
 
     tensor_flat = tl.reshape(tensor, (FLAT_M, GROUP_SIZE))
     abs_max = tl.max(tl.abs(tensor_flat), axis=1, keep_dims=True)
-    scales_raw = abs_max / (6. * meta_scales)
+    scales_raw = abs_max * meta_scales / 6.
     scales_fp8 = tl.minimum(scales_raw, max_fp8).to(fp8_dtype)
-    scales_full = tl.maximum(scales_fp8.to(tl.float32) * meta_scales, eps)
+    scales_full = tl.maximum(scales_fp8.to(tl.float32) / meta_scales, eps)
 
     wq = tensor_flat / scales_full
 

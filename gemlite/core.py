@@ -119,7 +119,7 @@ def set_ptx_fp4_pack(enabled: bool = True):
 
 #Enable/disable CUDA graph-based autotuning (more accurate but slower)
 #Enable/disable fast NVFP4 mode (pre-allocated static meta_scale, skips dynamic computation)
-def set_fast_nvfp4(enabled: bool = True, default_value: float = 0.05):
+def set_fast_nvfp4(enabled: bool = True, default_value: float = 448.0):
     global GEMLITE_FAST_NVFP4, GEMLITE_NVFP4_META_SCALES
     GEMLITE_FAST_NVFP4 = enabled
     if enabled and len(GEMLITE_NVFP4_META_SCALES) == 0:
@@ -214,7 +214,7 @@ def forward_functional(
             meta_scale = tensor_args[3]
             _static_meta = GEMLITE_NVFP4_META_SCALES[x.device.index] if GEMLITE_FAST_NVFP4 else None
             x, scales_x, meta_scale_a = scale_activations_nvfp4(x, meta_scale=_static_meta)
-            meta_scale = meta_scale * meta_scale_a  # combine weight and activation meta_scales
+            meta_scale = 1.0 / (meta_scale * meta_scale_a)  # flashinfer-compatible: gsf_w * gsf_a -> 1/(gsf_w * gsf_a)
     
     x = x.view(-1, x.shape[-1])
 
