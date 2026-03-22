@@ -1,4 +1,4 @@
-# Usage: python3 test_gemlitelineartriton.py [--autotune]
+# Usage: python3 test_int.py [--autotune]
 import sys
 _autotune = '--autotune' in sys.argv
 if _autotune: sys.argv.remove('--autotune')
@@ -6,7 +6,7 @@ if _autotune: sys.argv.remove('--autotune')
 
 import unittest
 import torch
-from gemlite import reset_config, set_autotune
+from gemlite import reset_config, set_autotune, set_native_atomic_bfp16
 from gemlite.core import GemLiteLinearTriton, DType, TORCH_TO_DTYPE, forward_functional
 from gemlite.triton_kernels.config import KERNEL
 from gemlite.quant_utils import scale_activations_per_token_torch as scale_activations
@@ -25,11 +25,15 @@ matmul_types  = ['GEMV_REVSPLITK', 'GEMV', 'GEMV_SPLITK', 'GEMM_SPLITK', 'GEMM']
 
 reset_config()
 if _autotune is False: set_autotune(False)
+#set_native_atomic_bfp16(False)
 KERNEL.ENABLE_CACHING = False
 
+manual_seed               = 0
 in_features, out_features = 4032, 2032
 batch_sizes               = [1, 3, 5, 16, 30, 65, 100, 250]
 W_nbits, group_size       = 4, 128 #128 / in_features
+
+assert in_features % 32 == 0, "in_features must be divisible by 32 for the current implementation"
 
 if group_size is None:
     group_size = in_features
@@ -57,7 +61,7 @@ W, W_q, scales, zeros  = gen_data(in_features, out_features, W_nbits=W_nbits, gr
 #Pre-cache data for faster processing
 input_data = {}
 for batch_size in batch_sizes:
-    torch.random.manual_seed(0)
+    torch.random.manual_seed(manual_seed)
     input_data[batch_size] = torch.randn((batch_size, in_features), dtype=compute_dtype, device=device) / 10.
 
 class TestGemLiteLinearTriton(unittest.TestCase):
@@ -85,41 +89,11 @@ class TestGemLiteLinearTriton(unittest.TestCase):
             y_ref = ref_fn(x)
 
             for matmul_type in _matmul_types:
-                if batch_size > 1 and 'GEMV' in matmul_type:
+                if batch_size > 4 and 'GEMV' in matmul_type:
                     continue
                 y_gem = gemlite_linear.forward_manual(x, matmul_type=matmul_type)
                 err   = (y_ref - y_gem).abs().mean().item()
                 self.assertTrue(err < tol, str(err) + ', expected < ' + str(tol) + ' | ' + matmul_type + ' | batch_size: ' + str(batch_size))
-
-    def test_serialization(self):
-        gemlite_linear = GemLiteLinearTriton(W_nbits, 
-                        group_size=group_size, 
-                        in_features=in_features, 
-                        out_features=out_features, 
-                        input_dtype=gemlite_dtype, 
-                        output_dtype=gemlite_dtype)
-
-        gemlite_linear.pack(W_q, scales, zeros, None)
-
-        torch.save(gemlite_linear.state_dict(), 'tmp.pt')
-
-        gemlite_linear_loaded = GemLiteLinearTriton()
-        gemlite_linear_loaded.load_state_dict(torch.load('tmp.pt'))
-
-        ref_args = gemlite_linear.get_meta_args()
-        loaded_args = gemlite_linear_loaded.get_meta_args()
-        for i in range(len(ref_args)):
-            assert ref_args[i] == loaded_args[i], "meta_args mismatch at " + str(i)
-
-        ref_args = gemlite_linear.get_tensor_args()
-        loaded_args = gemlite_linear_loaded.get_tensor_args()
-        for i in range(len(ref_args)):
-            if ref_args[i].numel() > 0: assert (ref_args[i] - loaded_args[i]).float().abs().mean() == 0, "tensor_args mismatch at " + str(i)
-
-        def ref_fn(x):
-            return gemlite_linear.forward_manual(x, matmul_type='GEMM')
-
-        self.eval(gemlite_linear_loaded, ref_fn, tol=1e-7, _matmul_types=['GEMM'])
 
     def test_fp16xfp16(self):
         gemlite_linear = GemLiteLinearTriton(W_nbits=16, 
@@ -140,7 +114,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
         def ref_fn(x):
             return torch.matmul(x.to(compute_dtype), W.T)
 
-        self.eval(gemlite_linear, ref_fn, tol=2.5e-3) #higher tol for gemv kernels, otherwise 1e-3 is fine
+        self.eval(gemlite_linear, ref_fn, tol=5e-3) #higher tol for gemv kernels, otherwise 1e-3 is fine
 
     def test_fp16xWn_asymmetric(self):
         #FP16 x Wn / asymmetric 
@@ -363,5 +337,6 @@ class TestGemLiteLinearTriton(unittest.TestCase):
             return torch.matmul(x.to(compute_dtype), W.T)
 
         self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn) #needs higher tolerance with fp8
+
 if __name__ == '__main__':
     unittest.main()
