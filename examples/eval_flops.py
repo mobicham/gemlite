@@ -393,16 +393,16 @@ def main():
         epilog="""
 Examples:
   # Run with default parameters (all processors)
-  python eval_flops.py
+  python3 eval_flops.py
 
   # Run with specific dimensions:
-  python eval_flops.py --M 8192 --K 8192 --N 8192
+  python3 eval_flops.py --M 8192 --K 8192 --N 8192
 
   # Run only specific processors (comma-separated):
-  python eval_flops.py --processor A4W4_MXFP_dynamic,flashinfer_nvfp4_dynamic,native_fp8
+  python3 eval_flops.py --processor A4W4_MXFP_dynamic,flashinfer_nvfp4_dynamic,native_fp8
 
   # Run only BF16 baseline (no quantization):
-  python eval_flops.py --processor none
+  python3 eval_flops.py --processor none
 
   # Available processors:
   #   GemLite:    A16W8_INT8, A16W8_FP8, A16W4_HQQ_INT,
