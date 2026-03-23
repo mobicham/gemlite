@@ -2326,7 +2326,7 @@ def scale_activations_nvfp4_triton_kernel_v5(
     # Requires CUDA 13.0+ ptxas (Triton bundles 12.9 as of v3.3). To enable, set
     # the environment variable TRITON_CUDA_ARCH_LIST to include CUDA 13.0+ ptxas, 
     # and override the bundled ptxas-blackwell.
-    ptx_pack: tl.constexpr = GEMLITE_ENABLE_PTX_FP4_PACK,
+    ptx_pack: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -2458,6 +2458,7 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> 
             num_tiles_k=num_tiles_k,
             BLOCK_SIZE_M=BLOCK_M,
             BLOCK_SIZE_K=BLOCK_K,
+            ptx_pack=GEMLITE_ENABLE_PTX_FP4_PACK,
         )
     else:
         # Static path: meta_scale already provided, use v5 kernel directly
@@ -2471,6 +2472,7 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> 
             eps=eps,
             GROUP_SIZE=group_size,
             meta_scales_ptr=meta_scale,
+            ptx_pack=GEMLITE_ENABLE_PTX_FP4_PACK,
         )
 
     return out, scales, meta_scale

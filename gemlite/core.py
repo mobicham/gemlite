@@ -214,7 +214,7 @@ def forward_functional(
             meta_scale = tensor_args[3]
             _static_meta = GEMLITE_NVFP4_META_SCALES[x.device.index] if GEMLITE_FAST_NVFP4 else None
             x, scales_x, meta_scale_a = scale_activations_nvfp4(x, meta_scale=_static_meta)
-            meta_scale = 1.0 / (meta_scale * meta_scale_a)  # flashinfer-compatible: gsf_w * gsf_a -> 1/(gsf_w * gsf_a)
+            meta_scale = 1.0 / (meta_scale * meta_scale_a)
     
     x = x.view(-1, x.shape[-1])
 
