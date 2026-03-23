@@ -56,6 +56,7 @@ def gen_data(in_features, out_features, W_nbits, group_size, dtype=compute_dtype
 
     return W, W_q, scales, zeros
 
+torch.random.manual_seed(manual_seed)
 W, W_q, scales, zeros  = gen_data(in_features, out_features, W_nbits=W_nbits, group_size=group_size)
 
 #Pre-cache data for faster processing

@@ -5,7 +5,8 @@ if _autotune: sys.argv.remove('--autotune')
 
 import unittest
 import torch
-from gemlite import reset_config, set_autotune, set_native_atomic_bfp16
+import gemlite
+from gemlite import reset_config, set_autotune
 from gemlite.triton_kernels.config import KERNEL
 from gemlite.helper import *
 
@@ -21,13 +22,17 @@ matmul_types  = ['GEMM', 'GEMM_SPLITK'] #TODO: improve GEMV mxfp accuracy.
 
 reset_config()
 if _autotune is False: set_autotune(False)
-#set_native_atomic_bfp16(False)
+#gemlite.set_fast_nvfp4(True)
+#gemlite.set_ptx_fp4_pack(True) # with cuda13 ptxas-blackwell / TRITON_PTXAS_BLACKWELL_PATH
+#gemlite.set_native_atomic_bfp16(False)
 KERNEL.ENABLE_CACHING = False
 
 manual_seed               = 0
 in_features, out_features = 4224, 2048 # test 5D TMA
 #in_features, out_features = 4032, 2048 # test 2D scales fall-back
 batch_sizes               = [1, 3, 16, 30, 32, 60, 100, 128]
+
+torch.random.manual_seed(manual_seed)
 linear_layer              = torch.nn.Linear(in_features=in_features, out_features=out_features, device=device, dtype=compute_dtype, bias=False)
 linear_layer.weight.data /= 10.
 linear_layer.weight.requires_grad = False

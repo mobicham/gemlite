@@ -14,7 +14,8 @@ repeat = 32
 gemlite.reset_config()
 gemlite.enable_cudagraph_autotune(True)
 gemlite.enable_tma(True)
-#gemlite.set_ptx_fp4_pack(True) # Requires ptxas CUDA 13+
+#gemlite.set_fast_nvfp4(True)
+#gemlite.set_ptx_fp4_pack(True) # Requires ptxas CUDA 13+ via ptxas-blackwell / TRITON_PTXAS_BLACKWELL_PATH
 #gemlite.set_autotune("max")
 #gemlite.core.enable_activation_scaling(2)
 
@@ -271,6 +272,7 @@ def run_benchmark(proc_name, M, K, N):
     Unified benchmark runner. Returns (label, M, K, N, tflops) or None on skip.
     Handles gemlite processors, native PyTorch INT8/FP8, and flashinfer NVFP4.
     """
+    torch._dynamo.reset()
     has_flashinfer, fi_err = _get_flashinfer()
 
     # ---- flashinfer NVFP4 dynamic (torch.compile + activation quant) ----
@@ -416,35 +418,69 @@ Examples:
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--M", type=int, default=8192, help="Batch/sequence dimension")
+    parser.add_argument("--M", type=str, default="8192", help="Comma-separated M values (e.g., 1,8,16,64,128,256,512,1024,2048,4096)")
     parser.add_argument("--K", type=int, default=8192, help="Input feature dimension")
     parser.add_argument("--N", type=int, default=8192, help="Output feature dimension")
     parser.add_argument("--processor", type=str, default="all",
                         help='Comma-separated processor names or "all" (default: all)')
     args = parser.parse_args()
 
-    M, K, N = args.M, args.K, args.N
+    M_values = [int(m.strip()) for m in args.M.split(",")]
+    K, N = args.K, args.N
 
     if args.processor == "all":
         processor_names = list(ALL_PROCESSORS)
     else:
         processor_names = [p.strip() for p in args.processor.split(",")]
 
-    results = []
-    for proc_name in processor_names:
-        result = run_benchmark(proc_name, M, K, N)
-        if result is not None:
-            results.append(result)
+    # results_map[proc_name][M] = tflops
+    results_map = {}
+    proc_labels = {}
 
-    # ---- Summary ----
-    print("\n" + "=" * 70)
+    for proc_name in processor_names:
+        for M in M_values:
+            result = run_benchmark(proc_name, M, K, N)
+            if result is not None:
+                label, m, k, n, tflops = result
+                proc_labels[proc_name] = label
+                if proc_name not in results_map:
+                    results_map[proc_name] = {}
+                results_map[proc_name][M] = tflops
+
+    # ---- Summary Table ----
+    active_procs = [p for p in processor_names if p in results_map]
+    if not active_procs:
+        print("No results to display.")
+        return
+
     gpu_name = torch.cuda.get_device_name(device)
-    print(f"SUMMARY  (GPU: {gpu_name})")
-    print("=" * 70)
-    max_label_len = max(len(r[0]) for r in results) if results else 0
-    for label, m, k, n, tflops in results:
-        print(f"  {label:<{max_label_len}} | {m}, {k}, {n} | {tflops:.2f} TFLOP/s")
-    print("=" * 70)
+    print(f"\n{'=' * 120}")
+    print(f"SUMMARY  (GPU: {gpu_name},  K={K}, N={N})  [TFLOP/s]")
+    print(f"{'=' * 120}")
+
+    # Column widths
+    col_w = max(12, max(len(proc_labels.get(p, p)) for p in active_procs) + 2)
+    m_col_w = 8
+
+    # Header
+    header = f"{'M':>{m_col_w}}"
+    for p in active_procs:
+        header += f"  {proc_labels.get(p, p):>{col_w}}"
+    print(header)
+    print("-" * len(header))
+
+    # Rows
+    for M in M_values:
+        row = f"{M:>{m_col_w}}"
+        for p in active_procs:
+            val = results_map.get(p, {}).get(M)
+            if val is not None:
+                row += f"  {val:>{col_w}.2f}"
+            else:
+                row += f"  {'--':>{col_w}}"
+        print(row)
+
+    print(f"{'=' * len(header)}")
 
 
 if __name__ == "__main__":
