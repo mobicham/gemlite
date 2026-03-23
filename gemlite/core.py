@@ -117,6 +117,20 @@ def set_ptx_fp4_pack(enabled: bool = True):
     from .quant_utils import set_ptx_fp4_pack_flag
     set_ptx_fp4_pack_flag(enabled)
 
+
+# Auto-detect ptxas-blackwell version for hardware FP4 packing support
+def auto_detect_ptx_fp4_pack():
+    try:
+        from triton.knobs import nvidia
+        major, minor = (int(x) for x in nvidia.ptxas_blackwell.version.split('.'))
+        if (major, minor) >= (13, 0):
+            set_ptx_fp4_pack(True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 #Enable/disable CUDA graph-based autotuning (more accurate but slower)
 #Enable/disable fast NVFP4 mode (pre-allocated static meta_scale, skips dynamic computation)
 def set_fast_nvfp4(enabled: bool = True, default_value: float = 448.0):
