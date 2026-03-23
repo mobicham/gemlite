@@ -18,6 +18,7 @@ from .core import (
     enable_cudagraph_autotune,
     set_fast_nvfp4,
     forward_functional,
+    auto_detect_ptx_fp4_pack,
 )
 
 from . import helper
@@ -25,3 +26,6 @@ from . import helper
 load_config  = GemLiteLinear.load_config
 cache_config = GemLiteLinear.cache_config
 reset_config = GemLiteLinear.reset_config
+
+# Auto-detect hardware FP4 packing support
+auto_detect_ptx_fp4_pack()
