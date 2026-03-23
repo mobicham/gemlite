@@ -13,7 +13,7 @@ repeat = 32
 
 gemlite.reset_config()
 gemlite.enable_cudagraph_autotune(True)
-gemlite.enable_tma(True)
+#gemlite.enable_tma(True)
 #gemlite.set_fast_nvfp4(True)
 #gemlite.set_ptx_fp4_pack(True) # Requires ptxas CUDA 13+ via ptxas-blackwell / TRITON_PTXAS_BLACKWELL_PATH
 #gemlite.set_autotune("max")
