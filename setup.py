@@ -11,7 +11,7 @@ setup(
         "gemlite": ["gemlite/*.py", "configs/*.json"],
     },
     include_package_data=True,
-    install_requires=["numpy", "tqdm"],
+    install_requires=["numpy", "tqdm", "triton>=3.6.0"],
 )
 
 # python3 setup.py install
