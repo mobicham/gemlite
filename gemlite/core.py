@@ -230,6 +230,10 @@ def forward_functional(
             x, scales_x, meta_scale_a = scale_activations_nvfp4(x, meta_scale=_static_meta)
             meta_scale = 1.0 / (meta_scale * meta_scale_a)
     
+    # For weight-only NVFP4 (group_size=16): pass stored meta_scale to the kernel
+    if not scaled_activations and meta_args[2] == 16:
+        meta_scale = tensor_args[3]
+
     x = x.view(-1, x.shape[-1])
 
     if(matmul_type >= 0):

@@ -418,6 +418,90 @@ class A16W4_MXFP(A16Wn_MXFP):
     def __init__(self, device='cuda:0', dtype=None):
         super().__init__(device=device, dtype=dtype, W_nbits=4)
 
+
+class A16W4_NVFP:
+    """Weight-only NVFP4 quantization (FP16/BF16 activations, 4-bit NVFP weights).
+    Uses group_size=16, FP8 e4m3fn scales, and a global meta_scale."""
+    def __init__(self, device='cuda:0', dtype=None):
+        self.device = device
+        self.dtype = dtype
+        self.quantizer_mx = None
+        self.W_nbits = 4
+        self.group_size = 16
+        self.input_dtype = DType.NVFP4
+
+    def from_packed_weights(self, weight_packed, bias=None, scales=None, meta_scale=None):
+        """Load pre-packed NVFP4 weights (nibble-packed [N, K//2] uint8).
+        Scales: fp8_e4m3fn or uint8 (same bit pattern) [N, K//16].
+        meta_scale: global scale factor (fp32)."""
+        return self.from_weights(weight_packed, bias=bias, scales=scales, meta_scale=meta_scale, packed=True)
+
+    def from_weights(self, weight, bias=None, scales=None, meta_scale=None, packed=False):
+        if(isinstance(weight, torch.nn.Parameter)):
+            weight = weight.data
+        if(isinstance(bias, torch.nn.Parameter)):
+            bias = bias.data
+
+        in_features, out_features = weight.shape[::-1]
+        if packed:
+            in_features *= 2
+
+        assert scales is not None, "Scales parameter cannot be None. Use from_linear() call to pre-quantize the weights."
+        assert weight.dtype in [torch.uint8], f"Invalid weight.dtype, should be uint8, got {weight.dtype}."
+        assert scales.dtype in [torch.float8_e4m3fn, torch.uint8], f"Invalid scales.dtype, should be float8_e4m3fn, got {scales.dtype}."
+        assert self.group_size == 16, f"Only group_size=16 is supported for NVFP4, got {self.group_size}"
+        assert self.dtype is not None, f"Input dtype should be either torch.float16 or torch.bfloat16, not None."
+
+        dtype = self.dtype
+        gemlite_dtype = TORCH_TO_DTYPE[dtype]
+
+        W_q = weight.to(device=self.device)
+        scales = scales.to(device=self.device)
+        if scales.dtype == torch.uint8:
+            scales = scales.view(torch.float8_e4m3fn)
+        bias = bias.to(device=self.device, dtype=dtype) if (bias is not None) else None
+
+        gemlite_linear = GemLiteLinearTriton(self.W_nbits,
+                        group_size=self.group_size,
+                        in_features=in_features,
+                        out_features=out_features,
+                        input_dtype=self.input_dtype,
+                        output_dtype=gemlite_dtype,
+                        scaled_activations=False,
+                        )
+
+        gemlite_linear.pack(W_q, scales, zeros=None, bias=bias, packed=packed)
+
+        # meta_scale for NVFP4: kernel multiplies acc by meta_scale_norm.
+        # Dequant: W ~ W_q * scale / meta_scales, dot_scaled gives W_q * scale,
+        # so we need to multiply by 1/meta_scales.
+        if meta_scale is not None:
+            gemlite_linear.meta_scale = torch.nn.Parameter(
+                (1.0 / meta_scale).to(dtype=torch.float32, device=gemlite_linear.W_q.device).reshape(()),
+                requires_grad=False,
+            )
+        return gemlite_linear
+
+    def from_linear(self, linear_layer, del_orig=True):
+        if self.dtype is None:
+            self.dtype = linear_layer.weight.dtype
+        if(self.quantizer_mx is None):
+            self.quantizer_mx = WeightQuantizerMXFP(device=self.device, compute_dtype=linear_layer.weight.dtype)
+
+        W = linear_layer.weight.data
+        bias = linear_layer.bias.clone() if (linear_layer.bias is not None) else None
+        N, K = W.shape
+        W_q, scales, _meta_scale = self.quantizer_mx.quantize_nvfp4(W, index=True)
+        W_q, scales = W_q.view([N, K]), scales.view(N, K // self.group_size)
+
+        cleanup_linear(linear_layer, del_orig)
+
+        out_layer = self.from_weights(weight=W_q, scales=scales, bias=bias, meta_scale=_meta_scale)
+
+        del W_q
+        torch.cuda.empty_cache()
+        return out_layer
+
 #################################################################################################
 #8-bit dynamic activations / 8-bit weights
 #################################################################################################
