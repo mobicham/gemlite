@@ -732,6 +732,8 @@ class A8W8_MXFP_dynamic:
 
 
     def from_linear(self, linear_layer, del_orig=True):
+        if self.dtype is None:
+            self.dtype = linear_layer.weight.dtype
         if(self.quantizer_mx is None):
             self.quantizer_mx = WeightQuantizerMXFP(device=self.device, compute_dtype=linear_layer.weight.dtype)
 
@@ -814,6 +816,8 @@ class A8Wn_MXFP_dynamic:
 
 
     def from_linear(self, linear_layer, del_orig=True):
+        if self.dtype is None:
+            self.dtype = linear_layer.weight.dtype
         if(self.quantizer_mx is None):
             self.quantizer_mx = WeightQuantizerMXFP(device=self.device, compute_dtype=linear_layer.weight.dtype)
 
@@ -898,6 +902,8 @@ class A4W4_MXFP_dynamic:
 
 
     def from_linear(self, linear_layer, del_orig=True):
+        if self.dtype is None:
+            self.dtype = linear_layer.weight.dtype
         if(self.quantizer_mx is None):
             self.quantizer_mx = WeightQuantizerMXFP(device=self.device, compute_dtype=linear_layer.weight.dtype)
 
@@ -979,6 +985,8 @@ class A4W4_NVFP_dynamic:
 
 
     def from_linear(self, linear_layer, del_orig=True):
+        if self.dtype is None:
+            self.dtype = linear_layer.weight.dtype
         if(self.quantizer_mx is None):
             self.quantizer_mx = WeightQuantizerMXFP(device=self.device, compute_dtype=linear_layer.weight.dtype)
 
