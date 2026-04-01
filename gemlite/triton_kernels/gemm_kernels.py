@@ -269,7 +269,7 @@ else:
     "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
     "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
 })
-@triton.jit(do_not_specialize=["M", "M_CLOSEST"])
+@triton.jit
 def gemm_INT_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
@@ -475,7 +475,7 @@ def gemm_INT_kernel(
     "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
     "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
 })
-@triton.jit(do_not_specialize=["M", "M_CLOSEST"])
+@triton.jit
 def gemm_MX_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
