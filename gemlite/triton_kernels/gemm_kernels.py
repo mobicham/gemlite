@@ -8,6 +8,7 @@ import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE
 from .utils import *
+from .utils import load_ptr
 
 KEYS        = ['M_CLOSEST', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'a_sizeof', 'b_sizeof'] 
 MATMUL_TYPE = "GEMM"
@@ -186,7 +187,7 @@ def get_fast_autotune_config_nvidia():
 
 def get_default_config_nvidia():
     return [triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4),
+            triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2),
             ]
 
 ########################################################################################################################################################################
@@ -255,6 +256,7 @@ elif(AUTOTUNE_SETTING == 'fast'):
     get_autotune_config = get_fast_autotune_config
 else:
     get_autotune_config = get_default_config
+
 
 @triton.autotune(
     configs = get_autotune_config(),
@@ -382,21 +384,12 @@ def gemm_INT_kernel(
     for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
 
         if(A_load_order == 0): #Early load
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict) 
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
-        if EVEN_K and EVEN_N:
-            b = tl.load(b_ptrs, eviction_policy=b_evict)
-        else:
-            b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+        b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
         if(A_load_order == 1): #Early load
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict) 
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
         
         #Meta-data loading policy
         if(W_group_mode > 0):
@@ -416,19 +409,13 @@ def gemm_INT_kernel(
             zeros = None
         
         if(A_load_order == 2): #Mid load
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict) 
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
         # Unpack and dequantize
         b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
         if(A_load_order == 3): #Late load 
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict) 
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
         
         #Dot
         acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype) 
@@ -441,35 +428,29 @@ def gemm_INT_kernel(
         offs_bk += BLOCK_SIZE_K
 
         if not EVEN_K:
-            a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
-            b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
+            if EVEN_M:
+                a_mask = tl.broadcast_to((offs_ak[None, :] < K), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+            else:
+                a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
+            if EVEN_N:
+                b_mask = tl.broadcast_to((offs_bk[:, None] < K), [BLOCK_SIZE_K, BLOCK_SIZE_N])
+            else:
+                b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
 
     #############################################################################################################
     #Channel-wise scaling
-    if(channel_scale_mode == 1): #weight-only
-        if EVEN_N:
-            scales_b = tl.load(scales_ptr + offs_bn, eviction_policy=meta_evict_policy)
-        else:
-            scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
-        acc      = acc.to(meta_dtype) * scales_b[None, :]
+    if channel_scale_mode == 1 or channel_scale_mode == 3:
+        scales_b = load_ptr(scales_ptr + offs_bn, offs_bn < N, meta_evict_policy, not EVEN_N, other=1)
 
-    if(channel_scale_mode == 2): #activation-only
-        if EVEN_M:
-            scales_a = tl.load(scales_a_ptr + offs_am, eviction_policy=meta_evict_policy)
-        else:
-            scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
+    if channel_scale_mode == 2 or channel_scale_mode == 3:
+        scales_a = load_ptr(scales_a_ptr + offs_am, offs_am < M, meta_evict_policy, not EVEN_M, other=1)
+
+    if channel_scale_mode == 1:
+        acc = acc.to(meta_dtype) * scales_b[None, :]
+    elif channel_scale_mode == 2:
         acc = acc.to(meta_dtype) * scales_a[:, None]
-
-    if(channel_scale_mode == 3): #weight + activation
-        if EVEN_M:
-            scales_a = tl.load(scales_a_ptr + offs_am, eviction_policy=meta_evict_policy)
-        else:
-            scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        if EVEN_N:
-            scales_b = tl.load(scales_ptr   + offs_bn, eviction_policy=meta_evict_policy)
-        else:
-            scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+    elif channel_scale_mode == 3:
+        acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
     #############################################################################################################
     
     #Output
@@ -658,15 +639,9 @@ def gemm_MX_kernel(
             a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
             b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_B]).T
         else:
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict) 
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
-            if EVEN_K and EVEN_N:
-                b = tl.load(b_ptrs, eviction_policy=b_evict)
-            else:
-                b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+            b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
         ####################################################################################
         k_m = k * BLOCK_SIZE_K_S
         if use_5d_scales:
@@ -674,18 +649,12 @@ def gemm_MX_kernel(
             scale_b_raw = tl.load_tensor_descriptor(scales_b_5d_desc, [0, pid_n * rep_n, k * rep_k, 0, 0])
             scales_b = scale_b_raw.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
         else:
-            if EVEN_K:
-                scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
-            else:
-                _scale_k_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
-                scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, mask=_scale_k_mask, other=0.0, eviction_policy=meta_evict_policy)
+            scale_b_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
+            scales_b = load_ptr(scales_b_ptrs + k_m * stride_meta_g, scale_b_mask, meta_evict_policy, not EVEN_K)
         
         if(channel_scale_mode == 4):
-            if EVEN_K:
-                scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
-            else:
-                _scale_a_k_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
-                scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, mask=_scale_a_k_mask, other=0.0, eviction_policy=meta_evict_policy)
+            scale_a_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
+            scales_a = load_ptr(scales_a_ptrs + k_m * stride_meta_a_g, scale_a_mask, meta_evict_policy, not EVEN_K)
         else:
             scales_a = scales_a_1s
 
@@ -700,8 +669,14 @@ def gemm_MX_kernel(
             offs_bk += BLOCK_SIZE_K
 
             if not EVEN_K:
-                a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
-                b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
+                if EVEN_M:
+                    a_mask = tl.broadcast_to((offs_ak[None, :] < K), [BLOCK_SIZE_M, BLOCK_SIZE_K_A])
+                else:
+                    a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
+                if EVEN_N:
+                    b_mask = tl.broadcast_to((offs_bk[:, None] < K), [BLOCK_SIZE_K_B, BLOCK_SIZE_N])
+                else:
+                    b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
 
     #NVFP4 meta-scale
     if(group_size == 16):
@@ -710,10 +685,7 @@ def gemm_MX_kernel(
     #############################################################################################################
     #Channel-wise scaling    
     if channel_scale_mode == 2:  # activation-only
-        if EVEN_M:
-            scales_a = tl.load(scales_a_ptr + offs_am, eviction_policy=meta_evict_policy)
-        else:
-            scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1.0, eviction_policy=meta_evict_policy)
+        scales_a = load_ptr(scales_a_ptr + offs_am, offs_am < M, meta_evict_policy, not EVEN_M, other=1.0)
         acc = acc * scales_a[:, None]
         
     #############################################################################################################
@@ -726,11 +698,10 @@ def gemm_MX_kernel(
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
         c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-        mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N))
         if EVEN_M and EVEN_N:
             tl.store(c_ptrs, acc)
         else:
-            tl.store(c_ptrs, acc, mask=mask)
+            tl.store(c_ptrs, acc, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
     
 
 PRINTED = False

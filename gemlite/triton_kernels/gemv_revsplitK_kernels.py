@@ -8,6 +8,7 @@ import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE, KERNEL
 from .utils import *
+from .utils import load_ptr
 
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
 MATMUL_TYPE   = "GEMV_REVSPLITK"
@@ -313,8 +314,8 @@ def gemv_INT_revsplitK_kernel(
     a_ptrs  = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak  
     b_ptrs  = b_ptr + ((offs_k[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn) 
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
-    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
+    a_mask  = (offs_am[:, None] < M) & (offs_ak[None, :] < K)
+    b_mask  = (offs_bk[:, None] < K) & (offs_bn[None, :] < N)
 
     #Stage 0: Load scales/zeros
     #-----------------------------------------------------------------------------------------------------------
@@ -340,21 +341,12 @@ def gemv_INT_revsplitK_kernel(
     #-----------------------------------------------------------------------------------------------------------
     #Load
     if(A_load_order == 0):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not EVEN_K).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     
-    if EVEN_K and EVEN_N:
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
-    else:
-        b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+    b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
     if(A_load_order == 1):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not EVEN_K).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
 
     # Unpack and dequantize    
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
@@ -372,27 +364,18 @@ def gemv_INT_revsplitK_kernel(
     a_ptrs += BLOCK_SIZE_K * stride_ak
     b_ptrs += (BLOCK_SIZE_K // elements_per_sample) * stride_bk
     if not EVEN_K:
-        a_mask  = ((offs_am[:, None] < M) & ((offs_ak[None, :] + BLOCK_SIZE_K) < K))
-        b_mask  = (((offs_bk[:, None] + BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N))
+        a_mask  = (offs_am[:, None] < M) & ((offs_ak[None, :] + BLOCK_SIZE_K) < K)
+        b_mask  = ((offs_bk[:, None] + BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N)
 
     #Stage 2
     #-----------------------------------------------------------------------------------------------------------
     if(A_load_order == 0):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not EVEN_K).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     
-    if EVEN_K and EVEN_N:
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
-    else:
-        b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+    b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
     if(A_load_order == 1):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not EVEN_K).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
 
     # Unpack and dequantize    
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)

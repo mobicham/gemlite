@@ -8,6 +8,7 @@ import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE
 from .utils import *
+from .utils import load_ptr
 
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
 MATMUL_TYPE   = "GEMV_SPLITK"
@@ -338,8 +339,8 @@ def gemv_INT_splitK_kernel(
     #Inputs
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)  
     b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn)
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
-    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
+    a_mask  = (offs_am[:, None] < M) & (offs_ak[None, :] < K)
+    b_mask  = (offs_bk[:, None] < K) & (offs_bn[None, :] < N)
         
     #Meta data stuff
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
@@ -364,21 +365,12 @@ def gemv_INT_splitK_kernel(
     for k in range(num_pid_k):
 
         if(A_load_order == 0): #Early load
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict)
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K)) 
 
-        if EVEN_K and EVEN_N:
-            b = tl.load(b_ptrs, eviction_policy=b_evict)
-        else:
-            b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+        b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
         if(A_load_order == 1): #Early load
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict)
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K)) 
 
         if(W_group_mode > 0):
             k_m = ((k * SPLIT_K + pid_k) * stride_mul).to(tl.int32) 
@@ -397,19 +389,13 @@ def gemv_INT_splitK_kernel(
             zeros = None
         
         if(A_load_order == 2): #Mid load
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict)
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
         # Unpack and dequantize
         b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
         if(A_load_order == 3): #Late load 
-            if EVEN_M and EVEN_K:
-                a = tl.load(a_ptrs, eviction_policy=a_evict)
-            else:
-                a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
         if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
 
@@ -424,8 +410,8 @@ def gemv_INT_splitK_kernel(
         
         #Update mask
         if not EVEN_K:
-            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_U) < K))
-            b_mask = ((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_U < K) & (offs_bn[None, :] < N))
+            a_mask = (offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_U) < K)
+            b_mask = (offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_U < K) & (offs_bn[None, :] < N)
 
     if(dot_prod_mode == 0):
         acc = tl.sum(acc, axis=0, keep_dims=True) 
@@ -445,7 +431,7 @@ def gemv_INT_splitK_kernel(
 
     if(channel_scale_mode == 3): #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
+        scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
 
     ##################################################################

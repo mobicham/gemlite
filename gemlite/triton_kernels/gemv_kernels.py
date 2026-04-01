@@ -8,6 +8,7 @@ import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE, KERNEL
 from .utils import *
+from .utils import load_ptr
 
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
 MATMUL_TYPE   = "GEMV"
@@ -330,21 +331,12 @@ def gemv_INT_kernel(
     ###################################################################
     #Load
     if(A_load_order == 0):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_K))
 
-    if EVEN_K and EVEN_N:
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
-    else:
-        b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+    b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
     if(A_load_order == 1):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_K))
     
     if(W_group_mode > 0):
         k_m = (pid_k * (BLOCK_SIZE_K / group_size)).to(tl.int32)
@@ -363,10 +355,7 @@ def gemv_INT_kernel(
         zeros = None
     
     if(A_load_order == 2):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_K))
 
     #tl.join() version
     if(join_version):
@@ -383,10 +372,7 @@ def gemv_INT_kernel(
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
     if(A_load_order == 3):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_K))
 
     if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
         
@@ -532,21 +518,12 @@ def gemv_MX_kernel(
     ###################################################################
     #Load
     if(A_load_order == 0):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_K))
 
-    if EVEN_K and EVEN_N:
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
-    else:
-        b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
+    b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
     if(A_load_order == 1):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_K))
 
     #Scales: only load_scales_as_block == False is supported here
     k_m = (pid_k * (BLOCK_SIZE_K / group_size)).to(tl.int32)
@@ -572,10 +549,7 @@ def gemv_MX_kernel(
         scales_a = scales_a.to(acc_dtype)
 
     if(A_load_order == 2):
-        if EVEN_K:
-            a = tl.load(a_ptrs, eviction_policy=a_evict)
-        else:
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_K))
 
     #Unpack and dequantize A
     a = a.reshape((BLOCK_SIZE_K, 1), can_reorder=False) #we work with transposed activations
