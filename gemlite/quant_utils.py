@@ -307,6 +307,8 @@ def scale_activations_per_token_triton_v1_kernel(
     min_val: tl.constexpr,
     max_val: tl.constexpr,
     fp32_scale: tl.constexpr, 
+    EVEN_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, 
     BLOCK_SIZE_K: tl.constexpr,
 ):
@@ -317,9 +319,13 @@ def scale_activations_per_token_triton_v1_kernel(
     offs_m  = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
 
     for m in range(UNROLL):
-        mask = ((offs_m < M)[:, None] & (offs_k < K)[None, :]).to(tl.int1)
         in_ptrs = offs_m[:, None] * stride_m + offs_k[None, :] * stride_k
-        tensor = tl.load(tensor_ptr + in_ptrs, mask=mask, other=0.0)
+        if EVEN_M and EVEN_K:
+            tensor = tl.load(tensor_ptr + in_ptrs)
+        else:
+            mask = (offs_m < M)[:, None] & (offs_k < K)[None, :]
+            tensor = tl.load(tensor_ptr + in_ptrs, mask=mask, other=0.0)
+
         if fp32_scale:
             tensor = tensor.to(tl.float32)
 
@@ -333,8 +339,12 @@ def scale_activations_per_token_triton_v1_kernel(
             tensor = round_triton(tensor)
 
         tl.store(scale_ptr + offs_m[:, None] * stride_sm, scales_x)
-        tl.store(y_ptr + in_ptrs, tensor, mask=mask)
+        if EVEN_M and EVEN_K:
+            tl.store(y_ptr + in_ptrs, tensor)
+        else:
+            tl.store(y_ptr + in_ptrs, tensor, mask=mask)
         offs_m += BLOCK_SIZE_M
+
 
 def scale_activations_per_token_triton_v1(
     tensor: Tensor, w_dtype: torch.dtype, fp32_scale: bool = True
@@ -355,6 +365,9 @@ def scale_activations_per_token_triton_v1(
 
     ROUND = not w_dtype.is_floating_point
 
+    EVEN_M = (M % BLOCK_SIZE_M == 0)
+    EVEN_K = (K % BLOCK_SIZE_K == 0)
+
     scale_activations_per_token_triton_v1_kernel[grid](
         tensor,
         scales,
@@ -369,6 +382,8 @@ def scale_activations_per_token_triton_v1(
         fp32_scale=fp32_scale,
         ROUND=ROUND,
         UNROLL=UNROLL,
+        EVEN_M=EVEN_M,
+        EVEN_K=EVEN_K,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         num_stages=1,
@@ -647,6 +662,177 @@ def scale_activations_per_token_triton_v4(
     )
 
     return y.view(x_shape), scales
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_M": 4, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 8, "BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 8, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_M": 16, "BLOCK_SIZE_K": 256}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_SIZE_M": 32, "BLOCK_SIZE_K": 128}, num_warps=8, num_stages=3),
+    ],
+    key=["K", "fp32_scale", "ROUND", "EVEN_M", "EVEN_K"],
+)
+@triton.jit
+def scale_activations_per_token_triton_v5_kernel(
+    x_ptr,
+    s_ptr,
+    y_ptr,
+    M,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_sm,
+    stride_ym,
+    stride_yk,
+    min_val: tl.constexpr,
+    max_val: tl.constexpr,
+    fp32_scale: tl.constexpr,
+    ROUND: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_k_base = tl.arange(0, BLOCK_SIZE_K)
+
+    # -----------------------------
+    # Pass 1: rowwise absmax
+    # -----------------------------
+    row_max = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_SIZE_K):
+        offs_k = k0 + offs_k_base
+        ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+
+        if EVEN_M:
+            if EVEN_K:
+                x = tl.load(ptrs)
+            else:
+                x = tl.load(ptrs, mask=offs_k[None, :] < K, other=0.0)
+        else:
+            if EVEN_K:
+                x = tl.load(ptrs, mask=offs_m[:, None] < M, other=0.0)
+            else:
+                x = tl.load(ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+
+        x_abs = tl.abs(x).to(tl.float32)
+        row_max = tl.maximum(row_max, tl.max(x_abs, axis=1))
+
+    scale = row_max / max_val
+    scale = tl.maximum(scale, 1e-6)
+
+    # Store scales
+    s_ptrs = s_ptr + offs_m * stride_sm
+    if EVEN_M:
+        tl.store(s_ptrs, scale)
+    else:
+        tl.store(s_ptrs, scale, mask=offs_m < M)
+
+    # -----------------------------
+    # Pass 2: quantize + store
+    # -----------------------------
+    for k0 in range(0, K, BLOCK_SIZE_K):
+        offs_k = k0 + offs_k_base
+        x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+
+        if EVEN_M:
+            if EVEN_K:
+                x = tl.load(x_ptrs)
+            else:
+                x = tl.load(x_ptrs, mask=offs_k[None, :] < K, other=0.0)
+        else:
+            if EVEN_K:
+                x = tl.load(x_ptrs, mask=offs_m[:, None] < M, other=0.0)
+            else:
+                x = tl.load(x_ptrs, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
+
+        if fp32_scale:
+            x = x.to(tl.float32)
+
+        q = x / scale[:, None]
+        q = tl.minimum(tl.maximum(q, min_val), max_val)
+
+        if ROUND:
+            q = round_triton(q)
+
+        y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yk
+
+        if EVEN_M:
+            if EVEN_K:
+                tl.store(y_ptrs, q)
+            else:
+                tl.store(y_ptrs, q, mask=offs_k[None, :] < K)
+        else:
+            if EVEN_K:
+                tl.store(y_ptrs, q, mask=offs_m[:, None] < M)
+            else:
+                tl.store(y_ptrs, q, mask=(offs_m[:, None] < M) & (offs_k[None, :] < K))
+
+def _pick_even_flags(M: int, K: int, block_m: int, block_k: int):
+    # Fast path if the full launch is aligned.
+    even_m = (M % block_m) == 0
+    even_k = (K % block_k) == 0
+    return even_m, even_k
+
+def scale_activations_per_token_triton_v5(
+    tensor: torch.Tensor,
+    w_dtype: torch.dtype,
+    fp32_scale: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert tensor.is_cuda, "tensor must be CUDA"
+    assert tensor.ndim >= 2, "expected at least 2D tensor"
+
+    min_val, max_val = get_dtype_range(w_dtype)
+
+    x_shape = tensor.shape
+    x = tensor.reshape(-1, tensor.shape[-1]).contiguous()
+    M, K = x.shape
+
+    # Keep scales in fp32 unless you explicitly want lower precision.
+    scales_dtype = torch.float32 if fp32_scale else tensor.dtype
+    scales = torch.empty((M,), device=x.device, dtype=scales_dtype)
+    y = torch.empty((M, K), device=x.device, dtype=w_dtype)
+
+    ROUND = not w_dtype.is_floating_point
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]),)
+
+    # Heuristic:
+    # - if M/K are clean multiples of the selected autotuned block sizes,
+    #   let the kernel skip masks on the hot path.
+    # - these booleans participate in autotune keying.
+    def launch(meta):
+        block_m = meta["BLOCK_SIZE_M"]
+        block_k = meta["BLOCK_SIZE_K"]
+        even_m, even_k = _pick_even_flags(M, K, block_m, block_k)
+        scale_activations_per_token_triton_v5_kernel[grid](
+            x,
+            scales,
+            y,
+            M,
+            K,
+            x.stride(0),
+            x.stride(1),
+            scales.stride(0),
+            y.stride(0),
+            y.stride(1),
+            min_val=min_val,
+            max_val=max_val,
+            fp32_scale=fp32_scale,
+            ROUND=ROUND,
+            EVEN_M=even_m,
+            EVEN_K=even_k,
+        )
+
+    # Warm trigger through Triton launch path
+    launch({"BLOCK_SIZE_M": 8, "BLOCK_SIZE_K": 128})
+
+    return y.reshape(x_shape), scales.reshape(*x_shape[:-1], 1)
+
 ####################################################################################################################
 #MXFP8
 ####################################################################################################################
@@ -2477,11 +2663,8 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> 
 
     return out, scales, meta_scale
 
-
-
-
 ####################################################################################################################
-scale_activations_per_token = scale_activations_per_token_triton_v3
+scale_activations_per_token = scale_activations_per_token_triton_v1
 scale_activations_mxfp8 = scale_activations_mxfp8_triton_v4
 scale_activations_mxfp4 = scale_activations_mxfp4_triton_v5
 scale_activations_nvfp4 = scale_activations_nvfp4_triton_v5

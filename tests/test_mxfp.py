@@ -22,9 +22,10 @@ matmul_types  = ['GEMM', 'GEMM_SPLITK'] #TODO: improve GEMV mxfp accuracy.
 
 reset_config()
 if _autotune is False: set_autotune(False)
+#gemlite.enable_tma(True)
 #gemlite.set_fast_nvfp4(True)
 #gemlite.set_ptx_fp4_pack(True) # with cuda13 ptxas-blackwell / TRITON_PTXAS_BLACKWELL_PATH
-#gemlite.set_native_atomic_bfp16(False)
+#gemlite.set_native_atomic_bfp16(False)Ft
 KERNEL.ENABLE_CACHING = False
 
 manual_seed               = 0

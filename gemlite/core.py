@@ -120,6 +120,7 @@ def set_ptx_fp4_pack(enabled: bool = True):
 
 # Auto-detect ptxas-blackwell version for hardware FP4 packing support
 def auto_detect_ptx_fp4_pack():
+    #TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.0/bin/ptxas for example.
     try:
         from triton.knobs import nvidia
         major, minor = (int(x) for x in nvidia.ptxas_blackwell.version.split('.'))

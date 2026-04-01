@@ -1,3 +1,4 @@
+# For blackwell, you need to export ptxas: TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.0/bin/ptxas 
 import torch
 import time, gc
 import gemlite
@@ -12,7 +13,7 @@ device, dtype = 'cuda:0', torch.bfloat16
 repeat = 32
 
 gemlite.reset_config()
-gemlite.enable_cudagraph_autotune(True)
+#gemlite.enable_cudagraph_autotune(True)
 #gemlite.enable_tma(True)
 #gemlite.set_fast_nvfp4(True)
 #gemlite.set_ptx_fp4_pack(True) # Requires ptxas CUDA 13+ via ptxas-blackwell / TRITON_PTXAS_BLACKWELL_PATH
@@ -44,8 +45,11 @@ def eval_model(model, M, K, iters=50, verbose=False):
         t.append(_time)
         if verbose:
             print(f"Took: {_time} ms")
+        del x
+        torch.cuda.empty_cache()
     t = t[-(iters // 2):]
     time_torch = (sum(t) / len(t))
+    gc.collect()
     return time_torch
 
 
