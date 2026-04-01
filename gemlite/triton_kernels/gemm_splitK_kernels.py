@@ -40,17 +40,15 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_inc_consumer', None)
             config["NUM_STAGES"] = num_stages
 
-#            config['EVEN_M'] = (m % config['BLOCK_SIZE_M'] == 0)
-            config['EVEN_K'] = (k % (config['BLOCK_SIZE_K'] * config.get('SPLIT_K', 1)) == 0)
-            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
+            config.pop('EVEN_M', None)
+            config.pop('EVEN_K', None)
+            config.pop('EVEN_N', None)
 
             # Adjust 5D TMA compatibility for cached configs
             if load_scales_as_block and n % 128 == 0 and (k // g) % 4 == 0:
                 config['BLOCK_SIZE_N'] = max(config['BLOCK_SIZE_N'], 128)
                 while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
                     config['BLOCK_SIZE_K'] *= 2
-                config['EVEN_K'] = (k % (config['BLOCK_SIZE_K'] * config.get('SPLIT_K', 1)) == 0)
-                config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
 
             yield triton.Config(config,
                 num_stages=num_stages,
@@ -116,8 +114,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         key = (block_size_m, block_size_n, block_size_k, group_size_m, split_k, A_load_order, num_stages, num_warps)
         
-        even_n = (n % block_size_n == 0)
-        even_k = (k % (block_size_k * split_k) == 0)
 
         new_config = {
             "BLOCK_SIZE_M": block_size_m,
@@ -125,8 +121,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             "BLOCK_SIZE_K": block_size_k,
             "GROUP_SIZE_M": group_size_m,
             "SPLIT_K": split_k,
-            "EVEN_N": even_n,
-            "EVEN_K": even_k,
             "A_load_order": A_load_order,
             "NUM_STAGES": num_stages,
         }
@@ -286,8 +280,12 @@ else:
     prune_configs_by = {'early_config_prune': kernel_config_pruner},
     use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
 )
-
-@triton.jit
+@triton.heuristics(values={
+    "EVEN_M": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0,
+    "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
+    "EVEN_K": lambda args: args["K"] % (args["BLOCK_SIZE_K"] * args["SPLIT_K"]) == 0,
+})
+@triton.jit(do_not_specialize=["M", "M_CLOSEST"])
 def gemm_splitK_INT_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
@@ -328,6 +326,7 @@ def gemm_splitK_INT_kernel(
     A_load_order: tl.constexpr, 
     data_contiguous: tl.constexpr,
     #################################
+    EVEN_M: tl.constexpr = False,
     EVEN_K: tl.constexpr = False, 
     EVEN_N: tl.constexpr = False,
     #################################
@@ -353,8 +352,6 @@ def gemm_splitK_INT_kernel(
     BLOCK_SIZE_K == SPLIT_K for imp2 (similar to original)
     """
 
-    # Runtime even_m: safe with torch.compile + CUDA graphs (not tied to M_CLOSEST cache key)
-    even_m = (M % BLOCK_SIZE_M == 0)
 
     pid   = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -409,7 +406,7 @@ def gemm_splitK_INT_kernel(
     for k in range(num_pid_k):
 
         if(A_load_order == 0): #Early load            
-            if even_m and EVEN_K:
+            if EVEN_M and EVEN_K:
                 a = tl.load(a_ptrs, eviction_policy=a_evict)
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
@@ -420,7 +417,7 @@ def gemm_splitK_INT_kernel(
             b = tl.load(b_ptrs, mask=b_mask, other=0., eviction_policy=b_evict)
 
         if(A_load_order == 1): #Early load
-            if even_m and EVEN_K:
+            if EVEN_M and EVEN_K:
                 a = tl.load(a_ptrs, eviction_policy=a_evict)
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
@@ -443,7 +440,7 @@ def gemm_splitK_INT_kernel(
             zeros = None
         
         if(A_load_order == 2): #Mid load
-            if even_m and EVEN_K:
+            if EVEN_M and EVEN_K:
                 a = tl.load(a_ptrs, eviction_policy=a_evict)
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
@@ -452,7 +449,7 @@ def gemm_splitK_INT_kernel(
         b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
         if(A_load_order == 3): #Late load 
-            if even_m and EVEN_K:
+            if EVEN_M and EVEN_K:
                 a = tl.load(a_ptrs, eviction_policy=a_evict)
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
@@ -493,12 +490,12 @@ def gemm_splitK_INT_kernel(
     mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
 
     if(SPLIT_K > 1):
-        if even_m and EVEN_N:
+        if EVEN_M and EVEN_N:
             tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
         else:
             tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
     else:
-        if even_m and EVEN_N:
+        if EVEN_M and EVEN_N:
             tl.store(c_ptrs, acc)
         else:
             tl.store(c_ptrs, acc, mask=mask)
@@ -509,7 +506,12 @@ def gemm_splitK_INT_kernel(
     prune_configs_by = {'early_config_prune': kernel_config_pruner},
     use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
 )
-@triton.jit
+@triton.heuristics(values={
+    "EVEN_M": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0,
+    "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
+    "EVEN_K": lambda args: args["K"] % (args["BLOCK_SIZE_K"] * args["SPLIT_K"]) == 0,
+})
+@triton.jit(do_not_specialize=["M", "M_CLOSEST"])
 def gemm_splitK_MX_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
@@ -552,6 +554,7 @@ def gemm_splitK_MX_kernel(
     A_load_order: tl.constexpr,
     data_contiguous: tl.constexpr,
     #################################
+    EVEN_M: tl.constexpr = False,
     EVEN_K: tl.constexpr = False, 
     EVEN_N: tl.constexpr = False,
     #################################
@@ -564,8 +567,6 @@ def gemm_splitK_MX_kernel(
     use_tma: tl.constexpr = True,
     use_5d_scales: tl.constexpr = False,
 ):
-    # Runtime even_m: safe with torch.compile + CUDA graphs (not tied to M_CLOSEST cache key)
-    even_m = (M % BLOCK_SIZE_M == 0)
 
     pid   = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
@@ -673,7 +674,7 @@ def gemm_splitK_MX_kernel(
             a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, (k * SPLIT_K + pid_k) * BLOCK_SIZE_K_A_E])
             b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, (k * SPLIT_K + pid_k) * BLOCK_SIZE_K_B_E]).T
         else:
-            if even_m and EVEN_K:
+            if EVEN_M and EVEN_K:
                 a = tl.load(a_ptrs, eviction_policy=a_evict)
             else:
                 a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
@@ -733,7 +734,7 @@ def gemm_splitK_MX_kernel(
     mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
 
     if(SPLIT_K > 1):
-        if even_m and EVEN_N:
+        if EVEN_M and EVEN_N:
             tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
         else:
             tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode)
@@ -741,7 +742,7 @@ def gemm_splitK_MX_kernel(
         if use_tma:
             tl.store_tensor_descriptor(c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], value=acc)
         else:
-            if even_m and EVEN_N:
+            if EVEN_M and EVEN_N:
                 tl.store(c_ptrs, acc)
             else:
                 tl.store(c_ptrs, acc, mask=mask)
