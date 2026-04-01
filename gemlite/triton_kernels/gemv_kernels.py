@@ -325,8 +325,8 @@ def gemv_INT_kernel(
         #orig version
         b_ptrs  = b_ptr + (offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn 
 
-    a_mask = (offs_ak[None, :] < K).to(tl.int1)
-    b_mask = (offs_bk[:, None] < K) & (offs_bn[None, :] < N).to(tl.int1)
+    a_mask = (offs_ak[None, :] < K)
+    b_mask = (offs_bk[:, None] < K) & (offs_bn[None, :] < N)
     ###################################################################
     #Load
     if(A_load_order == 0):
@@ -523,8 +523,8 @@ def gemv_MX_kernel(
     
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak #[1, BLOCK_SIZE_K]
     b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn #[BLOCK_SIZE_K, BLOCK_SIZE_N]
-    a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < (K // elements_per_sample_a))).to(tl.int1) 
-    b_mask = ((offs_bk[:, None] < (K // elements_per_sample)) & (offs_bn[None, :] < N)).to(tl.int1)
+    a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < (K // elements_per_sample_a))) 
+    b_mask = ((offs_bk[:, None] < (K // elements_per_sample)) & (offs_bn[None, :] < N))
 
     if(W_nbits == 4): #mxpf4 mapping
         mapping = tl.load(mapping_ptr + tl.arange(0, 16), eviction_policy='evict_last')[None, :].broadcast_to((BLOCK_SIZE_K, 16))

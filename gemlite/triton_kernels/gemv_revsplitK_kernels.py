@@ -313,8 +313,8 @@ def gemv_INT_revsplitK_kernel(
     a_ptrs  = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak  
     b_ptrs  = b_ptr + ((offs_k[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn) 
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
-    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N)).to(tl.int1)
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
+    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
 
     #Stage 0: Load scales/zeros
     #-----------------------------------------------------------------------------------------------------------
@@ -372,8 +372,8 @@ def gemv_INT_revsplitK_kernel(
     a_ptrs += BLOCK_SIZE_K * stride_ak
     b_ptrs += (BLOCK_SIZE_K // elements_per_sample) * stride_bk
     if not EVEN_K:
-        a_mask  = ((offs_am[:, None] < M) & ((offs_ak[None, :] + BLOCK_SIZE_K) < K)).to(tl.int1)
-        b_mask  = (((offs_bk[:, None] + BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N)).to(tl.int1)
+        a_mask  = ((offs_am[:, None] < M) & ((offs_ak[None, :] + BLOCK_SIZE_K) < K))
+        b_mask  = (((offs_bk[:, None] + BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N))
 
     #Stage 2
     #-----------------------------------------------------------------------------------------------------------

@@ -338,8 +338,8 @@ def gemv_INT_splitK_kernel(
     #Inputs
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)  
     b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn)
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
-    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N)).to(tl.int1)
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
+    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
         
     #Meta data stuff
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
@@ -424,8 +424,8 @@ def gemv_INT_splitK_kernel(
         
         #Update mask
         if not EVEN_K:
-            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_U) < K)).to(tl.int1)
-            b_mask = ((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_U < K) & (offs_bn[None, :] < N)).to(tl.int1)
+            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_U) < K))
+            b_mask = ((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_U < K) & (offs_bn[None, :] < N))
 
     if(dot_prod_mode == 0):
         acc = tl.sum(acc, axis=0, keep_dims=True) 
@@ -455,12 +455,18 @@ def gemv_INT_splitK_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    mask    = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
     if(SPLIT_K == 1):
-        tl.store(c_ptrs, acc, mask=mask) 
+        if EVEN_M and EVEN_N:
+            tl.store(c_ptrs, acc)
+        else:
+            mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, acc, mask=mask)
     else:
-        tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
+        if EVEN_M and EVEN_N:
+            tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+        else:
+            mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
 
 
 def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,

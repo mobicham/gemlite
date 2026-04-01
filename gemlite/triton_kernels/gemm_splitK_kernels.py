@@ -198,10 +198,8 @@ def get_fast_autotune_config_nvidia():
     return configs
 
 def get_default_config_nvidia():
-    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2),
+    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'SPLIT_K':1, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2),
             triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'SPLIT_K':2, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=3),
-            triton.Config({'BLOCK_SIZE_M':32, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'SPLIT_K':4, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4),
             ]
 
 ########################################################################################################################################################################
@@ -383,10 +381,10 @@ def gemm_splitK_INT_kernel(
 
     #Inputs
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)  
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
 
     b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn)
-    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N)).to(tl.int1)
+    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
     q_shift = ((offs_bk % elements_per_sample) * W_nbits).to(tl.int32)[:, None] 
         
     #Meta data stuff
@@ -461,9 +459,12 @@ def gemm_splitK_INT_kernel(
         a_ptrs += BLOCK_SIZE_K_U * stride_ak
         b_ptrs += BLOCK_SIZE_K_P * stride_bk
         
+        offs_ak += BLOCK_SIZE_K * SPLIT_K
+        offs_bk += BLOCK_SIZE_K_U
+
         if not EVEN_K:
-            a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K * SPLIT_K) < K)).to(tl.int1)
-            b_mask = (((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_U) < K) & (offs_bn[None, :] < N)).to(tl.int1)
+            a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
+            b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
 
     #############################################################################################################
     #Channel-wise scaling
@@ -487,7 +488,7 @@ def gemm_splitK_INT_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
+    mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
     if(SPLIT_K > 1):
         if EVEN_M and EVEN_N:
@@ -598,7 +599,7 @@ def gemm_splitK_MX_kernel(
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_ak = pid_k * BLOCK_SIZE_K_A_E + tl.arange(0, BLOCK_SIZE_K_A_E)
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < (K // elements_per_sample_a))).to(tl.int1)
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < (K // elements_per_sample_a)))
 
     #B
     BLOCK_SIZE_K_B_E: tl.constexpr = BLOCK_SIZE_K // elements_per_sample
@@ -711,9 +712,12 @@ def gemm_splitK_MX_kernel(
         b_ptrs += BLOCK_SIZE_K_B * stride_bk
         
         if not use_tma:
+            offs_ak += BLOCK_SIZE_K_A
+            offs_bk += BLOCK_SIZE_K_B
+
             if not EVEN_K:
-                a_mask = ((offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_A) < (K // elements_per_sample_a))).to(tl.int1)
-                b_mask = (((offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_B) < (K // elements_per_sample)) & (offs_bn[None, :] < N))
+                a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < (K // elements_per_sample_a)))
+                b_mask = ((offs_bk[:, None] < (K // elements_per_sample)) & (offs_bn[None, :] < N))
 
     #NVFP4 meta-scale
     if(group_size == 16):
@@ -722,7 +726,10 @@ def gemm_splitK_MX_kernel(
     #############################################################################################################
     #Channel-wise scaling  
     if channel_scale_mode == 2:  # activation-only
-        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1.0, eviction_policy=meta_evict_policy)
+        if EVEN_M:
+            scales_a = tl.load(scales_a_ptr + offs_am, eviction_policy=meta_evict_policy)
+        else:
+            scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1.0, eviction_policy=meta_evict_policy)
         acc = acc * scales_a[:, None]
     
     #############################################################################################################
@@ -731,7 +738,7 @@ def gemm_splitK_MX_kernel(
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
+    mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
     if(SPLIT_K > 1):
         if EVEN_M and EVEN_N:
