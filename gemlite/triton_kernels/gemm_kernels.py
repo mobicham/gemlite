@@ -379,7 +379,7 @@ def gemm_INT_kernel(
     #############################################################################################################
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-    for k in range(num_pid_k):
+    for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
 
         if(A_load_order == 0): #Early load
             if EVEN_M and EVEN_K:
