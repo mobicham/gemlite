@@ -8,10 +8,10 @@ import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE, KERNEL
 from .utils import *
+from .utils import load_ptr
 
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
 MATMUL_TYPE   = "GEMV_REVSPLITK"
-NATIVE_ATOMIC = gpu_supports_bfloat16_atomicadd()
 
 def kernel_config_pruner(configs, nargs, **kwargs):
     global KEYS
@@ -22,6 +22,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
     k = nargs['K'] 
     g = nargs['group_size']
     e = nargs['elements_per_sample']
+    split_k = 2 # Fixed
 
     pre_hook = init_to_zero("c_ptr") if nargs['use_prehook'] else None
 
@@ -32,22 +33,24 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config     = copy.deepcopy(GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE][signature])
             num_stages = config.pop('num_stages')
             num_warps  = config.pop('num_warps')
-            num_ctas   = config.pop('num_ctas')
+            num_ctas   = config.pop('num_ctas', 1)
 
             config.pop('num_buffers_warp_spec', None)
             config.pop('num_consumer_groups', None)
             config.pop('reg_dec_producer', None)
             config.pop('reg_inc_consumer', None)
 
+            config['EVEN_K'] = (k % (config['BLOCK_SIZE_K'] * split_k) == 0)
+            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
+
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps, pre_hook=pre_hook)
             return
 
     used = set()
     for config in configs:
-        block_size_m = 1 #Only 1 allowed here
+        block_size_m = 1 #next_power_of_2(m) #Only 1 allowed here
         block_size_n = min(n, config.kwargs['BLOCK_SIZE_N'])
         block_size_k = min(k, config.kwargs['BLOCK_SIZE_K'])
-        split_k      = 2
 
         A_load_order  = config.kwargs['A_load_order']
         dot_prod_mode = config.kwargs['dot_prod_mode']
@@ -59,7 +62,6 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-
         #tmp fix autotune getting stuck on the MI300X
         if IS_HIP:
             if block_size_n * block_size_k >= 65536:
@@ -68,13 +70,18 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         #Since we load the scales / zeros once per split_k pass, we need this
         while block_size_k >= 8 and (block_size_k * split_k > g):
            block_size_k //= 2
+        block_size_k = max(block_size_k, 8)
 
-        if(not (block_size_k * split_k <= g)):
-            continue
+        # if(not (block_size_k * split_k <= g)):
+        #     continue
 
         #Block size should be compatible with minimum-packing
         if(block_size_k < e):
             continue
+
+
+        even_n = (n % block_size_n == 0)
+        even_k = (k % (block_size_k * 2) == 0)
 
         key = (block_size_m, block_size_n, block_size_k, A_load_order, dot_prod_mode, num_stages, num_warps)
 
@@ -84,6 +91,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             'BLOCK_SIZE_K': block_size_k,
             'A_load_order': A_load_order,
             'dot_prod_mode': dot_prod_mode,
+            'EVEN_K': even_k,
+            'EVEN_N': even_n,
         }
 
         if IS_HIP:
@@ -92,7 +101,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
         if key in used:
             continue
-
+        
         used.add(key)
         yield triton.Config(new_config, num_stages=num_stages, num_warps=num_warps, pre_hook=pre_hook)
 
@@ -120,6 +129,10 @@ def get_max_autotune_config_nvidia(): #~20 sec/shape
 
 def get_fast_autotune_config_nvidia():
     configs = []
+    #Default
+    configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':32, 'BLOCK_SIZE_K':16, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=1, num_stages=1))
+    
+    #Extra
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':16, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=1, num_stages=1))
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':32, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=2, num_stages=2))
     
@@ -138,6 +151,8 @@ def get_fast_autotune_config_nvidia():
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':16, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=2))
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':32, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=1))
     configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':64, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=2))
+    
+    configs.append(triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':1024, 'BLOCK_SIZE_K':32, 'A_load_order':0, 'dot_prod_mode':0}, num_warps=4, num_stages=1))
     return configs
 
 
@@ -227,7 +242,7 @@ else:
 def gemv_INT_revsplitK_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
-    M, N, K, 
+    M, N: tl.constexpr, K: tl.constexpr, 
     ######### Quant parms #########
     W_nbits: tl.constexpr, 
     group_size: tl.constexpr, 
@@ -236,10 +251,14 @@ def gemv_INT_revsplitK_kernel(
     type_id: tl.constexpr,
     use_prehook: tl.constexpr,
     ######### Strides #########
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_meta_g, stride_meta_n,
+    stride_am: tl.constexpr, 
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, 
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, 
+    stride_cn: tl.constexpr,
+    stride_meta_g: tl.constexpr, 
+    stride_meta_n: tl.constexpr,
     ######### Dtypes #########
     input_dtype: tl.constexpr,
     output_dtype: tl.constexpr,
@@ -250,7 +269,9 @@ def gemv_INT_revsplitK_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
     A_load_order: tl.constexpr, 
     dot_prod_mode: tl.constexpr,
     data_contiguous: tl.constexpr,
@@ -260,6 +281,8 @@ def gemv_INT_revsplitK_kernel(
     atomic_mode: tl.constexpr = 'relaxed',
     a_evict: tl.constexpr = 'evict_last',
     b_evict: tl.constexpr = 'evict_first',
+    EVEN_K: tl.constexpr = False,
+    EVEN_N: tl.constexpr = False,
 ):
     """
     GEMV for C = matmul(A, dequantize(B, scales, zeros)). This is optimized for M==1
@@ -291,6 +314,8 @@ def gemv_INT_revsplitK_kernel(
     a_ptrs  = a_ptr + offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak  
     b_ptrs  = b_ptr + ((offs_k[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn) 
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
+    a_mask  = (offs_am[:, None] < M) & (offs_ak[None, :] < K)
+    b_mask  = (offs_bk[:, None] < K) & (offs_bn[None, :] < N)
 
     #Stage 0: Load scales/zeros
     #-----------------------------------------------------------------------------------------------------------
@@ -316,12 +341,12 @@ def gemv_INT_revsplitK_kernel(
     #-----------------------------------------------------------------------------------------------------------
     #Load
     if(A_load_order == 0):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not EVEN_K).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     
-    b = tl.load(b_ptrs, eviction_policy=b_evict) 
+    b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
     if(A_load_order == 1):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not EVEN_K).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
 
     # Unpack and dequantize    
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
@@ -338,16 +363,19 @@ def gemv_INT_revsplitK_kernel(
     #Advance and load next chunk
     a_ptrs += BLOCK_SIZE_K * stride_ak
     b_ptrs += (BLOCK_SIZE_K // elements_per_sample) * stride_bk
+    if not EVEN_K:
+        a_mask  = (offs_am[:, None] < M) & ((offs_ak[None, :] + BLOCK_SIZE_K) < K)
+        b_mask  = ((offs_bk[:, None] + BLOCK_SIZE_K) < K) & (offs_bn[None, :] < N)
 
     #Stage 2
     #-----------------------------------------------------------------------------------------------------------
     if(A_load_order == 0):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not EVEN_K).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
     
-    b = tl.load(b_ptrs, eviction_policy=b_evict) 
+    b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
     if(A_load_order == 1):
-        a = tl.load(a_ptrs, eviction_policy=a_evict).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
+        a = load_ptr(a_ptrs, a_mask, a_evict, not EVEN_K).reshape((BLOCK_SIZE_K, 1), can_reorder=False)
 
     # Unpack and dequantize    
     b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
@@ -364,16 +392,15 @@ def gemv_INT_revsplitK_kernel(
     if(dump_b_val > 0): acc /= dump_b_val
     ############################################################################################################
     #Channel-wise scaling
-    if(channel_scale_mode == 1): #weight-only
+    if channel_scale_mode == 1: #weight-only
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * scales_b[None, :]
 
-    if(channel_scale_mode == 2): #activation-only
+    if channel_scale_mode == 2: #activation-only
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=meta_dtype)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
-
-    if(channel_scale_mode == 3): #weight + activation
+        acc = acc.to(meta_dtype) * scales_a[:, None]
+        
+    if channel_scale_mode == 3: #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
@@ -384,7 +411,11 @@ def gemv_INT_revsplitK_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+    if EVEN_N:
+        tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+    else:
+        mask = (offs_cn[None, :] < N) # BLOCK_SIZE_M is always 1
+        tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode)
     
 KERNEL_CACHE = {}
 
@@ -392,6 +423,7 @@ def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor
                                                    W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
                                                    input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
                                                    channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id: int,
+                                                   meta_scale: float = 0.0,
                                                    ) -> Tensor:
     
     global KERNEL_CACHE
@@ -399,7 +431,7 @@ def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor
     M, K, N = x.shape[0], x.shape[1], W_q.shape[1]
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
 
-    native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or NATIVE_ATOMIC
+    native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or gpu_supports_bfloat16_atomicadd()
     kernel_output_dtype = (DTYPE_TO_TORCH[output_dtype] if native_atomic else torch.float32)
 
     if KERNEL.ENABLE_CACHING and M == 1:
@@ -453,7 +485,7 @@ def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor
         W_group_mode       = W_group_mode,
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
-        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype in [DType.FP16.value] and W_nbits == 8) else 0, #Warning: Only use with INT8
+        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype == tl.float16 and W_nbits == 8) else 0, #Warning: Only use with INT8
     )
 
     if(not native_atomic):

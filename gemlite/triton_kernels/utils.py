@@ -6,6 +6,23 @@ import triton.language as tl
 from triton.runtime import driver
 from ..dtypes import *
 
+GEMLITE_USE_NATIVE_ATOMIC_BFP16 = True
+GPU_COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
+# TMA descriptors require a global memory allocation
+from typing import Optional
+def alloc_fn(size: int, alignment: int, stream: Optional[int]):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+triton.set_allocator(alloc_fn)
+
+
+@triton.jit
+def load_ptr(ptrs, mask, eviction_policy, apply_mask: tl.constexpr, other=0.):
+    if apply_mask:
+        return tl.load(ptrs, mask=mask, other=other, eviction_policy=eviction_policy)
+    else:
+        return tl.load(ptrs, eviction_policy=eviction_policy)
+
 @triton.jit
 def swizzle_tile_v1(pid, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
     grid_m     = tl.cdiv(M, BLOCK_SIZE_M)
@@ -53,7 +70,6 @@ def linear_tile(pid, M, N, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexp
     pid_n = pid // tl.cdiv(M, BLOCK_SIZE_M)
     return pid_m, pid_n
 
-#################################################################################################################
 @triton.jit
 def dequantize(
     b,
@@ -108,9 +124,16 @@ def is_divisible(dividend, divisor):
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
-def gpu_has_more_shared_memory(ref_gpus = ["a100", "h100", "h200", "h20", "h800", "b100", "b200"]): 
+def gpu_has_more_shared_memory(
+    ref_gpus=(
+        "a100",
+        "h100", "h200", "h20", "h800",
+        "b100", "b200", "b300",
+        "6000",
+    ),
+):
     gpu_name = torch.cuda.get_device_properties(0).name.lower()
-    return True in [g in gpu_name for g in ref_gpus]
+    return any(g in gpu_name for g in ref_gpus)
 
 def gpu_supports_float16_acc(
     ref_gpus=["5090", "5080", "5070", "5060", 
@@ -121,11 +144,34 @@ def gpu_supports_float16_acc(
     gpu_name = torch.cuda.get_device_properties(0).name.lower()
     return True in [g in gpu_name for g in ref_gpus]
 
+def estimate_shared_memory_per_block(block_size_m, block_size_n, block_size_k, a_sizeof, b_sizeof, num_stages, e, g, load_scales_as_block):
+    a_smem = block_size_m * block_size_k * a_sizeof
+    if load_scales_as_block:
+        # MX kernels: dot_scaled handles scaling natively, no dequant buffer
+        # A tile: packed elements (e.g. NVFP4 packs 2 per byte, so K_A = K // e)
+        a_smem = block_size_m * (block_size_k // e) * a_sizeof
+        b_smem = (block_size_k // e) * block_size_n * b_sizeof
+        # scales_b: (BLOCK_N, BLOCK_K // group_size), scales_a: (BLOCK_M, BLOCK_K // group_size)
+        sb_smem = block_size_n * (block_size_k // g) * 1
+        sa_smem = block_size_m * (block_size_k // g) * 1
+        loop_smem = (a_smem + b_smem + sb_smem + sa_smem) * max(num_stages - 1, 1)
+        # Triton overlaps output buffer with loop data (reuses same SMEM)
+        output_smem = block_size_m * block_size_n * 2  # bf16 output via TMA store
+        estimated_smem = max(loop_smem, output_smem)
+    elif e > 1:
+        # INT packed: need packed B + dequantized B for MMA
+        b_smem = (block_size_k // e) * block_size_n * b_sizeof
+        b_smem += block_size_k * block_size_n * a_sizeof
+        estimated_smem = int((a_smem + b_smem) * num_stages * 1.20)
+    else:
+        # INT unpacked (8-bit): exact formula
+        b_smem = block_size_k * block_size_n * b_sizeof
+        estimated_smem = (a_smem + b_smem) * max(num_stages - 1, 1)
+    return estimated_smem
 
 def gpu_supports_bfloat16_atomicadd():
-    #Triton tl.atomic_add doens't support bfloat16 even for Hopper and above. 
-    #return torch.cuda.get_device_capability()[0] >= 9 #Hopper and above
-    return False
+    #Triton tl.atomic_add doens't support bfloat16 on older GPUs.
+    return (GPU_COMPUTE_CAPABILITY >= 9) and GEMLITE_USE_NATIVE_ATOMIC_BFP16
 
 NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 def get_num_SMs(device):
@@ -178,6 +224,4 @@ def get_gpu_shared_memory():
 
 ###################################################################################
 #Cached results to avoid runtime driver calls
-
-IS_HIP = is_hip() 
-NATIVE_ATOMIC = gpu_supports_bfloat16_atomicadd()
+IS_HIP = is_hip()

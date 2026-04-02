@@ -8,6 +8,7 @@ import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE
 from .utils import *
+from .utils import load_ptr
 
 KEYS        = ['M_CLOSEST', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'a_sizeof', 'b_sizeof'] 
 MATMUL_TYPE = "GEMM"
@@ -23,15 +24,16 @@ def kernel_config_pruner(configs, nargs, **kwargs):
     t = nargs['type_id']
     a_sizeof = nargs['a_sizeof']
     b_sizeof = nargs['b_sizeof']
-
+    
     #Check cache
+    load_scales_as_block = kwargs['load_scales_as_block']
     if(MATMUL_TYPE in GEMLITE_TRITON_CONFIG_CACHE):
         signature = str(tuple([get_closest_m(m), n, k, g, e, t]))
         if(signature in GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE]):
             config     = copy.deepcopy(GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE][signature])
             num_stages = config.pop('num_stages')
             num_warps  = config.pop('num_warps')
-            num_ctas   = config.pop('num_ctas')
+            num_ctas   = config.pop('num_ctas', 1)
 
             config.pop('num_buffers_warp_spec', None)
             config.pop('num_consumer_groups', None)
@@ -39,11 +41,20 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config.pop('reg_inc_consumer', None)
             config["NUM_STAGES"] = num_stages
 
+            config.pop('EVEN_M', None)
+            config.pop('EVEN_K', None)
+            config.pop('EVEN_N', None)
+
+            # Adjust 5D TMA compatibility for cached configs
+            if load_scales_as_block and n % 128 == 0 and (k // g) % 4 == 0:
+                config['BLOCK_SIZE_N'] = max(config['BLOCK_SIZE_N'], 128)
+                while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
+                    config['BLOCK_SIZE_K'] *= 2
+
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps)
             return
-    
+
     gpu_shared_memory = get_gpu_shared_memory()
-    load_scales_as_block = kwargs['load_scales_as_block']
     used = set()
     for config in configs:
         group_size_m = config.kwargs['GROUP_SIZE_M']
@@ -62,49 +73,43 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         elif m <= 128: block_size_m = min(max(block_size_m, 64), 128) #m: [64...128]
         elif m <= 256: block_size_m = min(max(block_size_m, 64), 256) #m: [128...256]
         elif m > 256:  block_size_m = min(max(block_size_m, 64), 256) #m > 256
-    
-        #Constraint: BLOCK_SIZE_K >= group_size, only for load_as_block = False
+
+        block_size_k = next_power_of_2(block_size_k)
+        block_size_n = next_power_of_2(block_size_n)
+        
+        #Constraints
         if(load_scales_as_block):
-            num_stages = max(num_stages, 2) #for dot_scaled kernels with pipelined loads
             if(e > 1):
                 block_size_k = max(block_size_k, 64) #m16n8k64
             else:
                 block_size_k = max(block_size_k, 32) #m16n8k32
+            # 5D TMA scale compatibility: adjust block sizes for 5D TMA descriptor
+            if n % 128 == 0 and (k // g) % 4 == 0:
+                block_size_n = max(block_size_n, 128)
+                while (block_size_k // g) % 4 != 0:
+                    block_size_k *= 2
         else:
-            block_size_k = min(block_size_k, g)
-
-        block_size_k = next_power_of_2(block_size_k)
-        block_size_n = next_power_of_2(block_size_n)
+            block_size_k = max(min(block_size_k, g), 32) #tl.dot minimum K
 
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
 
-        #Nvidia
         if not IS_HIP:
-            if e > 1 and not load_scales_as_block:
-                #Limit num stages when data is packed
-                num_stages = min(num_stages, 4)
-            if(e == 1 and num_stages == 1): 
-                #skip num_stages=1 for non-packed weights
+            if e == 1 and num_stages == 1:
                 continue
 
-        #Avoid OOM
-        while num_stages > 0 and not load_scales_as_block: #TODO: revisit MXFP case
-            shared_mem = (block_size_m * block_size_k * a_sizeof + block_size_k * block_size_n * b_sizeof)
-            if(e > 1): 
-                shared_mem += block_size_k * block_size_n * a_sizeof
-            shared_mem *= num_stages
-            if int(shared_mem) <= gpu_shared_memory:
+        # Reduce num_stages until config fits in shared memory
+        while num_stages > 1:
+            estimated_smem = estimate_shared_memory_per_block(
+                block_size_m, block_size_n, block_size_k,
+                a_sizeof, b_sizeof, num_stages, e, g,
+                load_scales_as_block
+            )
+            if estimated_smem <= gpu_shared_memory:
                 break
             num_stages -= 1
 
-        if(num_stages == 0): continue #config too large
-
-        ###########################################
-        if(load_scales_as_block):#tmp MXFP fix
-            block_size_k = min(block_size_k, 256)
-        ###########################################
-
         key = (block_size_m, block_size_n, block_size_k, group_size_m, A_load_order, num_stages, num_warps)
+        
 
         new_config = {
             "BLOCK_SIZE_M": block_size_m,
@@ -129,7 +134,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 ########################################################################################################################################################################
 #Nvidia
 def get_max_autotune_config_nvidia():
-    stages  = [1, 4, 5] if gpu_has_more_shared_memory() else [1, 2, 4]
+    stages  = [1, 3, 4, 5]
     configs = []
     for A in [0, 2]:
         for w in [4, 8]:
@@ -148,29 +153,42 @@ def get_max_autotune_config_nvidia():
 
 def get_fast_autotune_config_nvidia():
     configs = [] #BLOCK_SIZE_M is automatically adapted in the config pruning.
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':32,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
-
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':32,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=5))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
-
+    #Small tiles (packed INT with small group_size, small N problems)
+    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':64,  'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':32,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=5))
+    #Medium N tiles
     configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=4))
-    
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=4))
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=4))
-
-    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':512, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=3))
+    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
+    #Large N tiles
+    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':64,  'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=5))
+    #Large M×N tiles (pruner adapts M for large batch sizes)
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    # NVFP4-friendly configs: BSK=128 allows stages=3/4 within 99KB smem (NVFP4 g=16 cant fit BSK=256 stages=3)
+    configs.append(triton.Config({"BLOCK_SIZE_M":128, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":0}, num_warps=8, num_stages=5))
+    configs.append(triton.Config({"BLOCK_SIZE_M":128, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":0}, num_warps=8, num_stages=5))
+    configs.append(triton.Config({"BLOCK_SIZE_M":128, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":2}, num_warps=8, num_stages=5))
+    configs.append(triton.Config({"BLOCK_SIZE_M":128, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":2}, num_warps=8, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=8, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    #Extra coverage
+    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':32,  'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':2}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({'BLOCK_SIZE_M':128, 'BLOCK_SIZE_N':256, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=8, num_stages=5))
+    #Small M tiles (for M=32..64 where more tiles improve SM utilization)
+    configs.append(triton.Config({"BLOCK_SIZE_M":32, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":128, "GROUP_SIZE_M":8, "A_load_order":0}, num_warps=4, num_stages=5))
+    configs.append(triton.Config({"BLOCK_SIZE_M":32, "BLOCK_SIZE_N":128, "BLOCK_SIZE_K":256, "GROUP_SIZE_M":8, "A_load_order":0}, num_warps=4, num_stages=5))
     return configs
 
 def get_default_config_nvidia():
-    return [triton.Config({'BLOCK_SIZE_M':16, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':32, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':4}, num_warps=4, num_stages=4),]
+    return [triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2),
+            triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':128, 'BLOCK_SIZE_K':256, 'GROUP_SIZE_M':8, 'A_load_order':0}, num_warps=4, num_stages=2),
+            ]
 
 ########################################################################################################################################################################
 #AMD - Instinct MI300X
@@ -219,7 +237,7 @@ def get_fast_autotune_config_amd():
     return configs
 
 def get_default_config_amd():
-    return [triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':32, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2),]
+    return [triton.Config({'BLOCK_SIZE_M':64, 'BLOCK_SIZE_N':64, 'BLOCK_SIZE_K':64, 'GROUP_SIZE_M':8, 'A_load_order':0, 'NUM_STAGES':2}, num_warps=4, num_stages=2),]
 
 ########################################################################################################################################################################
 if IS_HIP:
@@ -239,17 +257,23 @@ elif(AUTOTUNE_SETTING == 'fast'):
 else:
     get_autotune_config = get_default_config
 
+
 @triton.autotune(
     configs = get_autotune_config(),
     key = KEYS, 
     prune_configs_by = {'early_config_prune': kernel_config_pruner},
     use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
 )
+@triton.heuristics(values={
+    "EVEN_M": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0,
+    "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
+    "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+})
 @triton.jit
 def gemm_INT_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
-    M, N, K, M_CLOSEST,
+    M, N: tl.constexpr, K: tl.constexpr, M_CLOSEST,
     ######### Quant parms #########
     W_nbits: tl.constexpr, 
     group_size: tl.constexpr, 
@@ -276,14 +300,25 @@ def gemm_INT_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr, 
+    NUM_STAGES: tl.constexpr,
     A_load_order: tl.constexpr, 
     data_contiguous: tl.constexpr,
     #################################
-    meta_evict_policy: tl.constexpr = '',
-    a_evict: tl.constexpr = '',
-    b_evict: tl.constexpr = '',
+    EVEN_M: tl.constexpr = False,
+    EVEN_K: tl.constexpr = False, 
+    EVEN_N: tl.constexpr = False,
+    #################################
+    meta_evict_policy: tl.constexpr = "evict_last",
+    a_evict: tl.constexpr = "",
+    b_evict: tl.constexpr = "evict_first",
+    meta_scale_norm_ptr = None,
+    #################################
+    use_tma: tl.constexpr = True,
+    use_5d_scales: tl.constexpr = False,
 ):
     """
     Based on https://github.com/fpgaminer/GPTQ-triton
@@ -296,6 +331,7 @@ def gemm_INT_kernel(
     BLOCK_SIZE_M >=16
     BLOCK_SIZE_K <= group_size
     """
+
 
     pid  = tl.program_id(axis=0)
 
@@ -313,7 +349,7 @@ def gemm_INT_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K) 
-
+    
     #Offsets
     #############################################################################################################
     if data_contiguous:
@@ -325,11 +361,12 @@ def gemm_INT_kernel(
     offs_bk = offs_k
 
     b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn) 
+    b_mask  = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
     q_shift = ((offs_bk % elements_per_sample) * W_nbits).to(tl.int32)[:, None] 
 
     #Inputs
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)  
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
     
     #Meta data stuff
     scales_ptrs = scales_ptr + offs_bn[None, :] * stride_meta_n
@@ -344,15 +381,15 @@ def gemm_INT_kernel(
     #############################################################################################################
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-    for k in range(num_pid_k):
+    for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
 
         if(A_load_order == 0): #Early load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
+        b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
         if(A_load_order == 1): #Early load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
         
         #Meta-data loading policy
         if(W_group_mode > 0):
@@ -372,13 +409,13 @@ def gemm_INT_kernel(
             zeros = None
         
         if(A_load_order == 2): #Mid load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
         # Unpack and dequantize
         b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
         if(A_load_order == 3): #Late load 
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
         
         #Dot
         acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype) 
@@ -386,32 +423,46 @@ def gemm_INT_kernel(
         #Advance
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K_P * stride_bk
+        
+        offs_ak += BLOCK_SIZE_K
+        offs_bk += BLOCK_SIZE_K
+
+        if not EVEN_K:
+            if EVEN_M:
+                a_mask = tl.broadcast_to((offs_ak[None, :] < K), [BLOCK_SIZE_M, BLOCK_SIZE_K])
+            else:
+                a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
+            if EVEN_N:
+                b_mask = tl.broadcast_to((offs_bk[:, None] < K), [BLOCK_SIZE_K, BLOCK_SIZE_N])
+            else:
+                b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
 
     #############################################################################################################
     #Channel-wise scaling
-    if(channel_scale_mode == 1): #weight-only
-        scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
-        acc      = acc.to(meta_dtype) * scales_b[None, :]
+    if channel_scale_mode == 1 or channel_scale_mode == 3:
+        scales_b = load_ptr(scales_ptr + offs_bn, offs_bn < N, meta_evict_policy, not EVEN_N, other=1)
 
-    if(channel_scale_mode == 2): #activation-only
-        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=meta_dtype)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+    if channel_scale_mode == 2 or channel_scale_mode == 3:
+        scales_a = load_ptr(scales_a_ptr + offs_am, offs_am < M, meta_evict_policy, not EVEN_M, other=1)
 
-    if(channel_scale_mode == 3): #weight + activation
-        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
-        acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
-
-    acc = acc.to(output_dtype)
+    if channel_scale_mode == 1:
+        acc = acc.to(meta_dtype) * scales_b[None, :]
+    elif channel_scale_mode == 2:
+        acc = acc.to(meta_dtype) * scales_a[:, None]
+    elif channel_scale_mode == 3:
+        acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
     #############################################################################################################
+    
     #Output
+    acc = acc.to(output_dtype)
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    tl.store(c_ptrs, acc, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N)) 
-
+    if EVEN_M and EVEN_N:
+        tl.store(c_ptrs, acc)
+    else:
+        tl.store(c_ptrs, acc, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
 
 @triton.autotune(
     configs = get_autotune_config(),
@@ -419,11 +470,16 @@ def gemm_INT_kernel(
     prune_configs_by = {'early_config_prune': kernel_config_pruner},
     use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
 )
+@triton.heuristics(values={
+    "EVEN_M": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0,
+    "EVEN_N": lambda args: args["N"] % args["BLOCK_SIZE_N"] == 0,
+    "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+})
 @triton.jit
 def gemm_MX_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
-    M, N, K, M_CLOSEST,
+    M, N: tl.constexpr, K: tl.constexpr, M_CLOSEST,
     ######### Quant parms #########
     W_nbits: tl.constexpr,
     group_size: tl.constexpr,
@@ -434,9 +490,9 @@ def gemm_MX_kernel(
     a_sizeof: tl.constexpr,
     b_sizeof: tl.constexpr,
     ######### Strides #########
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
+    stride_am: tl.constexpr, stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
     stride_meta_a_m: tl.constexpr, stride_meta_a_g: tl.constexpr,
     stride_meta_n: tl.constexpr, stride_meta_g: tl.constexpr,
     ######### Dtypes #########
@@ -455,11 +511,19 @@ def gemm_MX_kernel(
     A_load_order: tl.constexpr,
     data_contiguous: tl.constexpr,
     #################################
-    meta_evict_policy: tl.constexpr = '',
-    a_evict: tl.constexpr = '',
-    b_evict: tl.constexpr = '',
-    meta_scale_norm: tl.constexpr = (0.05 ** 2),
+    EVEN_M: tl.constexpr = False,
+    EVEN_K: tl.constexpr = False, 
+    EVEN_N: tl.constexpr = False,
+    #################################
+    meta_evict_policy: tl.constexpr = "evict_last",
+    a_evict: tl.constexpr = "",
+    b_evict: tl.constexpr = "",
+    meta_scale_norm_ptr = None,
+    #################################
+    use_tma: tl.constexpr = True,
+    use_5d_scales: tl.constexpr = False,
 ):
+
 
     pid = tl.program_id(axis=0)
     pid_m, pid_n = swizzle_tile(pid, M, N, BLOCK_SIZE_M, BLOCK_SIZE_N, GROUP_SIZE_M)
@@ -488,73 +552,172 @@ def gemm_MX_kernel(
     BLOCK_SIZE_K_A: tl.constexpr = BLOCK_SIZE_K // elements_per_sample_a
     offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_ak = tl.arange(0, BLOCK_SIZE_K_A)
+    if not use_tma:
+        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K // elements_per_sample_a)).to(tl.int1)
+    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K // elements_per_sample_a))
 
     #B
     BLOCK_SIZE_K_B: tl.constexpr = BLOCK_SIZE_K // elements_per_sample
     offs_bk = tl.arange(0, BLOCK_SIZE_K_B)
     offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    if not use_tma:
+        if data_contiguous:
+            offs_bn_load = offs_bn
+        else:
+            offs_bn_load = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+    else:
+        offs_bn_load = offs_bn
+    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn_load[None, :] * stride_bn
+    b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
 
     #Scales
     stride_mul: tl.constexpr = BLOCK_SIZE_K / group_size
     BLOCK_SIZE_K_S: tl.constexpr = BLOCK_SIZE_K // group_size
     offs_k_scales = tl.arange(0, BLOCK_SIZE_K_S)
     offs_n_b_scales = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
+    if not use_5d_scales:
+        scales_b_ptrs = scales_ptr + offs_n_b_scales[:, None] * stride_meta_n + offs_k_scales[None, :] * stride_meta_g #[BLOCK_SIZE_N, BLOCK_SIZE_K // group_size]
 
+    if use_tma:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            [M, K // elements_per_sample_a],
+            [stride_am, stride_ak],
+            [BLOCK_SIZE_M, BLOCK_SIZE_K_A]
+        )
+        
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            [N, K // elements_per_sample],
+            [stride_bn, stride_bk],
+            [BLOCK_SIZE_N, BLOCK_SIZE_K_B]
+        )
+        
+        c_desc = tl.make_tensor_descriptor(
+            c_ptr,
+            [M, N],
+            [stride_cm, stride_cn],
+            [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        )
+        
+    # 5D TMA Descriptors for Scales (preshuffled layout)
+    if use_5d_scales:
+        rep_n: tl.constexpr = BLOCK_SIZE_N // 128
+        rep_k: tl.constexpr = BLOCK_SIZE_K // group_size // 4
+        scales_b_shape1: tl.constexpr = N // 128
+        scales_b_shape2: tl.constexpr = K // group_size // 4
+        stride_b4: tl.constexpr = 1
+        stride_b3: tl.constexpr = 256
+        stride_b2: tl.constexpr = 512
+        stride_b1: tl.constexpr = 512 * scales_b_shape2
+        stride_b0: tl.constexpr = stride_b1 * scales_b_shape1
+        scales_b_5d_desc = tl.make_tensor_descriptor(
+            scales_ptr,
+            [1, scales_b_shape1, scales_b_shape2, 2, 256],
+            [stride_b0, stride_b1, stride_b2, stride_b3, stride_b4],
+            [1, rep_n, rep_k, 2, 256]
+        )
+    
     #B-scales
     if(channel_scale_mode == 4):
         scales_a_ptrs = scales_a_ptr + offs_am[:, None] * stride_meta_a_m + offs_k_scales[None, :] * stride_meta_a_g
+    
+    # _1s dtype must match actual scale dtype: uint8 for MXFP (E8M0), float8e4nv for NVFP4 (E4M3)
+    if group_size == 16:
+        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
+        #scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=1, dtype=tl.float32).to(tl.float8e4nv)
+    else:
+        scales_a_1s = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+        #scales_b_1s = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
 
+    _meta_scale_norm = tl.load(meta_scale_norm_ptr, eviction_policy='evict_last') if group_size == 16 else 1.0
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
     for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
-        a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
-
-        k_m = k * BLOCK_SIZE_K_S
-        scales_b = tl.load(scales_b_ptrs + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
-
-        if(channel_scale_mode == 4):
-            scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, eviction_policy=meta_evict_policy)
+        # Load A and B tiles        
+        if use_tma:
+            a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
+            b = tl.load_tensor_descriptor(b_desc, [pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_B]).T
         else:
-            scales_a = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K_S), value=127, dtype=tl.uint8)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
+
+            b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
+        ####################################################################################
+        k_m = k * BLOCK_SIZE_K_S
+        if use_5d_scales:
+            # 5D TMA scale loads (preshuffled layout)
+            scale_b_raw = tl.load_tensor_descriptor(scales_b_5d_desc, [0, pid_n * rep_n, k * rep_k, 0, 0])
+            scales_b = scale_b_raw.reshape(rep_n, rep_k, 32, 4, 4).trans(0, 3, 2, 1, 4).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K_S)
+        else:
+            scale_b_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
+            scales_b = load_ptr(scales_b_ptrs + k_m * stride_meta_g, scale_b_mask, meta_evict_policy, not EVEN_K)
+        
+        if(channel_scale_mode == 4):
+            scale_a_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
+            scales_a = load_ptr(scales_a_ptrs + k_m * stride_meta_a_g, scale_a_mask, meta_evict_policy, not EVEN_K)
+        else:
+            scales_a = scales_a_1s
+
+        ####################################################################################
         
         acc = tl.dot_scaled(a, scales_a, a_dtype, b, scales_b, b_dtype, acc)
 
-        a_ptrs += BLOCK_SIZE_K_A * stride_ak
-        b_ptrs += BLOCK_SIZE_K_B * stride_bk
+        if not use_tma:
+            a_ptrs += BLOCK_SIZE_K_A * stride_ak
+            b_ptrs += BLOCK_SIZE_K_B * stride_bk     
+            offs_ak += BLOCK_SIZE_K
+            offs_bk += BLOCK_SIZE_K
+
+            if not EVEN_K:
+                if EVEN_M:
+                    a_mask = tl.broadcast_to((offs_ak[None, :] < K), [BLOCK_SIZE_M, BLOCK_SIZE_K_A])
+                else:
+                    a_mask = ((offs_am[:, None] < M) & (offs_ak[None, :] < K))
+                if EVEN_N:
+                    b_mask = tl.broadcast_to((offs_bk[:, None] < K), [BLOCK_SIZE_K_B, BLOCK_SIZE_N])
+                else:
+                    b_mask = ((offs_bk[:, None] < K) & (offs_bn[None, :] < N))
 
     #NVFP4 meta-scale
     if(group_size == 16):
-        acc *= meta_scale_norm
+        acc = acc.to(tl.float32) * _meta_scale_norm
 
     #############################################################################################################
-    #Channel-wise scaling
-    if(channel_scale_mode == 2): #activation-only
-        dtype: tl.constexpr = c_ptr.dtype.element_ty
-        scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.full((BLOCK_SIZE_N,), value=1, dtype=dtype)
-        acc      = acc.to(dtype) * (scales_a[:, None] * scales_b[None, :])
-
+    #Channel-wise scaling    
+    if channel_scale_mode == 2:  # activation-only
+        scales_a = load_ptr(scales_a_ptr + offs_am, offs_am < M, meta_evict_policy, not EVEN_M, other=1.0)
+        acc = acc * scales_a[:, None]
+        
     #############################################################################################################
     #Output
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    mask    = ((offs_cm[:, None] < M) & (offs_cn[None, :] < N)).to(tl.int1)
-    tl.store(c_ptrs, acc, mask=mask)
+    acc = acc.to(output_dtype)
+    if use_tma:
+        tl.store_tensor_descriptor(c_desc, [pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N], value=acc)
+    else:
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+        c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
+        if EVEN_M and EVEN_N:
+            tl.store(c_ptrs, acc)
+        else:
+            tl.store(c_ptrs, acc, mask=(offs_cm[:, None] < M) & (offs_cn[None, :] < N))
+    
 
+PRINTED = False
 def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
-                W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
-                input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
-                channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 
+                W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int,
+                input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int,
+                channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int,
+                meta_scale: Tensor = None,
                 ) -> Tensor:
     
-    M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1]
+    
+    global PRINTED
+    from ..core import GEMLITE_USE_TMA
+    M, K, N = x.shape[0], W_q.shape[0] * elements_per_sample, W_q.shape[1] # W
     M_CLOSEST = get_closest_m(M)
-
+    
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
     output = torch.empty((M, N), device=W_q.device, dtype=DTYPE_TO_TORCH[output_dtype])
 
@@ -568,37 +731,251 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
     if(is_mx_dtype(input_dtype)):
         gemm_kernel = gemm_MX_kernel
         load_scales_as_block = True
+        use_5d_scales = (scales.ndim == 5)
     else:
         gemm_kernel = gemm_INT_kernel
         load_scales_as_block = False
+        use_5d_scales = False
 
     gemm_kernel[grid](
-        x, W_q, output, 
+        x, W_q, output,
         scales, zeros, scales_x,
         M, N, K, M_CLOSEST,
-        #############################################
         W_nbits, group_size, unpack_mask, elements_per_sample,
         type_id, x.dtype.itemsize, W_q.dtype.itemsize,
-        ###############################################
         x.stride(0), x.stride(1),
         W_q.stride(0), W_q.stride(1),
         output.stride(0), output.stride(1),
         stride_meta_a_m, stride_meta_a_g,
-        scales.stride(0), scales.stride(1),
-        ################################################
+        0 if use_5d_scales else scales.stride(0), 0 if use_5d_scales else scales.stride(1),
         load_scales_as_block = load_scales_as_block,
         input_dtype  = DTYPE_TO_TRITON[input_dtype],
         output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
         acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
         meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
-        ################################################
-        channel_scale_mode = channel_scale_mode,
-        W_group_mode       = W_group_mode,
-        zero_is_scalar     = zeros.numel() == 1,
-        data_contiguous    = data_contiguous,
+        channel_scale_mode  = channel_scale_mode,
+        W_group_mode        = W_group_mode,
+        zero_is_scalar      = zeros.numel() == 1,
+        data_contiguous     = data_contiguous,
+        use_tma             = use_5d_scales,
+        use_5d_scales       = use_5d_scales,
+        meta_scale_norm_ptr = meta_scale,
     )
-
+    
     return output
+
+
+
+# @triton.autotune(
+#     configs = get_autotune_config(),
+#     key = KEYS, 
+#     prune_configs_by = {'early_config_prune': kernel_config_pruner},
+#     use_cuda_graph = AUTOTUNE.USE_CUDA_GRAPH,
+# )
+# @triton.jit
+# def gemm_INT_kernel_persistent_tma(
+#     a_ptr, b_ptr, c_ptr,
+#     scales_ptr, zeros_ptr, scales_a_ptr,
+#     M, N, K, M_CLOSEST,
+#     ######### Quant parms #########
+#     W_nbits: tl.constexpr, 
+#     group_size: tl.constexpr, 
+#     unpack_mask: tl.constexpr, 
+#     elements_per_sample: tl.constexpr, 
+#     #################################
+#     type_id: tl.constexpr,
+#     a_sizeof: tl.constexpr,
+#     b_sizeof: tl.constexpr,
+#     ######### Strides #########
+#     stride_am: tl.constexpr, stride_ak: tl.constexpr,
+#     stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+#     stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+#     stride_meta_a_m: tl.constexpr, stride_meta_a_g: tl.constexpr,
+#     stride_meta_g: tl.constexpr, stride_meta_n: tl.constexpr,
+#     ######### Dtypes #########
+#     load_scales_as_block: tl.constexpr, #False
+#     input_dtype: tl.constexpr,
+#     output_dtype: tl.constexpr,
+#     acc_dtype: tl.constexpr,
+#     meta_dtype: tl.constexpr,
+#     ######### Meta-data mode #########
+#     channel_scale_mode: tl.constexpr,
+#     W_group_mode: tl.constexpr,
+#     zero_is_scalar: tl.constexpr,
+#     ######### tuning params #########
+#     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+#     GROUP_SIZE_M: tl.constexpr, NUM_STAGES: tl.constexpr,
+#     #################################
+#     EVEN_M: tl.constexpr = False, 
+#     EVEN_K: tl.constexpr = False, 
+#     EVEN_N: tl.constexpr = False,
+#     #################################
+#     A_load_order: tl.constexpr = 0, 
+#     data_contiguous: tl.constexpr = True,
+#     #################################
+#     meta_evict_policy: tl.constexpr = '',
+#     a_evict: tl.constexpr = '',
+#     b_evict: tl.constexpr = '',
+#     NUM_SMS: tl.constexpr = 8,
+# ):
+#     """
+#     Persistent + TMA version.
+#     A: (M, K) fp16/bf16
+#     B_packed: (K//elements_per_sample, N) int32
+#     scales/zeros: (num_groups, N) or other depending on W_group_mode
+#     """
+
+#     # ---------------------------
+#     # Persistent tiling setup
+#     # ---------------------------
+#     start_pid = tl.program_id(0).to(tl.int32)
+   
+#     grid_m = tl.cdiv(M, BLOCK_SIZE_M)
+#     grid_n = tl.cdiv(N, BLOCK_SIZE_N)
+#     num_tiles = grid_m * grid_n
+#     width = GROUP_SIZE_M * grid_n  # tiles per "group stripe"
+
+#     a_desc = tl.make_tensor_descriptor(
+#         a_ptr,
+#         [M, K],
+#         [stride_am, stride_ak],
+#         [BLOCK_SIZE_M, BLOCK_SIZE_K]
+#     )
+
+#     # b_desc = tl.make_tensor_descriptor(
+#     #     b_ptr,
+#     #     [K, N],
+#     #     [stride_bk, stride_bn],
+#     #     [BLOCK_SIZE_K, BLOCK_SIZE_N]
+#     # )
+    
+#     #transposed : use self.W_q = self.W_q.contiguous().t()
+#     b_desc = tl.make_tensor_descriptor(
+#         b_ptr,
+#         [N, K],
+#         [stride_bn, stride_bk],
+#         [BLOCK_SIZE_N, BLOCK_SIZE_K]
+#     )
+        
+#     # # Precompute unpack shifts (vector length = elements_per_sample)
+#     # # shifts = [0, W_nbits, 2*W_nbits, ...]
+#     # shifts = (tl.arange(0, elements_per_sample) * W_nbits).to(tl.int32)
+
+#     # # Optional scalar zero
+#     # if zero_is_scalar:
+#     #     zero_scalar = tl.load(zeros_ptr, eviction_policy="evict_last")
+
+#     #############################################################################################################
+#     # Main loop
+#     for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+#         group_id = tile_id // width
+#         first_m = group_id * GROUP_SIZE_M
+#         gs = tl.minimum(grid_m - first_m, GROUP_SIZE_M)
+        
+#         pid_m = first_m + (tile_id % gs)
+#         pid_n = (tile_id % width) // gs
+
+#         rm = pid_m * BLOCK_SIZE_M
+#         rn = pid_n * BLOCK_SIZE_N
+
+#         # Accumulator
+#         acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+
+#         # Column indices for this tile (used for metadata + store)
+#         offs_n = rn + tl.arange(0, BLOCK_SIZE_N)
+#         n_mask = offs_n < N
+
+#         # K loop
+#         for k in tl.range(0, K, BLOCK_SIZE_K):
+#             a = tl.load_tensor_descriptor(a_desc, [rm, k])
+
+#             k_packed = k // elements_per_sample
+#             #b = tl.load_tensor_descriptor(b_desc, [k_packed, rn])
+#             b = tl.load_tensor_descriptor(b_desc, [rn, k_packed]).T #Transposed 
+
+#             acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype)
+
+#         #############################################################################################################
+#         # Channel-wise scaling
+#         offs_m = rm + tl.arange(0, BLOCK_SIZE_M)
+#         m_mask = offs_m < M
+#         if channel_scale_mode == 1:  # weight-only
+#             # expects a 1D per-N scale at scales_ptr (same as your original)
+#             scales_b = tl.load(scales_ptr + offs_n, mask=n_mask, other=1.0, eviction_policy=meta_evict_policy)
+#             acc = acc.to(meta_dtype) * scales_b[None, :]
+
+#         if channel_scale_mode == 2:  # activation-only
+#             scales_a = tl.load(scales_a_ptr + offs_m, mask=m_mask, other=1.0, eviction_policy=meta_evict_policy)
+#             acc = acc.to(meta_dtype) * scales_a[:, None]
+
+#         if channel_scale_mode == 3:  # weight + activation
+#             scales_a = tl.load(scales_a_ptr + offs_m, mask=m_mask, other=1.0, eviction_policy=meta_evict_policy)
+#             scales_b = tl.load(scales_ptr + offs_n, mask=n_mask, other=1.0, eviction_policy=meta_evict_policy)
+#             acc = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+
+#         acc = acc.to(output_dtype)
+
+#         #############################################################################################################
+#         # Store
+#         c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+#         mask = (m_mask[:, None] & n_mask[None, :])
+#         if EVEN_M and EVEN_N:
+#             tl.store(c_ptrs, acc)
+#         else:
+#             tl.store(c_ptrs, acc, mask=mask)
+
+# # Persistent version
+# NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
+# def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_5d: Tensor, scales_x: Tensor,
+#                 W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int, 
+#                 input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
+#                 channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id:int, 
+#                 ) -> Tensor:
+
+#     M = x.shape[0]
+#     K = W_q.shape[0] * elements_per_sample
+#     N = W_q.shape[1]
+#     M_CLOSEST = get_closest_m(M)
+#     load_scales_as_block = False
+    
+#     output = torch.empty((M, N), device=W_q.device, dtype=DTYPE_TO_TORCH[output_dtype])
+
+#     if scales_x is not None:
+#         stride_meta_a_m, stride_meta_a_g = scales_x.stride(0), scales_x.stride(1)
+#     else:
+#         stride_meta_a_m, stride_meta_a_g = 0, 0
+
+#     grid = (NUM_SMS,)
+
+#     gemm_INT_kernel_persistent_tma[grid](
+#         x, W_q, output, 
+#         scales, zeros, scales_x,
+#         M, N, K, M_CLOSEST,
+#         #############################################
+#         W_nbits, group_size, unpack_mask, elements_per_sample,
+#         type_id, x.dtype.itemsize, W_q.dtype.itemsize,
+#         ###############################################
+#         x.stride(0), x.stride(1),
+#         W_q.stride(0), W_q.stride(1),
+#         output.stride(0), output.stride(1),
+#         stride_meta_a_m, stride_meta_a_g,
+#         scales.stride(0), scales.stride(1),
+#         ################################################
+#         load_scales_as_block = load_scales_as_block,
+#         input_dtype  = DTYPE_TO_TRITON[input_dtype],
+#         output_dtype = TORCH_DTYPE_TO_TRITON[output.dtype],
+#         acc_dtype    = DTYPE_TO_TRITON[acc_dtype],
+#         meta_dtype   = DTYPE_TO_TRITON[meta_dtype],
+#         ################################################
+#         channel_scale_mode = channel_scale_mode,
+#         W_group_mode       = W_group_mode,
+#         zero_is_scalar     = zeros.numel() == 1,
+#         data_contiguous    = data_contiguous,
+#         NUM_SMS            = NUM_SMS,
+#     )
+
+
+#     return output
 
     
 class gemm:

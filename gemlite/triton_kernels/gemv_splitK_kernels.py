@@ -8,10 +8,10 @@ import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE
 from .utils import *
+from .utils import load_ptr
 
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
 MATMUL_TYPE   = "GEMV_SPLITK"
-NATIVE_ATOMIC = gpu_supports_bfloat16_atomicadd()
 
 def kernel_config_pruner(configs, nargs, **kwargs):
     global KEYS
@@ -30,12 +30,16 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             config     = copy.deepcopy(GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE][signature])
             num_stages = config.pop('num_stages')
             num_warps  = config.pop('num_warps')
-            num_ctas   = config.pop('num_ctas')
+            num_ctas   = config.pop('num_ctas', 1)
 
             config.pop('num_buffers_warp_spec', None)
             config.pop('num_consumer_groups', None)
             config.pop('reg_dec_producer', None)
             config.pop('reg_inc_consumer', None)
+
+            config['EVEN_M'] = (m % config['BLOCK_SIZE_M'] == 0)
+            config['EVEN_K'] = (k % config['BLOCK_SIZE_K'] == 0)
+            config['EVEN_N'] = (n % config['BLOCK_SIZE_N'] == 0)
 
             yield triton.Config(config,
                 num_stages=num_stages,
@@ -63,18 +67,23 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-        #K needs to be divisible by BLOCK_SIZE_K * SPLIT_K: TODO: without this, cuda-graphs breaks.
-        while block_size_k > 16 and not is_divisible(k, block_size_k * split_k):
-            block_size_k //=2
+        # #K needs to be divisible by BLOCK_SIZE_K * SPLIT_K: TODO: without this, cuda-graphs breaks.
+        # while block_size_k > 16 and not is_divisible(k, block_size_k * split_k):
+        #     block_size_k //=2
+        # block_size_k = min(block_size_k, 16)
 
-        #Skip blocks that are either too large or too small
-        block_area = (block_size_k // split_k) * block_size_n
-        if(block_area < 1024 or block_area > 4096 * 8): #128 * 8 * num_warps 
-            continue
+        # #Skip blocks that are either too large or too small
+        # block_area = (block_size_k // split_k) * block_size_n
+        # if(block_area < 1024 or block_area > 4096 * 8): #128 * 8 * num_warps 
+        #     continue
 
         #Block size should be compatible with minimum-packing
         if(block_size_k < e):
             continue
+
+        even_m = (m % block_size_m == 0)
+        even_n = (n % block_size_n == 0)
+        even_k = (k % block_size_k == 0)
 
         key = (block_size_m, block_size_n, block_size_k, group_size_m, split_k, A_load_order, dot_prod_mode, num_stages, num_warps)
         
@@ -86,6 +95,9 @@ def kernel_config_pruner(configs, nargs, **kwargs):
             'SPLIT_K'     : split_k,
             'A_load_order'  : A_load_order,
             'dot_prod_mode' : dot_prod_mode,
+            'EVEN_M': even_m,
+            'EVEN_N': even_n,
+            'EVEN_K': even_k,
         }
 
         if IS_HIP:
@@ -149,9 +161,7 @@ def get_fast_autotune_config_nvidia():
     return configs
 
 def get_default_config_nvidia():
-    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':2, 'BLOCK_SIZE_K':2048, 'GROUP_SIZE_M':8, 'SPLIT_K': 1, 
-                            'A_load_order':1, 'dot_prod_mode':0}, num_warps=4, num_stages=2)
-
+    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':2, 'BLOCK_SIZE_K':2048, 'GROUP_SIZE_M':8, 'SPLIT_K': 1, 'A_load_order':1, 'dot_prod_mode':0}, num_warps=4, num_stages=2)
     return [config]
 
 ########################################################################################################################################################################
@@ -241,7 +251,7 @@ else:
 def gemv_INT_splitK_kernel(
     a_ptr, b_ptr, c_ptr,
     scales_ptr, zeros_ptr, scales_a_ptr,
-    M, N, K, 
+    M, N: tl.constexpr, K: tl.constexpr, 
     ######### Quant parms #########
     W_nbits: tl.constexpr, 
     group_size: tl.constexpr, 
@@ -249,10 +259,16 @@ def gemv_INT_splitK_kernel(
     elements_per_sample: tl.constexpr,
     type_id: tl.constexpr,
     ######### Strides #########
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    stride_meta_g, stride_meta_n,
+    stride_am: tl.constexpr, 
+    stride_ak: tl.constexpr,
+    stride_bk: tl.constexpr, 
+    stride_bn: tl.constexpr,
+    stride_cm: tl.constexpr, 
+    stride_cn: tl.constexpr,
+    stride_meta_a_m: tl.constexpr, 
+    stride_meta_a_g: tl.constexpr,
+    stride_meta_g: tl.constexpr, 
+    stride_meta_n: tl.constexpr,
     ######### Dtypes #########
     input_dtype: tl.constexpr,
     output_dtype: tl.constexpr,
@@ -263,12 +279,19 @@ def gemv_INT_splitK_kernel(
     W_group_mode: tl.constexpr,
     zero_is_scalar: tl.constexpr,
     ######### tuning params #########
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr, SPLIT_K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, 
+    BLOCK_SIZE_N: tl.constexpr, 
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
     A_load_order: tl.constexpr, 
     dot_prod_mode: tl.constexpr,
     data_contiguous: tl.constexpr,
     dump_b_val: tl.constexpr = 0, #Improve accuracy mainly for A16W8 with post looop scaling
+    #################################
+    EVEN_M: tl.constexpr = False, 
+    EVEN_K: tl.constexpr = False, 
+    EVEN_N: tl.constexpr = False,
     #################################
     meta_evict_policy: tl.constexpr = '',
     atomic_mode: tl.constexpr = 'relaxed',
@@ -315,9 +338,10 @@ def gemv_INT_splitK_kernel(
 
     #Inputs
     a_ptrs  = a_ptr + (offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak)  
-    a_mask  = ((offs_am[:, None] < M) & (offs_ak[None, :] < K)).to(tl.int1)
     b_ptrs  = b_ptr + ((offs_bk[:, None] // elements_per_sample) * stride_bk + offs_bn[None, :] * stride_bn)
-
+    a_mask  = (offs_am[:, None] < M) & (offs_ak[None, :] < K)
+    b_mask  = (offs_bk[:, None] < K) & (offs_bn[None, :] < N)
+        
     #Meta data stuff
     q_shift = ((offs_k % elements_per_sample) * W_nbits).to(tl.int32)[:, None]
 
@@ -341,12 +365,12 @@ def gemv_INT_splitK_kernel(
     for k in range(num_pid_k):
 
         if(A_load_order == 0): #Early load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K)) 
 
-        b = tl.load(b_ptrs, eviction_policy=b_evict)
+        b = load_ptr(b_ptrs, b_mask, b_evict, not (EVEN_K and EVEN_N))
 
         if(A_load_order == 1): #Early load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict) 
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K)) 
 
         if(W_group_mode > 0):
             k_m = ((k * SPLIT_K + pid_k) * stride_mul).to(tl.int32) 
@@ -365,13 +389,13 @@ def gemv_INT_splitK_kernel(
             zeros = None
         
         if(A_load_order == 2): #Mid load
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
         # Unpack and dequantize
         b = dequantize(b, scales, zeros, q_shift, meta_dtype, unpack_mask, elements_per_sample, W_group_mode, zero_is_scalar)
 
         if(A_load_order == 3): #Late load 
-            a = tl.load(a_ptrs, mask=a_mask, other=0., eviction_policy=a_evict)
+            a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
 
         if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
 
@@ -383,6 +407,11 @@ def gemv_INT_splitK_kernel(
         #Advance
         a_ptrs += BLOCK_SIZE_K_U * stride_ak
         b_ptrs += BLOCK_SIZE_K_P * stride_bk
+        
+        #Update mask
+        if not EVEN_K:
+            a_mask = (offs_am[:, None] < M) & ((offs_ak[None, :] + (k + 1) * BLOCK_SIZE_K_U) < K)
+            b_mask = (offs_bk[:, None] + (k + 1) * BLOCK_SIZE_K_U < K) & (offs_bn[None, :] < N)
 
     if(dot_prod_mode == 0):
         acc = tl.sum(acc, axis=0, keep_dims=True) 
@@ -402,7 +431,7 @@ def gemv_INT_splitK_kernel(
 
     if(channel_scale_mode == 3): #weight + activation
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
-        scales_b = tl.load(scales_ptr   + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
+        scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N, other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
 
     ##################################################################
@@ -412,31 +441,45 @@ def gemv_INT_splitK_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_cn = tl.max_contiguous(tl.multiple_of(offs_cn, BLOCK_SIZE_N), BLOCK_SIZE_N)
     c_ptrs  = c_ptr + (offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn)
-    mask    = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
     if(SPLIT_K == 1):
-        tl.store(c_ptrs, acc, mask=mask) 
+        if EVEN_M and EVEN_N:
+            tl.store(c_ptrs, acc)
+        else:
+            mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.store(c_ptrs, acc, mask=mask)
     else:
-        tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
+        if EVEN_M and EVEN_N:
+            tl.atomic_add(c_ptrs, acc, sem=atomic_mode)
+        else:
+            mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tl.atomic_add(c_ptrs, acc, mask=mask, sem=atomic_mode) 
 
 
 def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x: Tensor,
                                                 W_nbits: int, group_size: int, unpack_mask: int, elements_per_sample: int,
                                                 input_dtype: int, output_dtype: int, acc_dtype: int, meta_dtype:int, 
                                                 channel_scale_mode: int, W_group_mode: int, data_contiguous: bool, type_id: int,
+                                                meta_scale: float = 0.0,
                                                 ) -> Tensor: 
     
     M, K, N = x.shape[0], x.shape[1], W_q.shape[1]
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
 
     native_atomic = True 
-    #native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or NATIVE_ATOMIC
+    #native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or gpu_supports_bfloat16_atomicadd()
     #WARNING: change this to the second check if SPLIT_K > 1 
     
     output = torch.empty((M, N), device=W_q.device, dtype=DTYPE_TO_TORCH[output_dtype] if native_atomic else torch.float32) 
     
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), META['SPLIT_K'])
 
+    device_index = W_q.device.index
+
+    if(scales_x is not None):
+        stride_meta_a_m, stride_meta_a_g = scales_x.stride(0), scales_x.stride(1)
+    else:
+        stride_meta_a_m, stride_meta_a_g = None, None
+        
     dtype = DTYPE_TO_TRITON[input_dtype]
     if(dtype in [tl.float16, tl.bfloat16, tl.float32]):
         acc_dtype = dtype
@@ -456,6 +499,7 @@ def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         x.stride(0), x.stride(1),
         W_q.stride(0), W_q.stride(1),
         output.stride(0), output.stride(1),
+        stride_meta_a_m, stride_meta_a_g,
         scales.stride(0), scales.stride(1),
         ################################################
         input_dtype  = DTYPE_TO_TRITON[input_dtype],
@@ -467,7 +511,7 @@ def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         W_group_mode       = W_group_mode,
         zero_is_scalar     = zeros.numel() == 1,
         data_contiguous    = data_contiguous,
-        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype == DType.FP16.value and W_nbits == 8) else 0, #Warning: Only use with INT8
+        dump_b_val         = 0.001 if(W_group_mode in [0, 1] and acc_dtype == tl.float16 and W_nbits == 8) else 0, #Warning: Only use with INT8
     )
 
     if(not native_atomic):
@@ -481,4 +525,3 @@ class gemv_splitK:
     matmul_type = MATMUL_TYPE
 
 __all__ = ["gemv_splitK"]
-

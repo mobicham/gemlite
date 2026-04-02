@@ -66,6 +66,10 @@ GEMLITE_MATMUL_TYPES         = [kernel.matmul_type for kernel in GEMLITE_TRITON_
 GEMLITE_MATMUL_TYPES_MAPPING = {GEMLITE_MATMUL_TYPES[i]: i for i in range(len(GEMLITE_MATMUL_TYPES))}
 GEMLITE_TRITON_CONFIG_CACHE  = {} #Global config cache for all the kernels
 _GROUP_SIZE_WARNED           = False
+GEMLITE_USE_TMA              = False # Set to False for faster MXFP8 on sm_120
+GEMLITE_ENABLE_PTX_FP4_PACK  = False # Set to True for hardware e2m1x2 FP4 packing (requires CUDA 13.0+ ptxas)
+GEMLITE_FAST_NVFP4           = False
+GEMLITE_NVFP4_META_SCALES    = []  # Pre-allocated per-GPU meta_scale tensors
 
 ###################################################################################
 #Utils
@@ -96,19 +100,68 @@ def set_acc_dtype(dtype):
     assert dtype in [DType.FP16, DType.FP32], "Invalid dtype (should be DType.FP16 or DType.FP32)."
     GEMLITE_ACC_DTYPE[DType.FP16] = dtype
 
+#Enable/disable TMA for MX kernel data loading
+def enable_tma(enabled: bool = True):
+    global GEMLITE_USE_TMA
+    GEMLITE_USE_TMA = enabled
+
+#Enable/disable BF16 native atomic add (disable for higher FP8/INT8 accuracy)
+def set_native_atomic_bfp16(enabled: bool = True):
+    from .triton_kernels import utils as _utils
+    _utils.GEMLITE_USE_NATIVE_ATOMIC_BFP16 = enabled
+
+#Enable/disable hardware PTX FP4 packing in activation quantization (requires CUDA 13.0+ ptxas)
+def set_ptx_fp4_pack(enabled: bool = True):
+    global GEMLITE_ENABLE_PTX_FP4_PACK
+    GEMLITE_ENABLE_PTX_FP4_PACK = enabled
+    from .quant_utils import set_ptx_fp4_pack_flag
+    set_ptx_fp4_pack_flag(enabled)
+
+
+# Auto-detect ptxas-blackwell version for hardware FP4 packing support
+def auto_detect_ptx_fp4_pack():
+    #TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.0/bin/ptxas for example.
+    try:
+        from triton.knobs import nvidia
+        major, minor = (int(x) for x in nvidia.ptxas_blackwell.version.split('.'))
+        if (major, minor) >= (13, 0):
+            set_ptx_fp4_pack(True)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+#Enable/disable CUDA graph-based autotuning (more accurate but slower)
+#Enable/disable fast NVFP4 mode (pre-allocated static meta_scale, skips dynamic computation)
+def set_fast_nvfp4(enabled: bool = True, default_value: float = 448.0):
+    global GEMLITE_FAST_NVFP4, GEMLITE_NVFP4_META_SCALES
+    GEMLITE_FAST_NVFP4 = enabled
+    if enabled and len(GEMLITE_NVFP4_META_SCALES) == 0:
+        num_gpus = torch.cuda.device_count()
+        GEMLITE_NVFP4_META_SCALES = [
+            torch.full((1,), fill_value=default_value, device=f"cuda:{i}", dtype=torch.float32)
+            for i in range(num_gpus)
+        ]
+
+def enable_cudagraph_autotune(enabled: bool = True):
+    set_autotune("fast", use_cuda_graph=enabled)
+
 #Return the default gemv kernel to use for M==1
 def get_default_gemv(W_nbits: int, mx_dtype: bool = False) -> str:
     #TODO: adapt mx for IS_HIP = True
     if mx_dtype: 
-        return 'GEMM_SPLITK' #TODO: fix mxf bugs in GEMV outputs garbage.
+        return 'GEMM_SPLITK' #TODO:'GEMV' if (W_nbits < 8) else 'GEMM_SPLITK' -> Revisit NVFP4 failing test.
     else:
         return 'GEMV_REVSPLITK' if (W_nbits < 8) else 'GEMV_SPLITK'
 
 #matmul type selection logic
 def get_matmul_type(batch_size: int, W_nbits: int, mx_dtype: bool = False):
-    if batch_size > 64:
+    gemm_limit = 64
+    if batch_size >= gemm_limit:
         return "GEMM"
-    if batch_size > 1:
+    gemv_limit = 4 if (W_nbits < 8 and not mx_dtype) else 2 # previous 1
+    if batch_size > gemv_limit:
         return "GEMM_SPLITK"
     else:
         return get_default_gemv(W_nbits, mx_dtype)
@@ -121,7 +174,7 @@ def enable_activation_scaling(batch_size):
     Only works with the MXFP format - use with A8W4_MXFP/A4W4_MXFP.
     """
     return True
-    #return batch_size >= 32
+    #return batch_size >= 2 #TODO: Needs Triton fix https://github.com/triton-lang/triton/pull/9577
 
 
 #Main functional forward call
@@ -155,6 +208,7 @@ def forward_functional(
     scaled_activations = bool(meta_args[0]) and enable_activation_scaling(batch_size)
     #Dynamic activation quantization
     scales_x = None
+    meta_scale = 0.0
     if(scaled_activations):
         input_dtype = DType(meta_args[5])
         channel_scale_mode = meta_args[9]
@@ -172,8 +226,15 @@ def forward_functional(
             x, scales_x = scale_activations_mxfp4(x)
 
         elif(input_dtype in [DType.NVFP4] and channel_scale_mode == 4): #NVPF4: TODO
-            x, scales_x = scale_activations_nvfp4(x)
+            meta_scale = tensor_args[3]
+            _static_meta = GEMLITE_NVFP4_META_SCALES[x.device.index] if GEMLITE_FAST_NVFP4 else None
+            x, scales_x, meta_scale_a = scale_activations_nvfp4(x, meta_scale=_static_meta)
+            meta_scale = 1.0 / (meta_scale * meta_scale_a)
     
+    # For weight-only NVFP4 (group_size=16): pass stored meta_scale to the kernel
+    if not scaled_activations and meta_args[2] == 16:
+        meta_scale = tensor_args[3]
+
     x = x.view(-1, x.shape[-1])
 
     if(matmul_type >= 0):
@@ -184,7 +245,7 @@ def forward_functional(
     out = (
         GEMLITE_TRITON_MAPPING[matmul_type_str]
         .forward(
-            x, *tensor_args, scales_x, *meta_args[1:-1], data_contiguous, type_id
+            x, *tensor_args[:3], scales_x, *meta_args[1:-1], data_contiguous, type_id, meta_scale=meta_scale
         )
         .view(out_shape)
     )
@@ -252,7 +313,7 @@ class GemLiteLinearTriton(torch.nn.Module):
 
         if in_features is not None and out_features is not None:
             if (in_features % GemLiteLinearTriton.MIN_SIZE != 0) or (
-                in_features % group_size != 0 if (group_size is not None) else False
+                (in_features % group_size != 0) if (group_size is not None and W_nbits < 16) else False
             ):
                 raise NotImplementedError(
                     "Invalid input shapes: "
@@ -298,6 +359,19 @@ class GemLiteLinearTriton(torch.nn.Module):
         #Default forward        
         self.forward = self.forward_auto_no_warmup
 
+        #Meta-scale for NVFP4 (0.0 = not used)
+        self.meta_scale = 0.0
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # Rebuild metadata from live attributes to ensure consistency
+        # (helpers may override channel_scale_mode/W_group_mode after pack())
+        if hasattr(self, 'metadata') and self.metadata is not None and hasattr(self, 'W_nbits'):
+            self.metadata = torch.nn.Parameter(
+                torch.tensor(self.get_meta_args(), device=self.W_q.device if isinstance(self.W_q, (torch.Tensor, torch.nn.Parameter)) else 'cpu', dtype=torch.int32),
+                requires_grad=False,
+            )
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
         self.W_q        = state_dict.pop("W_q", None)
         self.bias       = state_dict.pop("bias", None)
@@ -305,9 +379,10 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.zeros      = state_dict.pop("zeros", None)
         self.metadata   = state_dict.pop("metadata", None)
         self.orig_shape = state_dict.pop("orig_shape", None)
+        _meta_scale     = state_dict.pop("meta_scale", None)
 
         self.metadata   = [v.item() for v in self.metadata]
-        self.orig_shape = (v.item() for v in self.orig_shape)
+        self.orig_shape = tuple(v.item() for v in self.orig_shape)
 
         (self.scaled_activations,
         self.W_nbits,
@@ -327,10 +402,50 @@ class GemLiteLinearTriton(torch.nn.Module):
         self.acc_dtype    = DType(self.acc_dtype)
         self.meta_dtype   = DType(self.meta_dtype)
 
+        # Restore meta_scale with backward compat for old checkpoints
+        if _meta_scale is not None:
+            self.meta_scale = _meta_scale.float()
+        else:
+            self.meta_scale = 0.05 if self.input_dtype == DType.NVFP4 else 0.0  # backward compat default for old checkpoints
+
         self.out_features, self.in_features = self.orig_shape
         self.compute_dtype = DTYPE_TO_TORCH[self.input_dtype.value]
         self.scaled_activations = bool(self.scaled_activations)
         self.data_contiguous = bool(self.data_contiguous)
+        
+        # Backward compat: pop stale scales_5d from old saves
+        state_dict.pop("scales_5d", None)
+        # Convert 2D scales to 5D TMA layout for MX dtypes
+        if is_mx_dtype(self.input_dtype) and self.scales is not None:
+            s = self.scales.data if isinstance(self.scales, torch.nn.Parameter) else self.scales
+            if s.ndim == 2:
+                s_2d = s.contiguous()  # [N, K_S] contiguous (matches pack's self.scales.T.contiguous())
+                N_dim, K_S = s_2d.shape[0], s_2d.shape[1]
+                if GEMLITE_USE_TMA and self.elements_per_sample > 1 and N_dim % 128 == 0 and K_S % 4 == 0:
+                    self.scales = s_2d.reshape(N_dim // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N_dim // 128, K_S // 4, 2, 256).contiguous()
+
+        # Re-register tensors as nn.Parameter for proper state_dict / .to() / .parameters() support
+        _device = self.W_q.device
+        self.W_q = torch.nn.Parameter(self.W_q, requires_grad=False)
+        self.bias = torch.nn.Parameter(self.bias, requires_grad=False) if self.bias is not None else None
+        self.scales = torch.nn.Parameter(self.scales, requires_grad=False)
+        self.zeros = torch.nn.Parameter(self.zeros, requires_grad=False)
+        self.metadata = torch.nn.Parameter(
+            torch.tensor(self.get_meta_args(), device=_device, dtype=torch.int32),
+            requires_grad=False,
+        )
+        self.orig_shape = torch.nn.Parameter(
+            torch.tensor([self.out_features, self.in_features], device=_device, dtype=torch.int32),
+            requires_grad=False,
+        )
+        if not isinstance(self.meta_scale, torch.nn.Parameter):
+            _ms = self.meta_scale.item() if isinstance(self.meta_scale, torch.Tensor) else float(self.meta_scale)
+            self.meta_scale = torch.nn.Parameter(
+                torch.tensor(_ms, device=_device, dtype=torch.float32),
+                requires_grad=False,
+            )
+
+
 
     #Make sure to feed UINT8 W_q for packing
     def pack(
@@ -342,6 +457,7 @@ class GemLiteLinearTriton(torch.nn.Module):
         fma_mode: bool = True,
         contiguous: Union[int, None] = None,
         packing_bitwidth: Union[int, None] = None,
+        packed: bool = False,
     ):  
 
         #Check inputs
@@ -380,8 +496,18 @@ class GemLiteLinearTriton(torch.nn.Module):
             if(contiguous is None): 
                 contiguous = False
 
+        # Pre-packed weights (already nibble-packed, shape [N, K//elements_per_sample])
+        if packed and W_q.dtype == torch.uint8:
+            if packing_bitwidth is None:
+                packing_bitwidth = 8 if is_mx_dtype(self.input_dtype) else GemLiteLinearTriton.PACKING_BITWIDTH
+            self.elements_per_sample = packing_bitwidth // self.W_nbits
+            self.W_q = W_q.view(self.out_features, self.in_features // self.elements_per_sample).t()
+
+            if contiguous is None:
+                contiguous = not is_mx_dtype(self.input_dtype)
+
         # Packed weigths
-        if W_q.dtype == torch.uint8:  
+        elif W_q.dtype == torch.uint8:  
             _pack_weights_over_cols = pack_weights_over_cols_triton if (W_q.device.type == "cuda") else pack_weights_over_cols_torch
 
             self.W_q, self.elements_per_sample = _pack_weights_over_cols(
@@ -399,7 +525,7 @@ class GemLiteLinearTriton(torch.nn.Module):
 
         if(self.W_q is None):
             raise Exception('Weights were not packed, please check your W_q.dtype')
-
+        
         #Bias / device
         self.device = self.W_q.device
         self.bias = None if (bias is None) else bias.to(device=self.device)
@@ -492,9 +618,29 @@ class GemLiteLinearTriton(torch.nn.Module):
         if(self.input_dtype in [DType.NVFP4]):
             self.scales = self.scales.to(torch.float8_e4m3fn)
         if(is_mx_dtype(self.input_dtype)):
-            self.scales = self.scales.T
             self.W_group_mode = 2
             self.channel_scale_mode = 0
+            
+            ################################
+            # TMA
+            K, N = self.W_q.shape
+            
+            if(self.input_dtype in [DType.MXFP4, DType.NVFP4]):
+                K *= 2
+                group_size = 2 * self.W_q.numel() // self.scales.numel()
+            else:
+                group_size = self.W_q.numel() // self.scales.numel()
+            
+            # Preshuffle weight scales to 5D TMA layout for fast loading
+            # Original: [K_S, N] -> transpose to [N, K_S] -> 5D: [1, N//128, K_S//4, 2, 256]
+            K_S = K // group_size
+            if GEMLITE_USE_TMA and self.elements_per_sample > 1 and N % 128 == 0 and K_S % 4 == 0:
+                # Currently TMA only enabled for MXFP4/NVFP4 NOT for MXFP8 because of poor performance on sm_120 (self.elements_per_sample > 1 check)
+                self.scales = self.scales.T.contiguous().reshape(N // 128, 4, 32, K_S // 4, 4).permute(0, 3, 2, 1, 4).reshape(1, N // 128, K_S // 4, 2, 256).contiguous()
+            else:
+                # Keep 2D transposed layout for pointer-based fallback
+                self.scales = self.scales.T
+            ################################
 
         if(self.scales is not None):
             self.meta_dtype = TORCH_TO_DTYPE[self.scales.dtype]
@@ -516,11 +662,20 @@ class GemLiteLinearTriton(torch.nn.Module):
             requires_grad=False,
         )
         
+
+        self.meta_scale = torch.nn.Parameter(
+            torch.tensor(self.meta_scale, device=self.device, dtype=torch.float32),
+            requires_grad=False,
+        )
+
         return self
 
     #Return the main arguments
     def get_tensor_args(self):
-        return [self.W_q, self.scales, self.zeros]
+        meta_scale = self.meta_scale
+        if not isinstance(meta_scale, torch.Tensor):
+            meta_scale = torch.tensor(meta_scale, dtype=torch.float32, device=self.W_q.device)
+        return [self.W_q, self.scales, self.zeros, meta_scale]
 
     def get_meta_args(self):
         return [int(self.scaled_activations),

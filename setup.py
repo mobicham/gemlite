@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 setup(
     name='gemlite',
-    version="0.5.1.post1",
+    version="0.6.0",
     url="https://github.com/mobiusml/gemlite/",
     author="Dr. Hicham Badri",
     author_email="hicham@mobiuslabs.com",
@@ -11,7 +11,7 @@ setup(
         "gemlite": ["gemlite/*.py", "configs/*.json"],
     },
     include_package_data=True,
-    install_requires=["numpy", "tqdm"],
+    install_requires=["numpy", "tqdm", "triton>=3.6.0"],
 )
 
 # python3 setup.py install
