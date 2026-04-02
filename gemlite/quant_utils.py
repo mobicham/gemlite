@@ -235,7 +235,7 @@ class WeightQuantizerMXFP:
 #INT8 / FP8 activations
 ####################################################################################################################
 def prune_large_blocks(configs, named_args, **kwargs):
-    M = named_args['M']
+    M = named_args.get('M_CLOSEST', named_args.get('M'))
     
     pruned = []
     for config in configs:
@@ -383,12 +383,12 @@ def scale_activations_per_token_triton_v1(
         triton.Config({'BLOCK_SIZE_M': 2}, num_warps=8, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 4}, num_warps=8, num_stages=1),
     ],
-    key=['M', 'K']
+    key=['M_CLOSEST', 'K']
 )
 @triton.jit
 def scale_activations_per_token_triton_v2_kernel(
-    tensor_ptr, scale_ptr, y_ptr, 
-    M, K,
+    tensor_ptr, scale_ptr, y_ptr,
+    M, K, M_CLOSEST,
     stride_m: tl.constexpr, 
     stride_k: tl.constexpr, 
     stride_sm: tl.constexpr,
@@ -443,9 +443,10 @@ def scale_activations_per_token_triton_v2(
     BLOCK_SIZE_K = triton.next_power_of_2(K)
     ROUND = not w_dtype.is_floating_point
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_per_token_triton_v2_kernel[grid](
         tensor, scales, y,
-        M, K,
+        M, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0),
         min_val=min_val, max_val=max_val,
@@ -461,12 +462,12 @@ def scale_activations_per_token_triton_v2(
         triton.Config({'BLOCK_SIZE_M': 2}, num_warps=8, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 4}, num_warps=8, num_stages=1),
     ],
-    key=['M', 'K']
+    key=['M_CLOSEST', 'K']
 )
 @triton.jit
 def scale_activations_per_token_triton_v3_kernel(
-    tensor_ptr, scale_ptr, y_ptr, 
-    M, K,
+    tensor_ptr, scale_ptr, y_ptr,
+    M, K, M_CLOSEST,
     stride_m: tl.constexpr, 
     stride_k: tl.constexpr, 
     stride_sm: tl.constexpr,
@@ -524,9 +525,10 @@ def scale_activations_per_token_triton_v3(
     BLOCK_SIZE_K = triton.next_power_of_2(K)
     ROUND = not w_dtype.is_floating_point
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_per_token_triton_v3_kernel[grid](
         tensor, scales, y,
-        M, K,
+        M, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0),
         min_val=min_val, max_val=max_val,
@@ -546,7 +548,7 @@ def scale_activations_per_token_triton_v3(
         triton.Config({"BLOCK_SIZE_M": 4, "BLOCK_SIZE_K": 2048}, num_warps=8, num_stages=2),
         triton.Config({"BLOCK_SIZE_M": 4, "BLOCK_SIZE_K": 4096}, num_warps=8, num_stages=2),
     ],
-    key=["M", "K"],
+    key=["M_CLOSEST", "K"],
 )
 @triton.jit
 def scale_activations_per_token_triton_v4_kernel(
@@ -555,6 +557,7 @@ def scale_activations_per_token_triton_v4_kernel(
     y_ptr,
     M,
     K,
+    M_CLOSEST,
     stride_m: tl.constexpr,
     stride_k: tl.constexpr,
     stride_sm: tl.constexpr,
@@ -631,12 +634,14 @@ def scale_activations_per_token_triton_v4(
 
     ROUND = not w_dtype.is_floating_point
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_per_token_triton_v4_kernel[grid](
         tensor,
         scales,
         y,
         M,
         K,
+        M_CLOSEST,
         tensor.stride(0),
         tensor.stride(1),
         scales.stride(0),
@@ -913,7 +918,7 @@ def scale_activations_mxfp8_triton_v2(
         triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_SIZE_M': 128}, num_warps=4, num_stages=3),
     ],
-    key=['M', 'K'],
+    key=['M_CLOSEST', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks},
 )
 @triton.jit
@@ -921,7 +926,7 @@ def scale_activations_mxfp8_triton_kernel_v3(
     tensor_ptr,
     out_ptr,
     scales_ptr,
-    M, K,
+    M, K, M_CLOSEST,
     #########################
     stride_m_t: tl.constexpr, 
     stride_k_t: tl.constexpr,
@@ -988,11 +993,12 @@ def scale_activations_mxfp8_triton_v3(
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_mxfp8_triton_kernel_v3[grid](
         tensor,
         out,
         scales,
-        M, K, 
+        M, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),
@@ -1012,13 +1018,13 @@ def scale_activations_mxfp8_triton_v3(
         triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_K': 256}, num_warps=8, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_K': 256}, num_warps=8, num_stages=1),
     ],
-    key=['M', 'K'],
+    key=['M_CLOSEST', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks},
 )
 @triton.jit
 def scale_activations_mxfp8_triton_kernel_v4(
     tensor_ptr, out_ptr, scales_ptr,
-    M, M_padded, K,
+    M, M_padded, K, M_CLOSEST,
     stride_m_t: tl.constexpr, stride_k_t: tl.constexpr,
     stride_m_o: tl.constexpr, stride_k_o: tl.constexpr,
     stride_m_s: tl.constexpr, stride_k_s: tl.constexpr,
@@ -1106,9 +1112,10 @@ def scale_activations_mxfp8_triton_v4(
 
     grid = lambda meta: (min(NUM_SMS, triton.cdiv(M, meta['BLOCK_SIZE_M'])),)
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_mxfp8_triton_kernel_v4[grid](
         tensor, out, scales,
-        M, M_padded, K,
+        M, M_padded, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         out.stride(0), out.stride(1),
         scales.stride(0), scales.stride(1),
@@ -1225,7 +1232,7 @@ def scale_activations_nvfp4_torch(tensor: Tensor, meta_scale=None) -> Tuple[Tens
         triton.Config({'BLOCK_SIZE_M': 32}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_SIZE_M': 64}, num_warps=4, num_stages=3),
     ],
-    key=['M', 'K'],
+    key=['M_CLOSEST', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks},
 )
 @triton.jit
@@ -1234,7 +1241,7 @@ def scale_activations_mxfp4_triton_kernel(
     out_ptr,
     scales_ptr,
     thr_pos_ptr,
-    M, K,
+    M, K, M_CLOSEST,
     #########################
     stride_m_t: tl.constexpr, 
     stride_k_t: tl.constexpr,
@@ -1322,12 +1329,13 @@ def scale_activations_mxfp4_triton(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_mxfp4_triton_kernel[grid](
         tensor,
         out,
         scales,
         thr_pos[device_index],
-        M, K, 
+        M, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),
@@ -1348,7 +1356,7 @@ def scale_activations_mxfp4_triton(tensor: Tensor) -> Tuple[Tensor, Tensor]:
         triton.Config({'BLOCK_SIZE_M': 16}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_SIZE_M': 128}, num_warps=4, num_stages=3),
     ],
-    key=['M', 'K'],
+    key=['M_CLOSEST', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks},
 )
 @triton.jit
@@ -1357,7 +1365,7 @@ def scale_activations_nvfp4_triton_kernel(
     out_ptr,
     scales_ptr,
     thr_pos_ptr,
-    M, K,
+    M, K, M_CLOSEST,
     #########################
     stride_m_t: tl.constexpr, 
     stride_k_t: tl.constexpr,
@@ -1454,12 +1462,13 @@ def scale_activations_nvfp4_triton(tensor: torch.Tensor, meta_scale=None) -> Tup
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_nvfp4_triton_kernel[grid](
         tensor,
         out,
         scales,
         thr_pos[device_index],
-        M, K, 
+        M, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),
@@ -1481,13 +1490,13 @@ def scale_activations_nvfp4_triton(tensor: torch.Tensor, meta_scale=None) -> Tup
         triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_K': 128}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_K': 128}, num_warps=8, num_stages=1),
     ],
-    key=['M', 'K'],
+    key=['M_CLOSEST', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks},
 )
 @triton.jit
 def scale_activations_mxfp4_triton_kernel_v2(
     tensor_ptr, out_ptr, scales_ptr, thr_pos_ptr,
-    M, M_padded, K,
+    M, M_padded, K, M_CLOSEST,
     stride_m_t: tl.constexpr, stride_k_t: tl.constexpr,
     stride_m_s: tl.constexpr, stride_k_s: tl.constexpr,
     stride_m_o: tl.constexpr, stride_k_o: tl.constexpr,
@@ -1575,9 +1584,10 @@ def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     grid = lambda meta: (min(NUM_SMS, triton.cdiv(M, meta['BLOCK_SIZE_M'])),)
     device_index = tensor.device.index
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_mxfp4_triton_kernel_v2[grid](
         tensor, out, scales, thr_pos[device_index],
-        M, M_padded, K,
+        M, M_padded, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),
@@ -1598,13 +1608,13 @@ def scale_activations_mxfp4_triton_v2(tensor: Tensor) -> Tuple[Tensor, Tensor]:
         triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_K': 128}, num_warps=4, num_stages=1),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_K': 128}, num_warps=8, num_stages=1),
     ],
-    key=['M', 'K'],
+    key=['M_CLOSEST', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks},
 )
 @triton.jit
 def scale_activations_nvfp4_triton_kernel_v2(
     tensor_ptr, out_ptr, scales_ptr, thr_pos_ptr,
-    M, M_padded, K,
+    M, M_padded, K, M_CLOSEST,
     stride_m_t: tl.constexpr, stride_k_t: tl.constexpr,
     stride_m_s: tl.constexpr, stride_k_s: tl.constexpr,
     stride_m_o: tl.constexpr, stride_k_o: tl.constexpr,
@@ -1699,9 +1709,10 @@ def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor, meta_scale=None) -> 
     grid = lambda meta: (min(NUM_SMS, triton.cdiv(M, meta['BLOCK_SIZE_M'])),)
     device_index = tensor.device.index
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_nvfp4_triton_kernel_v2[grid](
         tensor, out, scales, thr_pos[device_index],
-        M, M_padded, K,
+        M, M_padded, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),
@@ -1725,7 +1736,7 @@ def scale_activations_nvfp4_triton_v2(tensor: torch.Tensor, meta_scale=None) -> 
         triton.Config({'BLOCK_SIZE_M': 16},  num_warps=4, num_stages=2),
         triton.Config({'BLOCK_SIZE_M': 64},  num_warps=4, num_stages=3),
     ],
-    key=['M', 'K'],
+    key=['M_CLOSEST', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks},
 )
 @triton.jit
@@ -1734,7 +1745,7 @@ def scale_activations_mxfp4_triton_kernel_v3(
     out_ptr,
     scales_ptr,
     thr_pos_ptr,
-    M, K,
+    M, K, M_CLOSEST,
     #########################
     stride_m_t: tl.constexpr,
     stride_k_t: tl.constexpr,
@@ -1813,12 +1824,13 @@ def scale_activations_mxfp4_triton_v3(tensor: Tensor) -> Tuple[Tensor, Tensor]:
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_mxfp4_triton_kernel_v3[grid](
         tensor,
         out,
         scales,
         thr_pos[device_index],
-        M, K,
+        M, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),
@@ -1842,7 +1854,7 @@ def scale_activations_mxfp4_triton_v3(tensor: Tensor) -> Tuple[Tensor, Tensor]:
         triton.Config({'BLOCK_SIZE_M': 32},  num_warps=4, num_stages=2),
         triton.Config({'BLOCK_SIZE_M': 64},  num_warps=4, num_stages=3),
     ],
-    key=['M', 'K'],
+    key=['M_CLOSEST', 'K'],
     prune_configs_by={'early_config_prune': prune_large_blocks},
 )
 @triton.jit
@@ -1851,7 +1863,7 @@ def scale_activations_nvfp4_triton_kernel_v3(
     out_ptr,
     scales_ptr,
     thr_pos_ptr,
-    M, K,
+    M, K, M_CLOSEST,
     #########################
     stride_m_t: tl.constexpr,
     stride_k_t: tl.constexpr,
@@ -1939,12 +1951,13 @@ def scale_activations_nvfp4_triton_v3(tensor: torch.Tensor, meta_scale=None) -> 
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(K, group_size))
     device_index = tensor.device.index
 
+    M_CLOSEST = get_closest_m(M)
     scale_activations_nvfp4_triton_kernel_v3[grid](
         tensor,
         out,
         scales,
         thr_pos[device_index],
-        M, K,
+        M, K, M_CLOSEST,
         tensor.stride(0), tensor.stride(1),
         scales.stride(0), scales.stride(1),
         out.stride(0), out.stride(1),
