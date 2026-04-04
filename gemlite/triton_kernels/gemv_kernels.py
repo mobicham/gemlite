@@ -6,7 +6,7 @@ from torch import Tensor
 import triton
 import triton.language as tl
 from ..dtypes import is_mx_dtype
-from .config import AUTOTUNE, KERNEL
+from .config import AUTOTUNE, KERNEL_CACHE
 from .utils import *
 from .utils import load_ptr
 
@@ -209,7 +209,6 @@ def get_default_config_amd():
     config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':32, 'BLOCK_SIZE_K':16, 'A_load_order':0, 'dot_prod_mode':0, 'NUM_STAGES':1}, num_warps=1, num_stages=1)
     return [config]
 ########################################################################################################################################################################
-KERNEL_CACHE = {}
 
 if IS_HIP:
     get_max_autotune_config = get_max_autotune_config_amd
@@ -598,7 +597,6 @@ def gemv_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
                                          meta_scale: float = 0.0,
                                          ) -> Tensor:
     
-    global KERNEL_CACHE
 
     M, K, N = x.shape[0], x.shape[1], W_q.shape[1]
     #assert K == W_q.shape[0] * elements_per_sample, "Invalid Input Shapes"
@@ -606,19 +604,27 @@ def gemv_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
     native_atomic = (output_dtype in [DType.FP16.value, DType.FP32.value]) or gpu_supports_bfloat16_atomicadd()
     kernel_output_dtype = (DTYPE_TO_TORCH[output_dtype] if native_atomic else torch.float32)
 
-    if KERNEL.ENABLE_CACHING and M == 1:
-        if (M, N) not in KERNEL_CACHE:
-            KERNEL_CACHE[(M, N)] = {
-                "data": torch.empty((KERNEL.CACHE_SIZE, M, N), device=W_q.device, dtype=kernel_output_dtype),
+    if KERNEL_CACHE.ENABLE and M == 1:
+        if (M, N) not in KERNEL_CACHE.CACHE:
+            KERNEL_CACHE.CACHE[(M, N)] = {
+                "data": torch.empty((KERNEL_CACHE.CACHE_SIZE, M, N), device=W_q.device, dtype=kernel_output_dtype),
                 "ptr": 0,
             }
 
-        entry = KERNEL_CACHE[(M, N)]
-        if entry["ptr"] % KERNEL.CACHE_SIZE == 0:
+        entry = KERNEL_CACHE.CACHE[(M, N)]
+        # CUDA graph capture: reset ptr once per entry so batch-zero gets captured
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and not entry.get("_capture_reset", False):
+            entry["ptr"] = 0
+            entry["_capture_reset"] = True
+        elif not capturing:
+            entry["_capture_reset"] = False
+
+        if entry["ptr"] % KERNEL_CACHE.CACHE_SIZE == 0:
             entry["data"].zero_()
             entry["ptr"] = 0
 
-        output = entry["data"][entry["ptr"] % KERNEL.CACHE_SIZE]
+        output = entry["data"][entry["ptr"] % KERNEL_CACHE.CACHE_SIZE]
         entry["ptr"] += 1
         use_prehook = False
     else:

@@ -16,9 +16,10 @@ class AUTOTUNE:
 	GEMM           = "fast"
 	USE_CUDA_GRAPH = False
 
-class KERNEL:
-	ENABLE_CACHING = False
-	CACHE_SIZE     = 256 
+class KERNEL_CACHE:
+	ENABLE = False
+	CACHE_SIZE     = 256
+	CACHE          = {} 
 
 def reload_all_modules():
 	#Avoid circular imports
@@ -37,7 +38,7 @@ def reload_all_modules():
 	imp.reload(gemv_revsplitK_kernels)
 
 def set_kernel_caching(enable: bool):
-	KERNEL.ENABLE_CACHING = enable
+	KERNEL_CACHE.ENABLE = enable
 
 def set_autotune(config: Union[dict, str, bool], **kwargs):
 	if(type(config) == str):
