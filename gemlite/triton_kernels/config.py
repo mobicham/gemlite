@@ -17,9 +17,9 @@ class AUTOTUNE:
 	USE_CUDA_GRAPH = False
 
 class KERNEL_CACHE:
-	ENABLE = False
-	CACHE_SIZE     = 256
-	CACHE          = {} 
+	ENABLE     = False
+	CACHE_SIZE = 256
+	CACHE      = {} 
 
 def reload_all_modules():
 	#Avoid circular imports
