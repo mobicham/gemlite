@@ -172,6 +172,17 @@ def _get_flashinfer():
         return False, "flashinfer not installed (pip install flashinfer)"
 
 
+def _get_flashinfer_fp8_block():
+    """Check if flashinfer with FP8 groupwise block GEMM is available."""
+    try:
+        from flashinfer.gemm import gemm_fp8_nt_groupwise
+        return True, None
+    except ImportError:
+        return False, "flashinfer not installed (pip install flashinfer)"
+    except Exception as e:
+        return False, f"flashinfer_fp8_block import error: {e}"
+
+
 # ---- custom_op wrappers for torch.compile compatibility ----
 @torch.library.custom_op("flashinfer_bench::nvfp4_quantize", mutates_args=())
 def _nvfp4_quantize_op(
@@ -269,6 +280,80 @@ def patch_model_flashinfer_nvfp4(model):
             model[i] = FlashinferNVFP4Dynamic(layer)
 
 
+###########################################################################################################################
+# flashinfer FP8 block-quant reference (BxB weight blocks, per-row per-B-K activation blocks)
+###########################################################################################################################
+from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE as _FI_B
+
+# Only the flashinfer CUDA kernel is wrapped in custom_op (torch.compile cannot trace it).
+# Activation quantization is pure PyTorch and stays in the compiled graph so inductor can fuse it.
+@torch.library.custom_op("flashinfer_bench::fp8_block_gemm", mutates_args=())
+def _fp8_block_gemm_op(
+    a_fp8: torch.Tensor, b_fp8: torch.Tensor,
+    a_scale: torch.Tensor, b_scale: torch.Tensor,
+) -> torch.Tensor:
+    from flashinfer.gemm import gemm_fp8_nt_groupwise
+    B = _FI_B
+    return gemm_fp8_nt_groupwise(
+        a=a_fp8, b=b_fp8,
+        a_scale=a_scale, b_scale=b_scale,
+        scale_major_mode="K",
+        scale_granularity_mnk=(1, B, B),
+        out_dtype=torch.bfloat16,
+    )
+
+@torch.library.register_fake("flashinfer_bench::fp8_block_gemm")
+def _fp8_block_gemm_fake(
+    a_fp8: torch.Tensor, b_fp8: torch.Tensor,
+    a_scale: torch.Tensor, b_scale: torch.Tensor,
+):
+    M, K = a_fp8.shape
+    N = b_fp8.shape[0]
+    return torch.empty(M, N, device=a_fp8.device, dtype=torch.bfloat16)
+
+
+class FlashinferFP8BlockDynamic(torch.nn.Module):
+    """
+    FP8 block-quant (BxB weights, 1xB activations) via flashinfer's gemm_fp8_nt_groupwise.
+    B is controlled by gemlite.triton_kernels.config.BLOCK_QUANT_SIZE.
+    Activation quantization is pure PyTorch so torch.compile/inductor can fuse it.
+    """
+    def __init__(self, linear_layer: torch.nn.Linear):
+        super().__init__()
+        B = _FI_B
+        w = linear_layer.weight.data            # (N, K) bf16/fp16
+        N, K = w.shape
+        assert K % B == 0 and N % B == 0, (
+            f"flashinfer_fp8_block requires K ({K}) and N ({N}) divisible by {B}"
+        )
+        self.N, self.K, self.B = N, K, B
+        self.max_val = torch.finfo(torch.float8_e4m3fn).max
+        w_f32 = w.to(torch.float32)
+        # Per (B x B) weight block amax -> scale
+        w_blk = w_f32.view(N // B, B, K // B, B)
+        amax = w_blk.abs().amax(dim=(1, 3))                      # [N//B, K//B]
+        scales = (amax / self.max_val).clamp_(min=1e-6)          # [N//B, K//B] fp32
+        w_q = (w_blk / scales[:, None, :, None]).clamp_(-self.max_val, self.max_val)
+        w_fp8 = w_q.to(torch.float8_e4m3fn).view(N, K).contiguous()
+        self.register_buffer("w_fp8", w_fp8)
+        self.register_buffer("b_scale", scales.contiguous())    # [N//B, K//B]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Per-row, per-B-K block activation quant (pure PyTorch, stays in the compiled graph).
+        B = self.B
+        M, K = x.shape
+        x_blk = x.to(torch.float32).view(M, K // B, B)
+        a_scale = (x_blk.abs().amax(dim=-1) / self.max_val).clamp_(min=1e-6)  # [M, K//B]
+        x_fp8 = (x_blk / a_scale.unsqueeze(-1)).clamp_(-self.max_val, self.max_val).to(torch.float8_e4m3fn).view(M, K)
+        return torch.ops.flashinfer_bench.fp8_block_gemm(x_fp8, self.w_fp8, a_scale, self.b_scale)
+
+
+def patch_model_flashinfer_fp8_block(model):
+    for i, layer in enumerate(model):
+        if isinstance(layer, torch.nn.Linear):
+            model[i] = FlashinferFP8BlockDynamic(layer)
+
+
 
 ###########################################################################################################################
 def run_benchmark(proc_name, M, K, N):
@@ -301,6 +386,38 @@ def run_benchmark(proc_name, M, K, N):
         perf_time_ms = eval_model(model, M_padded, K) / repeat
         tflops = get_flops(M, K, N, perf_time_ms)
         label = "flashinfer NVFP4 (dynamic)"
+        if M_padded != M:
+            print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s  (M padded to {M_padded} internally)")
+        else:
+            print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s")
+
+        cleanup(model)
+        _inductor_config.triton.cudagraph_trees = old_cudagraph
+        return (label, M, K, N, tflops)
+
+    # ---- flashinfer FP8 block-quant dynamic (BxB weights, 1xB activations) ----
+    if proc_name == "flashinfer_fp8_block_dynamic":
+        has_fi_fp8, fi_fp8_err = _get_flashinfer_fp8_block()
+        if not has_fi_fp8:
+            print(f"  Skipping {proc_name}: {fi_fp8_err}")
+            return None
+        from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE as _B
+        if K % _B != 0 or N % _B != 0:
+            print(f"  Skipping {proc_name}: K ({K}) and N ({N}) must be divisible by {_B}")
+            return None
+        old_cudagraph = _inductor_config.triton.cudagraph_trees
+        _inductor_config.triton.cudagraph_trees = False
+
+        # flashinfer's FP8 groupwise kernel requires M to be a multiple of 4.
+        M_padded = ((M + 3) // 4) * 4
+
+        model = get_model(K, N, repeat=repeat)
+        patch_model_flashinfer_fp8_block(model)
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+
+        perf_time_ms = eval_model(model, M_padded, K) / repeat
+        tflops = get_flops(M, K, N, perf_time_ms)
+        label = "flashinfer FP8 block (dynamic)"
         if M_padded != M:
             print(f"  {label} | {M}, {K}, {N} | {tflops:.2f} TFLOP/s  (M padded to {M_padded} internally)")
         else:
@@ -348,6 +465,8 @@ def run_benchmark(proc_name, M, K, N):
         "A16W4_HQQ_INT": lambda: A16W4_HQQ_INT(),
         "A8W8_INT8_dynamic": lambda: A8W8_INT8_dynamic(),
         "A8W8_FP8_dynamic": lambda: A8W8_FP8_dynamic(),
+        "A8W8_INT8_block_dynamic": lambda: A8W8_INT8_dynamic(block_quant=True),
+        "A8W8_FP8_block_dynamic": lambda: A8W8_FP8_dynamic(block_quant=True),
         "A8W8_MXFP_dynamic_post_scale": lambda: A8W8_MXFP_dynamic(dtype=dtype, post_scale=True),
         "A8W8_MXFP_dynamic": lambda: A8W8_MXFP_dynamic(dtype=dtype, post_scale=False),
         "A4W4_MXFP_dynamic": lambda: A4W4_MXFP_dynamic(dtype=dtype),
@@ -383,6 +502,8 @@ ALL_PROCESSORS = [
     "A16W4_HQQ_INT",
     "A8W8_INT8_dynamic",
     "A8W8_FP8_dynamic",
+    "A8W8_INT8_block_dynamic",
+    "A8W8_FP8_block_dynamic",
     "A8W8_MXFP_dynamic_post_scale",
     "A8W8_MXFP_dynamic",
     "A4W4_MXFP_dynamic",
@@ -390,6 +511,7 @@ ALL_PROCESSORS = [
     "native_int8",
     "native_fp8",
     "flashinfer_nvfp4_dynamic",
+    "flashinfer_fp8_block_dynamic",
 ]
 
 
@@ -416,7 +538,7 @@ Examples:
   #               A8W8_MXFP_dynamic_post_scale, A8W8_MXFP_dynamic,
   #               A4W4_MXFP_dynamic, A4W4_NVFP_dynamic
   #   PyTorch:    native_int8, native_fp8
-  #   flashinfer: flashinfer_nvfp4_dynamic
+  #   flashinfer: flashinfer_nvfp4_dynamic, flashinfer_fp8_block_dynamic
   #   Baseline:   none / fp16 (BF16, no quantization)
   #   Use "all" to run every processor.
         """,

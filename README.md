@@ -144,7 +144,7 @@ gemlite_linear = A16W4_HQQ_INT(device=device, dtype=dtype).from_hqqlinear(hqq_la
 gemlite_linear = A16W2_HQQ_INT(device=device, dtype=dtype).from_hqqlinear(hqq_layer)
 gemlite_linear = A16W158_INT(device=device, dtype=dtype).from_bitlinear(bitlinear_layer)
 
-# 8-bit activation dynamic quant
+# 8-bit activation dynamic quant (channelwise; pass block_quant=True for DeepSeek-style 128x128 block quant)
 gemlite_linear = A8W8_INT8_dynamic(device=device, dtype=dtype).from_linear(layer)
 gemlite_linear = A8W8_FP8_dynamic(device=device, dtype=dtype).from_linear(layer)
 gemlite_linear = A8W4_HQQ_INT_dynamic(device=device, dtype=dtype).from_hqqlinear(hqq_layer)

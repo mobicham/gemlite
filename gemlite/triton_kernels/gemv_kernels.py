@@ -6,11 +6,11 @@ from torch import Tensor
 import triton
 import triton.language as tl
 from ..dtypes import is_mx_dtype
-from .config import AUTOTUNE, KERNEL_CACHE
+from .config import AUTOTUNE, KERNEL_CACHE, BLOCK_QUANT_SIZE
 from .utils import *
 from .utils import load_ptr
 
-KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
+KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'channel_scale_mode']
 MATMUL_TYPE   = "GEMV"
 
 #Init MXFP workspace for dequant
@@ -67,6 +67,11 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = min(g, block_size_k) #Makes BLOCK_SIZE_K compatible with the group_size
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
+
+        # Block-quant (channel_scale_mode==4): one tile must fit inside one BxB scale block
+        if nargs.get('channel_scale_mode', 0) == 4:
+            block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
+            block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
 
         #tmp fix autotune getting stuck on the MI300X
         if IS_HIP:
@@ -287,6 +292,7 @@ def gemv_INT_kernel(
     load_scales_as_block: tl.constexpr = False,
     EVEN_K: tl.constexpr = False,
     EVEN_N: tl.constexpr = False,
+    block_quant_size: tl.constexpr = BLOCK_QUANT_SIZE,
 ):
     """
     GEMV for C = matmul(A, dequantize(B, scales, zeros)). This is optimized for M==1
@@ -397,6 +403,13 @@ def gemv_INT_kernel(
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N,   other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+
+    if channel_scale_mode == 4: #block-quant: one scale_b/scale_a per tile
+        k_m_bq = (pid_k * BLOCK_SIZE_K) // block_quant_size
+        n_m_bq = (pid_n * BLOCK_SIZE_N) // block_quant_size
+        scales_b = tl.load(scales_ptr + k_m_bq * stride_meta_g + n_m_bq * stride_meta_n, eviction_policy=meta_evict_policy)
+        scales_a = tl.load(scales_a_ptr + offs_am * stride_meta_a_m + k_m_bq * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
+        acc      = acc.to(tl.float32) * scales_a[:, None] * scales_b
 
     ####################################################################
     #Output

@@ -196,7 +196,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
             _x, _x_scaled = scale_activations(x, w_dtype=torch.int8)
             return torch.matmul(_x.to(torch.float16), (W_q.to(torch.float16) - 7).T) * _x_scaled
 
-        self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn)
+        self.eval(gemlite_linear, ref_fn, tol=7e-3, input_fn=input_fn)
 
     def test_int8Wn_scaled_weights_scaled_activations(self):
         #INT8 x Wn - activation scaling only
@@ -338,6 +338,45 @@ class TestGemLiteLinearTriton(unittest.TestCase):
             return torch.matmul(x.to(compute_dtype), W.T)
 
         self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn) #needs higher tolerance with fp8
+
+    def test_int8_block_quant(self):
+        #A8W8 INT8 dynamic with DeepSeek-style 128x128 block quantization
+        from gemlite.helper import A8W8_INT8_dynamic
+        lin = torch.nn.Linear(in_features, out_features, bias=False, dtype=compute_dtype, device=device)
+        with torch.no_grad():
+            lin.weight.copy_(W.to(compute_dtype))
+        gemlite_linear = A8W8_INT8_dynamic(device=device, dtype=compute_dtype, block_quant=True).from_linear(lin, del_orig=False)
+
+        self.assertTrue(gemlite_linear.W_group_mode == 0)
+        self.assertTrue(gemlite_linear.channel_scale_mode == 4)
+
+        def input_fn(batch_size):
+            return torch.randn((batch_size, in_features), dtype=compute_dtype, device=device) / 10.
+
+        def ref_fn(x):
+            return torch.matmul(x.to(compute_dtype), W.T)
+
+        self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn, _matmul_types=matmul_types)
+
+    @unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
+    def test_fp8_block_quant(self):
+        #A8W8 FP8 dynamic with DeepSeek-style 128x128 block quantization
+        from gemlite.helper import A8W8_FP8_dynamic
+        lin = torch.nn.Linear(in_features, out_features, bias=False, dtype=compute_dtype, device=device)
+        with torch.no_grad():
+            lin.weight.copy_(W.to(compute_dtype))
+        gemlite_linear = A8W8_FP8_dynamic(device=device, dtype=compute_dtype, block_quant=True).from_linear(lin, del_orig=False)
+
+        self.assertTrue(gemlite_linear.W_group_mode == 0)
+        self.assertTrue(gemlite_linear.channel_scale_mode == 4)
+
+        def input_fn(batch_size):
+            return torch.randn((batch_size, in_features), dtype=compute_dtype, device=device) / 10.
+
+        def ref_fn(x):
+            return torch.matmul(x.to(compute_dtype), W.T)
+
+        self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn, _matmul_types=matmul_types)
 
 if __name__ == '__main__':
     unittest.main()

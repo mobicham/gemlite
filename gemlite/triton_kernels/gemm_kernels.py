@@ -6,11 +6,11 @@ from torch import Tensor
 import triton
 import triton.language as tl
 from ..dtypes import is_mx_dtype
-from .config import AUTOTUNE
+from .config import AUTOTUNE, BLOCK_QUANT_SIZE
 from .utils import *
 from .utils import load_ptr
 
-KEYS        = ['M_CLOSEST', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'a_sizeof', 'b_sizeof'] 
+KEYS        = ['M_CLOSEST', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'a_sizeof', 'b_sizeof', 'channel_scale_mode'] 
 MATMUL_TYPE = "GEMM"
 
 def kernel_config_pruner(configs, nargs, **kwargs):
@@ -27,6 +27,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
     
     #Check cache
     load_scales_as_block = kwargs['load_scales_as_block']
+    channel_scale_mode = kwargs.get('channel_scale_mode', 0)
     if(MATMUL_TYPE in GEMLITE_TRITON_CONFIG_CACHE):
         signature = str(tuple([get_closest_m(m), n, k, g, e, t]))
         if(signature in GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE]):
@@ -50,6 +51,12 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 config['BLOCK_SIZE_N'] = max(config['BLOCK_SIZE_N'], 128)
                 while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
                     config['BLOCK_SIZE_K'] *= 2
+
+            # Block-quant: clamp block sizes <= BLOCK_QUANT_SIZE
+            if channel_scale_mode == 4:
+                # BLOCK_SIZE_M is unconstrained (scales_a is [M, K/BLOCK_QUANT_SIZE])
+                config['BLOCK_SIZE_N'] = min(config['BLOCK_SIZE_N'], BLOCK_QUANT_SIZE)
+                config['BLOCK_SIZE_K'] = min(config['BLOCK_SIZE_K'], BLOCK_QUANT_SIZE)
 
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps)
             return
@@ -90,6 +97,12 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                     block_size_k *= 2
         else:
             block_size_k = max(min(block_size_k, g), 32) #tl.dot minimum K
+
+        #Block-quant: single fp32 scale per BxB block, so BLOCK_SIZE_{M,N,K} must be <=BLOCK_QUANT_SIZE
+        if channel_scale_mode == 4:
+            # BLOCK_SIZE_M is unconstrained (scales_a is [M, K/BLOCK_QUANT_SIZE])
+            block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
+            block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
 
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
 
@@ -319,6 +332,7 @@ def gemm_INT_kernel(
     #################################
     use_tma: tl.constexpr = True,
     use_5d_scales: tl.constexpr = False,
+    block_quant_size: tl.constexpr = BLOCK_QUANT_SIZE,
 ):
     """
     Based on https://github.com/fpgaminer/GPTQ-triton
@@ -378,6 +392,12 @@ def gemm_INT_kernel(
     if(zero_is_scalar):
         zero_scalar = tl.load(zeros_ptr, eviction_policy='evict_last')
     
+    # Block-quantization: BxB weight scales (fp32), per-row per-B-K activation scales (fp32), where B = BLOCK_QUANT_SIZE
+    if channel_scale_mode == 4:
+        K_PER_SCALE:      tl.constexpr = block_quant_size // BLOCK_SIZE_K   #k-iters per B-K block (>=1)
+        scales_a_ptrs     = scales_a_ptr + offs_am * stride_meta_a_m
+        scales_b_base_ptr = scales_ptr + ((pid_n * BLOCK_SIZE_N) // block_quant_size) * stride_meta_n
+
     #############################################################################################################
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
@@ -417,8 +437,18 @@ def gemm_INT_kernel(
         if(A_load_order == 3): #Late load 
             a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
         
+        #Block-quant: load per-block activation/weight fp32 scales before the dot.
+        if channel_scale_mode == 4:
+            k_m = k // K_PER_SCALE
+            scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
+            scales_b = tl.load(scales_b_base_ptr + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
+
         #Dot
-        acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype) 
+        if channel_scale_mode == 4:
+            tmp = tl.dot(a, b.to(input_dtype), out_dtype=acc_dtype)
+            acc += tmp * scales_a[:, None] * scales_b
+        else:
+            acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype) 
         
         #Advance
         a_ptrs += BLOCK_SIZE_K * stride_ak

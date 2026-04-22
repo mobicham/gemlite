@@ -2496,7 +2496,189 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> 
 
 
 ####################################################################################################################
+#INT8 / FP8 per-block activations (block quantization)
+####################################################################################################################
+from .triton_kernels.config import BLOCK_QUANT_SIZE
+
+@torch.compile(fullgraph=True)
+def scale_activations_per_block_torch(
+    tensor: Tensor, w_dtype: torch.dtype, block_size: int = BLOCK_QUANT_SIZE,
+) -> Tuple[Tensor, Tensor]:
+    min_val, max_val = get_dtype_range(w_dtype)
+    out_shape = tensor.shape
+    tensor = tensor.to(torch.float32, copy=False).view(-1, tensor.shape[-1])
+    M, K = tensor.shape
+    assert K % block_size == 0, "K must be divisible by block_size for per-block activation quantization."
+
+    # [M, K//B, B] -> amax over B
+    t = tensor.view(M, K // block_size, block_size)
+    scales = t.abs().amax(dim=-1) / max_val  # [M, K//B]
+    scales = scales.clamp_(min=1e-6)
+    out = t / scales.unsqueeze(-1)
+    out = out.clamp_(min_val, max_val)
+    if not w_dtype.is_floating_point:
+        out = out.round_()
+    out = out.to(dtype=w_dtype).view(out_shape)
+    return out, scales.contiguous()
+
+
+@triton.jit
+def scale_activations_per_block_triton_v1_kernel(
+    tensor_ptr, scale_ptr, y_ptr,
+    M, K,
+    stride_m: tl.constexpr,
+    stride_k: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sg: tl.constexpr,
+    ROUND: tl.constexpr,
+    min_val: tl.constexpr,
+    max_val: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,  # == block_size (quantization block)
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    m_mask = offs_m < M
+    mask = m_mask[:, None] & (offs_k[None, :] < K)
+
+    offsets = offs_m[:, None] * stride_m + offs_k[None, :] * stride_k
+    tensor = tl.load(tensor_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    scales_x = tl.max(tl.abs(tensor), axis=1) / max_val
+    scales_x = tl.maximum(scales_x, 1e-6)
+    tensor = tensor / scales_x[:, None]
+    tensor = tl.minimum(tl.maximum(tensor, min_val), max_val)
+    if ROUND:
+        tensor = round_triton(tensor)
+
+    tl.store(scale_ptr + offs_m * stride_sm + pid_k * stride_sg, scales_x, mask=m_mask)
+    tl.store(y_ptr + offsets, tensor, mask=mask)
+
+
+def scale_activations_per_block_triton_v1(
+    tensor: Tensor, w_dtype: torch.dtype, block_size: int = BLOCK_QUANT_SIZE,
+) -> Tuple[Tensor, Tensor]:
+    min_val, max_val = get_dtype_range(w_dtype)
+    x_shape = tensor.shape
+    tensor = tensor.view(-1, tensor.shape[-1])
+    M, K = tensor.shape
+    assert K % block_size == 0, "K must be divisible by block_size for per-block activation quantization."
+
+    num_k_blocks = K // block_size
+    scales = torch.empty((M, num_k_blocks), dtype=torch.float32, device=tensor.device)
+    y = torch.empty((M, K), dtype=w_dtype, device=tensor.device)
+
+    BLOCK_SIZE_M = 1
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), num_k_blocks)
+    ROUND = not w_dtype.is_floating_point
+
+    scale_activations_per_block_triton_v1_kernel[grid](
+        tensor, scales, y,
+        M, K,
+        tensor.stride(0), tensor.stride(1),
+        scales.stride(0), scales.stride(1),
+        ROUND=ROUND,
+        min_val=min_val, max_val=max_val,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_K=block_size,
+        num_stages=1, num_warps=4,
+    )
+
+    return y.view(x_shape), scales
+
+
+####################################################################################################################
+# v2: 2D grid, multi-row + multi-group per program via flat reshape.
+# Each tile covers BLOCK_SIZE_M rows × BLOCK_SIZE_K cols (BLOCK_SIZE_K is a multiple of the 128 quant
+# block); the tile is reshaped to [BLOCK_SIZE_M * GROUPS_PER_BLOCK, 128] so the per-128 amax becomes
+# one row-reduction, letting each program amortize launch overhead over many rows.
+# Autotune key is (M_CLOSEST, K), identical to the other quant_utils kernels — M_CLOSEST is bucketed
+# by get_closest_m so changing M across buckets does not force a recompile.
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_K': 128},  num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_K': 512},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 2,  'BLOCK_SIZE_K': 512},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 4,  'BLOCK_SIZE_K': 512},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 8,  'BLOCK_SIZE_K': 512},  num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 4,  'BLOCK_SIZE_K': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 8,  'BLOCK_SIZE_K': 1024}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_K': 512},  num_warps=8, num_stages=2),
+    ],
+    key=['M_CLOSEST', 'K'],
+)
+@triton.jit
+def scale_activations_per_block_triton_v2_kernel(
+    tensor_ptr, scale_ptr, y_ptr,
+    M, K, M_CLOSEST,
+    stride_m: tl.constexpr, stride_k: tl.constexpr,
+    stride_sm: tl.constexpr, stride_sg: tl.constexpr,
+    ROUND: tl.constexpr,
+    min_val: tl.constexpr, max_val: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    GROUPS_PER_BLOCK: tl.constexpr = BLOCK_SIZE_K // GROUP_SIZE
+    FLAT_M: tl.constexpr = BLOCK_SIZE_M * GROUPS_PER_BLOCK
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    m_mask = offs_m < M
+    mask = m_mask[:, None] & (offs_k[None, :] < K)
+
+    offsets = offs_m[:, None] * stride_m + offs_k[None, :] * stride_k
+    x = tl.load(tensor_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    x_flat = tl.reshape(x, (FLAT_M, GROUP_SIZE))
+    amax = tl.max(tl.abs(x_flat), axis=1)
+    scales_x = tl.maximum(amax / max_val, 1e-6)
+    xq = x_flat * (1.0 / scales_x[:, None])
+    xq = tl.clamp(xq, min_val, max_val)
+    if ROUND:
+        xq = round_triton(xq)
+
+    xq = tl.reshape(xq, (BLOCK_SIZE_M, BLOCK_SIZE_K)).to(y_ptr.dtype.element_ty)
+    tl.store(y_ptr + offsets, xq, mask=mask)
+
+    scales_2d = tl.reshape(scales_x, (BLOCK_SIZE_M, GROUPS_PER_BLOCK))
+    offs_g = pid_k * GROUPS_PER_BLOCK + tl.arange(0, GROUPS_PER_BLOCK)
+    mask = m_mask[:, None] & (offs_g < tl.cdiv(K, GROUP_SIZE))[None, :]
+    tl.store(scale_ptr + offs_m[:, None] * stride_sm + offs_g[None, :] * stride_sg, scales_2d, mask=mask)
+
+
+def scale_activations_per_block_triton_v2(
+    tensor: Tensor, w_dtype: torch.dtype, block_size: int = BLOCK_QUANT_SIZE,
+) -> Tuple[Tensor, Tensor]:
+    min_val, max_val = get_dtype_range(w_dtype)
+    x_shape = tensor.shape
+    tensor = tensor.view(-1, tensor.shape[-1])
+    M, K = tensor.shape
+    assert K % block_size == 0, "K must be divisible by block_size for per-block activation quantization."
+
+    scales = torch.empty((M, K // block_size), dtype=torch.float32, device=tensor.device)
+    y = torch.empty((M, K), dtype=w_dtype, device=tensor.device)
+    M_CLOSEST = get_closest_m(M)
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(K, META['BLOCK_SIZE_K']))
+    scale_activations_per_block_triton_v2_kernel[grid](
+        tensor, scales, y,
+        M, K, M_CLOSEST,
+        tensor.stride(0), tensor.stride(1),
+        scales.stride(0), scales.stride(1),
+        ROUND=not w_dtype.is_floating_point,
+        min_val=min_val, max_val=max_val,
+        GROUP_SIZE=block_size,
+    )
+    return y.view(x_shape), scales
+
+
+####################################################################################################################
 scale_activations_per_token = scale_activations_per_token_triton_v3
+scale_activations_per_block = scale_activations_per_block_triton_v2
 scale_activations_mxfp8 = scale_activations_mxfp8_triton_v4
 scale_activations_mxfp4 = scale_activations_mxfp4_triton_v5
 scale_activations_nvfp4 = scale_activations_nvfp4_triton_v5

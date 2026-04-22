@@ -23,6 +23,7 @@ from .bitpack import (
 
 from .quant_utils import (
     scale_activations_per_token,
+    scale_activations_per_block,
     scale_activations_mxfp8,
     scale_activations_mxfp4,
     scale_activations_nvfp4,
@@ -213,7 +214,10 @@ def forward_functional(
         input_dtype = DType(meta_args[5])
         channel_scale_mode = meta_args[9]
 
-        if(input_dtype in FP8_INT8_DTYPES): #INT8 / FP8
+        if(input_dtype in FP8_INT8_DTYPES and channel_scale_mode == 4): #INT8 / FP8 block quantization
+            x, scales_x = scale_activations_per_block(x, w_dtype=DTYPE_TO_TORCH[input_dtype.value])
+
+        elif(input_dtype in FP8_INT8_DTYPES): #INT8 / FP8
             x, scales_x = scale_activations_per_token(x, w_dtype=DTYPE_TO_TORCH[input_dtype.value])
 
         elif(input_dtype in [DType.MXFP8] and channel_scale_mode == 4): #MXPF8
