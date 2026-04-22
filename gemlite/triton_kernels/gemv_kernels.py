@@ -10,7 +10,7 @@ from .config import AUTOTUNE, KERNEL_CACHE
 from .utils import *
 from .utils import load_ptr
 
-KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
+KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'channel_scale_mode']
 MATMUL_TYPE   = "GEMV"
 
 #Init MXFP workspace for dequant
@@ -67,6 +67,11 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = min(g, block_size_k) #Makes BLOCK_SIZE_K compatible with the group_size
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
+
+        # Block-quant (channel_scale_mode==4): one tile must fit inside one 128x128 scale block
+        if nargs.get('channel_scale_mode', 0) == 4:
+            block_size_n = min(block_size_n, 128)
+            block_size_k = min(block_size_k, 128)
 
         #tmp fix autotune getting stuck on the MI300X
         if IS_HIP:
@@ -397,6 +402,14 @@ def gemv_INT_kernel(
         scales_a = tl.load(scales_a_ptr + offs_am, mask=offs_am < M, other=1, eviction_policy=meta_evict_policy)
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N,   other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
+
+    if channel_scale_mode == 4: #block-quant: one scale_b/scale_a per tile
+        BLOCK_QUANT_SIZE: tl.constexpr = 128
+        k_m_bq = (pid_k * BLOCK_SIZE_K) // BLOCK_QUANT_SIZE
+        n_m_bq = (pid_n * BLOCK_SIZE_N) // BLOCK_QUANT_SIZE
+        scales_b = tl.load(scales_ptr + k_m_bq * stride_meta_g + n_m_bq * stride_meta_n, eviction_policy=meta_evict_policy)
+        scales_a = tl.load(scales_a_ptr + offs_am * stride_meta_a_m + k_m_bq * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
+        acc      = acc.to(tl.float32) * scales_a[:, None] * scales_b
 
     ####################################################################
     #Output

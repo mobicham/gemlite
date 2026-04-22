@@ -356,7 +356,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
         def ref_fn(x):
             return torch.matmul(x.to(compute_dtype), W.T)
 
-        self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn, _matmul_types=['GEMM_SPLITK', 'GEMM'])
+        self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn, _matmul_types=matmul_types)
 
     @unittest.skipIf(not is_fp8_supported(), "Skipping test: GPU does not support FP8")
     def test_fp8_block_quant(self):
@@ -376,7 +376,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
         def ref_fn(x):
             return torch.matmul(x.to(compute_dtype), W.T)
 
-        self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn, _matmul_types=['GEMM_SPLITK', 'GEMM'])
+        self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn, _matmul_types=matmul_types)
 
 if __name__ == '__main__':
     unittest.main()

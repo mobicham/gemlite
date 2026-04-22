@@ -10,7 +10,7 @@ from .config import AUTOTUNE, KERNEL_CACHE
 from .utils import *
 from .utils import load_ptr
 
-KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id']
+KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'channel_scale_mode']
 MATMUL_TYPE   = "GEMV_REVSPLITK"
 
 def kernel_config_pruner(configs, nargs, **kwargs):
@@ -61,6 +61,11 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = min(block_size_k, g)
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
+
+        # Block-quant: one tile fits inside a 128x128 scale block
+        if nargs.get('channel_scale_mode', 0) == 4:
+            block_size_n = min(block_size_n, 128)
+            block_size_k = min(block_size_k, 128)
 
         #tmp fix autotune getting stuck on the MI300X
         if IS_HIP:
@@ -257,6 +262,8 @@ def gemv_INT_revsplitK_kernel(
     stride_bn: tl.constexpr,
     stride_cm: tl.constexpr, 
     stride_cn: tl.constexpr,
+    stride_meta_a_m: tl.constexpr, 
+    stride_meta_a_g: tl.constexpr,
     stride_meta_g: tl.constexpr, 
     stride_meta_n: tl.constexpr,
     ######### Dtypes #########
@@ -359,7 +366,17 @@ def gemv_INT_revsplitK_kernel(
         acc = tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True).to(acc_dtype)
     if(dot_prod_mode == 2):
         acc = tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True)
-    
+
+    # Block-quant: scale this stage's dot by the matching (A, B) 128-block scales before
+    # accumulating into the running total. Next stage starts from zero in  below.
+    if channel_scale_mode == 4:
+        BLOCK_QUANT_SIZE: tl.constexpr = 128
+        n_m_bq = (pid_n * BLOCK_SIZE_N) // BLOCK_QUANT_SIZE
+        k_m_bq1 = (pid_k * BLOCK_SIZE_K) // BLOCK_QUANT_SIZE
+        scales_b1 = tl.load(scales_ptr + k_m_bq1 * stride_meta_g + n_m_bq * stride_meta_n, eviction_policy=meta_evict_policy)
+        scales_a1 = tl.load(scales_a_ptr + offs_am * stride_meta_a_m + k_m_bq1 * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
+        acc = acc.to(tl.float32) * scales_a1[:, None] * scales_b1
+
     #Advance and load next chunk
     a_ptrs += BLOCK_SIZE_K * stride_ak
     b_ptrs += (BLOCK_SIZE_K // elements_per_sample) * stride_bk
@@ -382,12 +399,18 @@ def gemv_INT_revsplitK_kernel(
     
     #Dot product
     if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
-    if(dot_prod_mode == 0):
-        acc += tl.sum(a.to(acc_dtype) * b.to(acc_dtype), axis=0, keep_dims=True) 
-    if(dot_prod_mode == 1):
-        acc += tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True).to(acc_dtype)
-    if(dot_prod_mode == 2):
-        acc += tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True)
+    if channel_scale_mode == 4:
+        k_m_bq2 = ((pid_k + 1) * BLOCK_SIZE_K) // BLOCK_QUANT_SIZE
+        scales_b2 = tl.load(scales_ptr + k_m_bq2 * stride_meta_g + n_m_bq * stride_meta_n, eviction_policy=meta_evict_policy)
+        scales_a2 = tl.load(scales_a_ptr + offs_am * stride_meta_a_m + k_m_bq2 * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
+        acc += tl.sum(a.to(acc_dtype) * b.to(acc_dtype), axis=0, keep_dims=True).to(tl.float32) * scales_a2[:, None] * scales_b2
+    else:
+        if(dot_prod_mode == 0):
+            acc += tl.sum(a.to(acc_dtype) * b.to(acc_dtype), axis=0, keep_dims=True) 
+        if(dot_prod_mode == 1):
+            acc += tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True).to(acc_dtype)
+        if(dot_prod_mode == 2):
+            acc += tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True)
 
     if(dump_b_val > 0): acc /= dump_b_val
     ############################################################################################################
@@ -467,6 +490,11 @@ def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor
     else:
         acc_dtype = DTYPE_TO_TRITON[acc_dtype]
 
+    if(scales_x is not None):
+        stride_meta_a_m, stride_meta_a_g = scales_x.stride(0), scales_x.stride(1)
+    else:
+        stride_meta_a_m, stride_meta_a_g = 0, 0
+
     if(is_mx_dtype(input_dtype)):
         raise Exception('MX dtypes are not supported for this kernel.')
     else:
@@ -480,6 +508,7 @@ def gemv_revsplitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor
         x.stride(0), x.stride(1),
         W_q.stride(0), W_q.stride(1),
         output.stride(0), output.stride(1),
+        stride_meta_a_m, stride_meta_a_g,
         scales.stride(0), scales.stride(1),
         ################################################
         input_dtype  = DTYPE_TO_TRITON[input_dtype],
