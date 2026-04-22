@@ -2496,9 +2496,9 @@ def scale_activations_nvfp4_triton_v5(tensor: torch.Tensor, meta_scale=None) -> 
 
 
 ####################################################################################################################
-#INT8 / FP8 per-block activations (DeepSeek-style block quantization)
+#INT8 / FP8 per-block activations (block quantization)
 ####################################################################################################################
-BLOCK_QUANT_SIZE = 128
+from .triton_kernels.config import BLOCK_QUANT_SIZE
 
 @torch.compile(fullgraph=True)
 def scale_activations_per_block_torch(

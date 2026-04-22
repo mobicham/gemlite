@@ -7,6 +7,7 @@ import time
 from tqdm import tqdm
 from gemlite.core import GemLiteLinearTriton, DType, TORCH_TO_DTYPE
 from gemlite.triton_kernels.utils import M_MAPPING
+from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE
 from gemlite.quant_utils import WeightQuantizerMXFP
 from .triton_kernels.utils import IS_HIP
 
@@ -506,8 +507,6 @@ class A16W4_NVFP:
 #8-bit dynamic activations / 8-bit weights
 #################################################################################################
 class A8W8_dynamic:
-    BLOCK_QUANT_SIZE = 128
-
     def __init__(self, device='cuda:0', dtype=None, fp8=False, fp32_scale=True, block_quant=False):
         self.device = device
         self.dtype = dtype
@@ -516,14 +515,14 @@ class A8W8_dynamic:
         self.block_quant = block_quant
 
     def _from_weights_block_quant(self, weight, bias=None):
-        """128x128 block quantization for weights + per-block (row x 128) activations."""
+        """BxB block quantization for weights + per-block (row x B) activations, B=BLOCK_QUANT_SIZE."""
         if(self.fp8):
             w_dtype, input_dtype, min_val, max_val = self.fp8, TORCH_TO_DTYPE[self.fp8], torch.finfo(self.fp8).min, torch.finfo(self.fp8).max
         else:
             w_dtype, input_dtype, min_val, max_val = torch.int8, DType.INT8, torch.iinfo(torch.int8).min, torch.iinfo(torch.int8).max
 
         in_features, out_features = weight.shape[::-1]
-        B = self.BLOCK_QUANT_SIZE
+        B = BLOCK_QUANT_SIZE
         in_pad  = ((in_features  + B - 1) // B) * B
         out_pad = ((out_features + B - 1) // B) * B
         pad_k, pad_n = in_pad - in_features, out_pad - out_features

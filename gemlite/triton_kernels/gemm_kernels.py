@@ -6,7 +6,7 @@ from torch import Tensor
 import triton
 import triton.language as tl
 from ..dtypes import is_mx_dtype
-from .config import AUTOTUNE
+from .config import AUTOTUNE, BLOCK_QUANT_SIZE
 from .utils import *
 from .utils import load_ptr
 
@@ -52,11 +52,11 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
                     config['BLOCK_SIZE_K'] *= 2
 
-            # Block-quant: clamp block sizes <= 128
+            # Block-quant: clamp block sizes <= BLOCK_QUANT_SIZE
             if channel_scale_mode == 4:
-                config['BLOCK_SIZE_M'] = min(config['BLOCK_SIZE_M'], 128)
-                config['BLOCK_SIZE_N'] = min(config['BLOCK_SIZE_N'], 128)
-                config['BLOCK_SIZE_K'] = min(config['BLOCK_SIZE_K'], 128)
+                config['BLOCK_SIZE_M'] = min(config['BLOCK_SIZE_M'], BLOCK_QUANT_SIZE)
+                config['BLOCK_SIZE_N'] = min(config['BLOCK_SIZE_N'], BLOCK_QUANT_SIZE)
+                config['BLOCK_SIZE_K'] = min(config['BLOCK_SIZE_K'], BLOCK_QUANT_SIZE)
 
             yield triton.Config(config, num_stages=num_stages, num_warps=num_warps)
             return
@@ -98,11 +98,11 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         else:
             block_size_k = max(min(block_size_k, g), 32) #tl.dot minimum K
 
-        #Block-quant: single fp32 scale per 128x128 block, so BLOCK_SIZE_{M,N,K} must be <=128
+        #Block-quant: single fp32 scale per BxB block, so BLOCK_SIZE_{M,N,K} must be <=BLOCK_QUANT_SIZE
         if channel_scale_mode == 4:
-            block_size_m = min(block_size_m, 128)
-            block_size_n = min(block_size_n, 128)
-            block_size_k = min(block_size_k, 128)
+            block_size_m = min(block_size_m, BLOCK_QUANT_SIZE)
+            block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
+            block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
 
         #Hint: skip block_size_n > block_size_k for col-major non-packed data.
 
@@ -332,6 +332,7 @@ def gemm_INT_kernel(
     #################################
     use_tma: tl.constexpr = True,
     use_5d_scales: tl.constexpr = False,
+    block_quant_size: tl.constexpr = BLOCK_QUANT_SIZE,
 ):
     """
     Based on https://github.com/fpgaminer/GPTQ-triton
@@ -391,12 +392,11 @@ def gemm_INT_kernel(
     if(zero_is_scalar):
         zero_scalar = tl.load(zeros_ptr, eviction_policy='evict_last')
     
-    # Block-quantization (DeepSeek-style): 128x128 weight scales (fp32), per-row per-128-K activation scales (fp32)
+    # Block-quantization: BxB weight scales (fp32), per-row per-B-K activation scales (fp32), where B = BLOCK_QUANT_SIZE
     if channel_scale_mode == 4:
-        BLOCK_QUANT_SIZE: tl.constexpr = 128
-        K_PER_SCALE:      tl.constexpr = BLOCK_QUANT_SIZE // BLOCK_SIZE_K   #k-iters per 128-K block (>=1)
+        K_PER_SCALE:      tl.constexpr = block_quant_size // BLOCK_SIZE_K   #k-iters per B-K block (>=1)
         scales_a_ptrs     = scales_a_ptr + offs_am * stride_meta_a_m
-        scales_b_base_ptr = scales_ptr + ((pid_n * BLOCK_SIZE_N) // BLOCK_QUANT_SIZE) * stride_meta_n
+        scales_b_base_ptr = scales_ptr + ((pid_n * BLOCK_SIZE_N) // block_quant_size) * stride_meta_n
 
     #############################################################################################################
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)

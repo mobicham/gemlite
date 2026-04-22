@@ -6,7 +6,7 @@ from torch import Tensor
 import triton
 import triton.language as tl
 from ..dtypes import is_mx_dtype
-from .config import AUTOTUNE
+from .config import AUTOTUNE, BLOCK_QUANT_SIZE
 from .utils import *
 from .utils import load_ptr
 
@@ -67,10 +67,10 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-        # Block-quant: one tile fits inside a 128x128 scale block
+        # Block-quant: one tile fits inside a BxB scale block
         if nargs.get('channel_scale_mode', 0) == 4:
-            block_size_n = min(block_size_n, 128)
-            block_size_k = min(block_size_k, 128)
+            block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
+            block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
 
         # #K needs to be divisible by BLOCK_SIZE_K * SPLIT_K: TODO: without this, cuda-graphs breaks.
         # while block_size_k > 16 and not is_divisible(k, block_size_k * split_k):
@@ -166,7 +166,7 @@ def get_fast_autotune_config_nvidia():
     return configs
 
 def get_default_config_nvidia():
-    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':2, 'BLOCK_SIZE_K':128, 'GROUP_SIZE_M':8, 'SPLIT_K': 1, 'A_load_order':1, 'dot_prod_mode':0}, num_warps=4, num_stages=2)
+    config = triton.Config({'BLOCK_SIZE_M':1, 'BLOCK_SIZE_N':2, 'BLOCK_SIZE_K':BLOCK_QUANT_SIZE, 'GROUP_SIZE_M':8, 'SPLIT_K': 1, 'A_load_order':1, 'dot_prod_mode':0}, num_warps=4, num_stages=2)
     return [config]
 
 ########################################################################################################################################################################
@@ -302,6 +302,7 @@ def gemv_INT_splitK_kernel(
     atomic_mode: tl.constexpr = 'relaxed',
     a_evict: tl.constexpr = 'evict_last',
     b_evict: tl.constexpr = 'evict_first',
+    block_quant_size: tl.constexpr = BLOCK_QUANT_SIZE,
 ):
     """
     Based on https://github.com/foundation-model-stack/foundation-model-stack/blob/triton/triton/kernels/gptq/splitk_dequant_gemm.py
@@ -362,10 +363,9 @@ def gemv_INT_splitK_kernel(
     ##################################################################
 
     # Block-quant setup: per-tile scales_a/scales_b ptr bases
-    BLOCK_QUANT_SIZE: tl.constexpr = 128
     if channel_scale_mode == 4:
         scales_a_base_ptrs = scales_a_ptr + offs_am * stride_meta_a_m
-        scales_b_base_ptr  = scales_ptr + ((pid_n * BLOCK_SIZE_N) // BLOCK_QUANT_SIZE) * stride_meta_n
+        scales_b_base_ptr  = scales_ptr + ((pid_n * BLOCK_SIZE_N) // block_quant_size) * stride_meta_n
 
     if(dot_prod_mode == 0):
         acc = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -416,7 +416,7 @@ def gemv_INT_splitK_kernel(
             current_acc = tl.sum(a.reshape((BLOCK_SIZE_K, 1), can_reorder=False) * b.to(input_dtype), axis=0, keep_dims=True).to(acc_dtype) 
             
         if channel_scale_mode == 4:
-            k_m = ((k * SPLIT_K + pid_k) * BLOCK_SIZE_K) // BLOCK_QUANT_SIZE
+            k_m = ((k * SPLIT_K + pid_k) * BLOCK_SIZE_K) // block_quant_size
             scales_a_bq = tl.load(scales_a_base_ptrs + k_m * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
             scales_b_bq = tl.load(scales_b_base_ptr + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
             current_acc = current_acc * (scales_a_bq[:, None] * scales_b_bq)
