@@ -54,7 +54,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
             # Block-quant: clamp block sizes <= BLOCK_QUANT_SIZE
             if channel_scale_mode == 4:
-                config['BLOCK_SIZE_M'] = min(config['BLOCK_SIZE_M'], BLOCK_QUANT_SIZE)
+                # BLOCK_SIZE_M is unconstrained (scales_a is [M, K/BLOCK_QUANT_SIZE])
                 config['BLOCK_SIZE_N'] = min(config['BLOCK_SIZE_N'], BLOCK_QUANT_SIZE)
                 config['BLOCK_SIZE_K'] = min(config['BLOCK_SIZE_K'], BLOCK_QUANT_SIZE)
 
@@ -107,7 +107,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         
         # Block-quant: block sizes must be <= BLOCK_QUANT_SIZE
         if channel_scale_mode == 4:
-            block_size_m = min(block_size_m, BLOCK_QUANT_SIZE)
+            # BLOCK_SIZE_M is unconstrained (scales_a is [M, K/BLOCK_QUANT_SIZE])
             block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
             block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
         
