@@ -7,7 +7,7 @@ import unittest
 import torch
 from gemlite import reset_config, set_autotune
 from gemlite.core import GemLiteLinearTriton, DType, TORCH_TO_DTYPE
-from gemlite.triton_kernels.config import KERNEL
+from gemlite.triton_kernels.config import KERNEL_CACHE
 from gemlite.helper import A4W4_MXFP_dynamic, A4W4_NVFP_dynamic, patch_model
 
 def is_fp8_supported():
@@ -23,7 +23,7 @@ dummy_file    = "/tmp/_test_serial.pt"
 
 reset_config()
 if not _autotune: set_autotune(False)
-KERNEL.ENABLE_CACHING = False
+KERNEL_CACHE.ENABLE = False
 
 def _check_serialization(test_case, gemlite_linear, matmul_type='GEMM', batch_size=32, tol=1e-7):
     """Shared serialization round-trip check."""
