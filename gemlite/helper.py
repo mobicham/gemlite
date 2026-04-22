@@ -506,17 +506,87 @@ class A16W4_NVFP:
 #8-bit dynamic activations / 8-bit weights
 #################################################################################################
 class A8W8_dynamic:
-    def __init__(self, device='cuda:0', dtype=None, fp8=False, fp32_scale=True):
+    BLOCK_QUANT_SIZE = 128
+
+    def __init__(self, device='cuda:0', dtype=None, fp8=False, fp32_scale=True, block_quant=False):
         self.device = device
         self.dtype = dtype
         self.fp8 = fp8
         self.fp32_scale = fp32_scale
+        self.block_quant = block_quant
+
+    def _from_weights_block_quant(self, weight, bias=None):
+        """DeepSeek-style 128x128 block quantization for weights + per-block (row x 128) activations."""
+        if(self.fp8):
+            w_dtype, input_dtype, min_val, max_val = self.fp8, TORCH_TO_DTYPE[self.fp8], torch.finfo(self.fp8).min, torch.finfo(self.fp8).max
+        else:
+            w_dtype, input_dtype, min_val, max_val = torch.int8, DType.INT8, torch.iinfo(torch.int8).min, torch.iinfo(torch.int8).max
+
+        in_features, out_features = weight.shape[::-1]
+        B = self.BLOCK_QUANT_SIZE
+        assert in_features % B == 0 and out_features % B == 0, \
+            f"block_quant requires in_features ({in_features}) and out_features ({out_features}) divisible by {B}."
+
+        dtype = weight.dtype if(self.dtype is None) else self.dtype
+        assert dtype in [torch.float16, torch.bfloat16, torch.float32], "Invalid weight dtype, should be floating point."
+        gemlite_dtype = TORCH_TO_DTYPE[dtype]
+
+        weight = weight.to(dtype=torch.float32, device=self.device)
+        # Reshape to [N//B, B, K//B, B] and compute per-block amax
+        w = weight.view(out_features // B, B, in_features // B, B)
+        amax = w.abs().amax(dim=(1, 3))  # [N//B, K//B]
+        scales = (amax / max_val).clamp_(min=1e-6)  # [N//B, K//B] fp32
+        W_q = (w / scales[:, None, :, None]).clamp_(min=min_val, max=max_val)
+        if(w_dtype.is_floating_point):
+            W_q = W_q.to(w_dtype)
+        else:
+            W_q = W_q.round_().to(w_dtype)
+        W_q = W_q.view(out_features, in_features)
+
+        bias = bias.to(device=self.device, dtype=dtype) if (bias is not None) else None
+
+        gemlite_linear = GemLiteLinearTriton(
+            8,
+            group_size=in_features,  # dummy: block-quant doesn't use group_size
+            in_features=in_features,
+            out_features=out_features,
+            input_dtype=input_dtype,
+            output_dtype=gemlite_dtype,
+            acc_dtype=DType.FP32,  # fp32 scales => accumulate in fp32
+            scaled_activations=True,
+        )
+
+        # Follow existing pack() contract: it will scale.view((out_features, -1)).t() which gives [?, out_features].
+        # For block quant, we want scales stored as [K//B, N//B] fp32 so that stride_meta_g = stride(0) and stride_meta_n = stride(1).
+        # Pass a placeholder 1D scale to pack() (so it sets meta_is_channelwise=True path), then overwrite.
+        placeholder = torch.ones((out_features, 1), dtype=torch.float32, device=self.device)
+        gemlite_linear.pack(W_q, scales=placeholder, zeros=None, bias=bias)
+
+        # Replace scales buffer with block-quant layout [K//B, N//B] fp32
+        block_scales = scales.t().contiguous()  # [K//B, N//B]
+        gemlite_linear.scales = torch.nn.Parameter(block_scales, requires_grad=False)
+        gemlite_linear.meta_dtype = DType.FP32
+
+        # channel_scale_mode=4: in-kernel block-scale multiply, no W_group dequant on B
+        gemlite_linear.W_group_mode = 0
+        gemlite_linear.channel_scale_mode = 4
+
+        # Refresh metadata tensor to reflect updated modes/meta_dtype
+        gemlite_linear.metadata = torch.nn.Parameter(
+            torch.tensor(gemlite_linear.get_meta_args(), device=self.device, dtype=torch.int32),
+            requires_grad=False,
+        )
+        return gemlite_linear
 
     def from_weights(self, weight, bias=None, scales=None):
         if(isinstance(weight, torch.nn.Parameter)):
             weight = weight.data
         if(isinstance(bias, torch.nn.Parameter)):
             bias = bias.data
+
+        if self.block_quant:
+            assert scales is None, "Pre-quantized path is not supported with block_quant=True."
+            return self._from_weights_block_quant(weight, bias=bias)
 
         if(self.fp8): #FP8
             w_dtype, input_dtype, min_val, max_val = self.fp8, TORCH_TO_DTYPE[self.fp8], torch.finfo(self.fp8).min, torch.finfo(self.fp8).max
@@ -554,18 +624,18 @@ class A8W8_dynamic:
             if(self.dtype is None):
                 dtype = scales.dtype if scales.dtype in [torch.float16, torch.bfloat16] else torch.float16
             else:
-                dtype = self.dtype 
+                dtype = self.dtype
             W_q = weight.to(device=self.device)
-            scales = scales.to(device=self.device) 
+            scales = scales.to(device=self.device)
             gemlite_dtype = TORCH_TO_DTYPE[dtype]
-        
+
         scales = scales.to(torch.float32 if self.fp32_scale else dtype)
         bias = bias.to(device=self.device, dtype=dtype) if (bias is not None) else None
 
-        gemlite_linear = GemLiteLinearTriton(8, 
-                        group_size=in_features, 
-                        in_features=in_features, 
-                        out_features=out_features, 
+        gemlite_linear = GemLiteLinearTriton(8,
+                        group_size=in_features,
+                        in_features=in_features,
+                        out_features=out_features,
                         input_dtype=input_dtype,
                         output_dtype=gemlite_dtype,
                         scaled_activations=True,
@@ -584,16 +654,16 @@ class A8W8_dynamic:
         return out_layer
 
 class A8W8_int8_dynamic(A8W8_dynamic):
-    def __init__(self, device='cuda:0', dtype=None):
-        super().__init__()
+    def __init__(self, device='cuda:0', dtype=None, block_quant=False):
+        super().__init__(block_quant=block_quant)
         self.device = device
         self.dtype = dtype
         self.fp8 = False
 A8W8_INT8_dynamic = A8W8_int8_dynamic
 
 class A8W8_fp8_dynamic(A8W8_dynamic):
-    def __init__(self, device='cuda:0', dtype=None, fp8=default_fp8):
-        super().__init__()
+    def __init__(self, device='cuda:0', dtype=None, fp8=default_fp8, block_quant=False):
+        super().__init__(block_quant=block_quant)
         self.device = device
         self.dtype = dtype
         self.fp8 = fp8

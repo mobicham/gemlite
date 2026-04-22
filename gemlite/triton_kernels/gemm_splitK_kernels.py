@@ -10,7 +10,7 @@ from .config import AUTOTUNE
 from .utils import *
 from .utils import load_ptr
 
-KEYS          = ['M_CLOSEST', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'a_sizeof', 'b_sizeof'] 
+KEYS          = ['M_CLOSEST', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'a_sizeof', 'b_sizeof', 'channel_scale_mode'] 
 MATMUL_TYPE   = "GEMM_SPLITK"
 
 def kernel_config_pruner(configs, nargs, **kwargs):
@@ -27,6 +27,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
 
     #Check cache
     load_scales_as_block = kwargs['load_scales_as_block']
+    channel_scale_mode = kwargs.get('channel_scale_mode', 0)
     if(MATMUL_TYPE in GEMLITE_TRITON_CONFIG_CACHE):
         signature = str(tuple([get_closest_m(m), n, k, g, e, t]))
         if(signature in GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE]):
@@ -50,6 +51,12 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 config['BLOCK_SIZE_N'] = max(config['BLOCK_SIZE_N'], 128)
                 while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
                     config['BLOCK_SIZE_K'] *= 2
+
+            # Block-quant: clamp block sizes <= 128
+            if channel_scale_mode == 4:
+                config['BLOCK_SIZE_M'] = min(config['BLOCK_SIZE_M'], 128)
+                config['BLOCK_SIZE_N'] = min(config['BLOCK_SIZE_N'], 128)
+                config['BLOCK_SIZE_K'] = min(config['BLOCK_SIZE_K'], 128)
 
             yield triton.Config(config,
                 num_stages=num_stages,
@@ -97,6 +104,12 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
         split_k      = max(split_k, 1)
+        
+        # Block-quant: block sizes must be <= 128
+        if channel_scale_mode == 4:
+            block_size_m = min(block_size_m, 128)
+            block_size_n = min(block_size_n, 128)
+            block_size_k = min(block_size_k, 128)
         
         if not IS_HIP:
             if e == 1 and num_stages == 1:
@@ -398,7 +411,13 @@ def gemm_splitK_INT_kernel(
 
     if(zero_is_scalar):
         zero_scalar = tl.load(zeros_ptr, eviction_policy='evict_last')
-    
+
+    # Block-quantization: 128x128 weight scales (fp32), per-row per-128-K activation scales (fp32)
+    BLOCK_QUANT_SIZE: tl.constexpr = 128
+    if channel_scale_mode == 4:
+        scales_a_ptrs     = scales_a_ptr + offs_am * stride_meta_a_m
+        scales_b_base_ptr = scales_ptr + ((pid_n * BLOCK_SIZE_N) // BLOCK_QUANT_SIZE) * stride_meta_n
+
     #############################################################################################################
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
@@ -439,7 +458,15 @@ def gemm_splitK_INT_kernel(
             a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
         
         #Dot
-        acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype) 
+        if channel_scale_mode == 4:
+            #Block-quant:
+            k_m = ((k * SPLIT_K + pid_k) * BLOCK_SIZE_K) // BLOCK_QUANT_SIZE
+            scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g,  mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
+            scales_b = tl.load(scales_b_base_ptr + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
+            tmp = tl.dot(a, b.to(input_dtype), out_dtype=acc_dtype)
+            acc += tmp * scales_a[:, None] * scales_b
+        else:
+            acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype)
         
         #Advance
         a_ptrs += BLOCK_SIZE_K_U * stride_ak
