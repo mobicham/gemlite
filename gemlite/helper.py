@@ -516,7 +516,7 @@ class A8W8_dynamic:
         self.block_quant = block_quant
 
     def _from_weights_block_quant(self, weight, bias=None):
-        """DeepSeek-style 128x128 block quantization for weights + per-block (row x 128) activations."""
+        """128x128 block quantization for weights + per-block (row x 128) activations."""
         if(self.fp8):
             w_dtype, input_dtype, min_val, max_val = self.fp8, TORCH_TO_DTYPE[self.fp8], torch.finfo(self.fp8).min, torch.finfo(self.fp8).max
         else:
@@ -524,16 +524,21 @@ class A8W8_dynamic:
 
         in_features, out_features = weight.shape[::-1]
         B = self.BLOCK_QUANT_SIZE
-        assert in_features % B == 0 and out_features % B == 0, \
-            f"block_quant requires in_features ({in_features}) and out_features ({out_features}) divisible by {B}."
+        in_pad  = ((in_features  + B - 1) // B) * B
+        out_pad = ((out_features + B - 1) // B) * B
+        pad_k, pad_n = in_pad - in_features, out_pad - out_features
 
         dtype = weight.dtype if(self.dtype is None) else self.dtype
         assert dtype in [torch.float16, torch.bfloat16, torch.float32], "Invalid weight dtype, should be floating point."
         gemlite_dtype = TORCH_TO_DTYPE[dtype]
 
         weight = weight.to(dtype=torch.float32, device=self.device)
-        # Reshape to [N//B, B, K//B, B] and compute per-block amax
-        w = weight.view(out_features // B, B, in_features // B, B)
+        if pad_k or pad_n:
+            weight_padded = torch.nn.functional.pad(weight, (0, pad_k, 0, pad_n))
+        else:
+            weight_padded = weight
+        # Reshape to [N//B, B, K//B, B] and compute per-block amax on the padded view
+        w = weight_padded.view(out_pad // B, B, in_pad // B, B)
         amax = w.abs().amax(dim=(1, 3))  # [N//B, K//B]
         scales = (amax / max_val).clamp_(min=1e-6)  # [N//B, K//B] fp32
         W_q = (w / scales[:, None, :, None]).clamp_(min=min_val, max=max_val)
@@ -541,7 +546,10 @@ class A8W8_dynamic:
             W_q = W_q.to(w_dtype)
         else:
             W_q = W_q.round_().to(w_dtype)
-        W_q = W_q.view(out_features, in_features)
+        W_q = W_q.view(out_pad, in_pad)
+        if pad_k or pad_n:
+            # Drop the zero-padded rows/cols; keep the layer at its original shape.
+            W_q = W_q[:out_features, :in_features].contiguous()
 
         bias = bias.to(device=self.device, dtype=dtype) if (bias is not None) else None
 
@@ -562,7 +570,8 @@ class A8W8_dynamic:
         placeholder = torch.ones((out_features, 1), dtype=torch.float32, device=self.device)
         gemlite_linear.pack(W_q, scales=placeholder, zeros=None, bias=bias)
 
-        # Replace scales buffer with block-quant layout [K//B, N//B] fp32
+        # Replace scales buffer with block-quant layout [K//B, N//B] fp32 — shape is
+        # ceil(K/B) x ceil(N/B) so kernel lookups for the partial edge blocks remain in bounds.
         block_scales = scales.t().contiguous()  # [K//B, N//B]
         gemlite_linear.scales = torch.nn.Parameter(block_scales, requires_grad=False)
         gemlite_linear.meta_dtype = DType.FP32

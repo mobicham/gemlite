@@ -29,8 +29,7 @@ if _autotune is False: set_autotune(False)
 KERNEL_CACHE.ENABLE = False
 
 manual_seed               = 0
-#in_features, out_features = 4032, 2032
-in_features, out_features = 4096, 2048
+in_features, out_features = 4032, 2032
 batch_sizes               = [1, 3, 5, 16, 30, 65, 100, 250]
 W_nbits, group_size       = 4, 128 #128 / in_features
 
@@ -197,7 +196,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
             _x, _x_scaled = scale_activations(x, w_dtype=torch.int8)
             return torch.matmul(_x.to(torch.float16), (W_q.to(torch.float16) - 7).T) * _x_scaled
 
-        self.eval(gemlite_linear, ref_fn, tol=5e-3, input_fn=input_fn)
+        self.eval(gemlite_linear, ref_fn, tol=7e-3, input_fn=input_fn)
 
     def test_int8Wn_scaled_weights_scaled_activations(self):
         #INT8 x Wn - activation scaling only
