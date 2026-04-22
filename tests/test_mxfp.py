@@ -7,7 +7,7 @@ import unittest
 import torch
 import gemlite
 from gemlite import reset_config, set_autotune
-from gemlite.triton_kernels.config import KERNEL
+from gemlite.triton_kernels.config import KERNEL_CACHE
 from gemlite.helper import *
 
 def is_fp8_supported(device_index=0):
@@ -26,7 +26,7 @@ if _autotune is False: set_autotune(False)
 #gemlite.set_fast_nvfp4(True)
 #gemlite.set_ptx_fp4_pack(True) # with cuda13 ptxas-blackwell / TRITON_PTXAS_BLACKWELL_PATH
 #gemlite.set_native_atomic_bfp16(False)Ft
-KERNEL.ENABLE_CACHING = False
+KERNEL_CACHE.ENABLE = False
 
 manual_seed               = 0
 in_features, out_features = 4224, 2048 # test 5D TMA

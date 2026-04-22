@@ -8,7 +8,7 @@ import unittest
 import torch
 from gemlite import reset_config, set_autotune, set_native_atomic_bfp16
 from gemlite.core import GemLiteLinearTriton, DType, TORCH_TO_DTYPE, forward_functional
-from gemlite.triton_kernels.config import KERNEL
+from gemlite.triton_kernels.config import KERNEL_CACHE
 from gemlite.quant_utils import scale_activations_per_token_torch as scale_activations
 
 def is_fp8_supported():
@@ -26,7 +26,7 @@ matmul_types  = ['GEMV_REVSPLITK', 'GEMV', 'GEMV_SPLITK', 'GEMM_SPLITK', 'GEMM']
 reset_config()
 if _autotune is False: set_autotune(False)
 #set_native_atomic_bfp16(False)
-KERNEL.ENABLE_CACHING = False
+KERNEL_CACHE.ENABLE = False
 
 manual_seed               = 0
 in_features, out_features = 4032, 2032
