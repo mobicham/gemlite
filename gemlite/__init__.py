@@ -13,6 +13,7 @@ from .core import (
     set_autotune,
     set_kernel_caching,
     enable_tma,
+    enable_warp_specialize,
     set_native_atomic_bfp16,
     set_ptx_fp4_pack,
     enable_cudagraph_autotune,

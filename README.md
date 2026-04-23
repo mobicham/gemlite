@@ -103,6 +103,9 @@ gemlite.set_acc_dtype(DType)
 # Enable TMA - disabled by default. Only supported for MXFP/NVFP kernels
 gemlite.enable_tma(True)
 
+# Enable Triton warp specialization on the k-loop - disabled by default
+gemlite.enable_warp_specialize(True)
+
 # Enable/disable native bfp16 atomic addition - recommended to leave this at the default value
 gemlite.set_native_atomic_bfp16(True)
 

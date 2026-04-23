@@ -11,6 +11,9 @@ MATMUL_DTYPES = ['GEMV', 'GEMV_REVSPLITK', 'GEMV_SPLITK', 'GEMM_SPLITK', 'GEMM']
 # Block-quant tile used for FP8/INT8 block-level quantization
 BLOCK_QUANT_SIZE = 128
 
+# Triton warp specialization on the k-loop.
+WARP_SPECIALIZE = False
+
 class AUTOTUNE:
 	GEMV           = "fast" #"max", "fast", "default" 
 	GEMV_REVSPLITK = "fast"

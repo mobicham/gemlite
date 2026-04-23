@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE, BLOCK_QUANT_SIZE
+from . import config
 from .utils import *
 from .utils import load_ptr
 
@@ -333,6 +334,7 @@ def gemm_INT_kernel(
     use_tma: tl.constexpr = True,
     use_5d_scales: tl.constexpr = False,
     block_quant_size: tl.constexpr = BLOCK_QUANT_SIZE,
+    warp_specialize: tl.constexpr = False,
 ):
     """
     Based on https://github.com/fpgaminer/GPTQ-triton
@@ -401,7 +403,7 @@ def gemm_INT_kernel(
     #############################################################################################################
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-    for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
+    for k in tl.range(num_pid_k, num_stages=NUM_STAGES, warp_specialize=warp_specialize):
 
         if(A_load_order == 0): #Early load
             a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
@@ -552,6 +554,7 @@ def gemm_MX_kernel(
     #################################
     use_tma: tl.constexpr = True,
     use_5d_scales: tl.constexpr = False,
+    warp_specialize: tl.constexpr = False,
 ):
 
 
@@ -663,7 +666,7 @@ def gemm_MX_kernel(
 
     _meta_scale_norm = tl.load(meta_scale_norm_ptr, eviction_policy='evict_last') if group_size == 16 else 1.0
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
-    for k in tl.range(num_pid_k, num_stages=NUM_STAGES):
+    for k in tl.range(num_pid_k, num_stages=NUM_STAGES, warp_specialize=warp_specialize):
         # Load A and B tiles        
         if use_tma:
             a = tl.load_tensor_descriptor(a_desc, [pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K_A])
@@ -790,6 +793,7 @@ def gemm_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, scales_x
         use_tma             = use_5d_scales,
         use_5d_scales       = use_5d_scales,
         meta_scale_norm_ptr = meta_scale,
+        warp_specialize     = config.WARP_SPECIALIZE,
     )
     
     return output
