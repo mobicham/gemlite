@@ -106,6 +106,11 @@ def enable_tma(enabled: bool = True):
     global GEMLITE_USE_TMA
     GEMLITE_USE_TMA = enabled
 
+#Enable/disable Triton warp specialization.
+def enable_warp_specialize(enabled: bool = True):
+    from .triton_kernels import config as _cfg
+    _cfg.WARP_SPECIALIZE = enabled
+
 #Enable/disable BF16 native atomic add (disable for higher FP8/INT8 accuracy)
 def set_native_atomic_bfp16(enabled: bool = True):
     from .triton_kernels import utils as _utils
