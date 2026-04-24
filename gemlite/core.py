@@ -116,6 +116,11 @@ def set_native_atomic_bfp16(enabled: bool = True):
     from .triton_kernels import utils as _utils
     _utils.GEMLITE_USE_NATIVE_ATOMIC_BFP16 = enabled
 
+#Enable/disable using the input dtype as GEMV accumulator (faster on some GPUs, lower accuracy)
+def set_fast_gemv_acc(enabled: bool = True):
+    from .triton_kernels import config as _cfg
+    _cfg.GEMLITE_FAST_GEMV_ACC = enabled
+
 #Enable/disable hardware PTX FP4 packing in activation quantization (requires CUDA 13.0+ ptxas)
 def set_ptx_fp4_pack(enabled: bool = True):
     global GEMLITE_ENABLE_PTX_FP4_PACK
