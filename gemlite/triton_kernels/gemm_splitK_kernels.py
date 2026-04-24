@@ -9,7 +9,6 @@ from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE, BLOCK_QUANT_SIZE
 from . import config
 from .utils import *
-from .utils import load_ptr
 
 KEYS          = ['M_CLOSEST', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'a_sizeof', 'b_sizeof', 'channel_scale_mode'] 
 MATMUL_TYPE   = "GEMM_SPLITK"

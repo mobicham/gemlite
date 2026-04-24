@@ -7,8 +7,8 @@ import triton
 import triton.language as tl
 from ..dtypes import is_mx_dtype
 from .config import AUTOTUNE, BLOCK_QUANT_SIZE
+from . import config as _gemlite_config
 from .utils import *
-from .utils import load_ptr
 
 KEYS          = ['M', 'N', 'K', 'group_size', 'elements_per_sample', 'type_id', 'channel_scale_mode']
 MATMUL_TYPE   = "GEMV_SPLITK"
@@ -17,15 +17,17 @@ def kernel_config_pruner(configs, nargs, **kwargs):
     global KEYS
     from ..core import GEMLITE_TRITON_CONFIG_CACHE
     
-    m = nargs['M'] 
-    n = nargs['N'] 
-    k = nargs['K'] 
+    m = nargs['M']
+    n = nargs['N']
+    k = nargs['K']
     g = nargs['group_size']
     e = nargs['elements_per_sample']
+    t = nargs['type_id']
 
     #Check cache
+    channel_scale_mode = kwargs.get('channel_scale_mode', 0)
     if(MATMUL_TYPE in GEMLITE_TRITON_CONFIG_CACHE):
-        signature = str(tuple([nargs[i] for i in KEYS]))
+        signature = str(tuple([get_closest_m(m), n, k, g, e, t]))
         if(signature in GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE]):
             config     = copy.deepcopy(GEMLITE_TRITON_CONFIG_CACHE[MATMUL_TYPE][signature])
             num_stages = config.pop('num_stages')
@@ -68,7 +70,7 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_n = next_power_of_2(block_size_n)
 
         # Block-quant: one tile fits inside a BxB scale block
-        if nargs.get('channel_scale_mode', 0) == 4:
+        if channel_scale_mode == 4:
             block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
             block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
 
@@ -501,7 +503,7 @@ def gemv_splitK_forward(x: Tensor, W_q: Tensor, scales: Tensor, zeros: Tensor, s
         stride_meta_a_m, stride_meta_a_g = None, None
         
     dtype = DTYPE_TO_TRITON[input_dtype]
-    if(dtype in [tl.float16, tl.bfloat16, tl.float32]):
+    if(dtype in [tl.float16, tl.bfloat16, tl.float32] and _gemlite_config.GEMLITE_FAST_GEMV_ACC):
         acc_dtype = dtype
     else:
         acc_dtype = DTYPE_TO_TRITON[acc_dtype]
