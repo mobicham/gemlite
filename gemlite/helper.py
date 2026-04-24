@@ -514,41 +514,71 @@ class A8W8_dynamic:
         self.fp32_scale = fp32_scale
         self.block_quant = block_quant
 
-    def _from_weights_block_quant(self, weight, bias=None):
-        """BxB block quantization for weights + per-block (row x B) activations, B=BLOCK_QUANT_SIZE."""
+    def _from_weights_block_quant(self, weight, bias=None, scales=None):
+        """BxB block quantization for weights + per-block (row x B) activations, B=BLOCK_QUANT_SIZE.
+
+        If ``scales`` is None, ``weight`` is quantized in-place (expected to be a
+        floating-point tensor) using per-block amax. If ``scales`` is provided,
+        ``weight`` must already be pre-quantized (FP8/INT8) and ``scales`` must
+        be shape ``[N//B, K//B]`` in fp32 — no re-quantization is performed.
+        """
         if(self.fp8):
-            w_dtype, input_dtype, min_val, max_val = self.fp8, TORCH_TO_DTYPE[self.fp8], torch.finfo(self.fp8).min, torch.finfo(self.fp8).max
+            w_dtype, input_dtype = self.fp8, TORCH_TO_DTYPE[self.fp8]
+            min_val, max_val = torch.finfo(self.fp8).min, torch.finfo(self.fp8).max
         else:
-            w_dtype, input_dtype, min_val, max_val = torch.int8, DType.INT8, torch.iinfo(torch.int8).min, torch.iinfo(torch.int8).max
+            w_dtype, input_dtype = torch.int8, DType.INT8
+            min_val, max_val = torch.iinfo(torch.int8).min, torch.iinfo(torch.int8).max
 
         in_features, out_features = weight.shape[::-1]
         B = BLOCK_QUANT_SIZE
-        in_pad  = ((in_features  + B - 1) // B) * B
-        out_pad = ((out_features + B - 1) // B) * B
-        pad_k, pad_n = in_pad - in_features, out_pad - out_features
 
-        dtype = weight.dtype if(self.dtype is None) else self.dtype
-        assert dtype in [torch.float16, torch.bfloat16, torch.float32], "Invalid weight dtype, should be floating point."
-        gemlite_dtype = TORCH_TO_DTYPE[dtype]
+        if scales is not None:
+            # Pre-quantized path: weight is already w_dtype, scales already [N//B, K//B].
+            assert weight.dtype == w_dtype, (
+                f"Pre-quantized weight must be {w_dtype}, got {weight.dtype}"
+            )
+            expected_scale_shape = (
+                (out_features + B - 1) // B,
+                (in_features + B - 1) // B,
+            )
+            assert tuple(scales.shape) == expected_scale_shape, (
+                f"Pre-quantized scales must have shape {expected_scale_shape}, "
+                f"got {tuple(scales.shape)}"
+            )
+            if not weight.is_contiguous():
+                weight = weight.contiguous()
+            W_q = weight.to(device=self.device)
+            scales = scales.to(device=self.device, dtype=torch.float32)
+            dtype = self.dtype if (self.dtype is not None) else torch.bfloat16
+            gemlite_dtype = TORCH_TO_DTYPE[dtype]
+        else:
+            # Self-quantization path: weight is floating-point, we compute scales.
+            dtype = weight.dtype if(self.dtype is None) else self.dtype
+            assert dtype in [torch.float16, torch.bfloat16, torch.float32], "Invalid weight dtype, should be floating point."
+            gemlite_dtype = TORCH_TO_DTYPE[dtype]
 
-        weight = weight.to(dtype=torch.float32, device=self.device)
-        if pad_k or pad_n:
-            weight_padded = torch.nn.functional.pad(weight, (0, pad_k, 0, pad_n))
-        else:
-            weight_padded = weight
-        # Reshape to [N//B, B, K//B, B] and compute per-block amax on the padded view
-        w = weight_padded.view(out_pad // B, B, in_pad // B, B)
-        amax = w.abs().amax(dim=(1, 3))  # [N//B, K//B]
-        scales = (amax / max_val).clamp_(min=1e-6)  # [N//B, K//B] fp32
-        W_q = (w / scales[:, None, :, None]).clamp_(min=min_val, max=max_val)
-        if(w_dtype.is_floating_point):
-            W_q = W_q.to(w_dtype)
-        else:
-            W_q = W_q.round_().to(w_dtype)
-        W_q = W_q.view(out_pad, in_pad)
-        if pad_k or pad_n:
-            # Drop the zero-padded rows/cols; keep the layer at its original shape.
-            W_q = W_q[:out_features, :in_features].contiguous()
+            in_pad  = ((in_features  + B - 1) // B) * B
+            out_pad = ((out_features + B - 1) // B) * B
+            pad_k, pad_n = in_pad - in_features, out_pad - out_features
+
+            weight = weight.to(dtype=torch.float32, device=self.device)
+            if pad_k or pad_n:
+                weight_padded = torch.nn.functional.pad(weight, (0, pad_k, 0, pad_n))
+            else:
+                weight_padded = weight
+            # Reshape to [N//B, B, K//B, B] and compute per-block amax on the padded view
+            w = weight_padded.view(out_pad // B, B, in_pad // B, B)
+            amax = w.abs().amax(dim=(1, 3))  # [N//B, K//B]
+            scales = (amax / max_val).clamp_(min=1e-6)  # [N//B, K//B] fp32
+            W_q = (w / scales[:, None, :, None]).clamp_(min=min_val, max=max_val)
+            if(w_dtype.is_floating_point):
+                W_q = W_q.to(w_dtype)
+            else:
+                W_q = W_q.round_().to(w_dtype)
+            W_q = W_q.view(out_pad, in_pad)
+            if pad_k or pad_n:
+                # Drop the zero-padded rows/cols; keep the layer at its original shape.
+                W_q = W_q[:out_features, :in_features].contiguous()
 
         bias = bias.to(device=self.device, dtype=dtype) if (bias is not None) else None
 
@@ -593,8 +623,7 @@ class A8W8_dynamic:
             bias = bias.data
 
         if self.block_quant:
-            assert scales is None, "Pre-quantized path is not supported with block_quant=True."
-            return self._from_weights_block_quant(weight, bias=bias)
+            return self._from_weights_block_quant(weight, bias=bias, scales=scales)
 
         if(self.fp8): #FP8
             w_dtype, input_dtype, min_val, max_val = self.fp8, TORCH_TO_DTYPE[self.fp8], torch.finfo(self.fp8).min, torch.finfo(self.fp8).max
