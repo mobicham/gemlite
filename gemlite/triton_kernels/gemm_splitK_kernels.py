@@ -52,8 +52,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
                     config['BLOCK_SIZE_K'] *= 2
 
-            # Block-quant: clamp block sizes <= BLOCK_QUANT_SIZE
-            if channel_scale_mode == 4:
+            # INT Block-quant (mode==5): clamp block sizes <= BLOCK_QUANT_SIZE
+            if channel_scale_mode == 5:
                 # BLOCK_SIZE_M is unconstrained (scales_a is [M, K/BLOCK_QUANT_SIZE])
                 config['BLOCK_SIZE_N'] = min(config['BLOCK_SIZE_N'], BLOCK_QUANT_SIZE)
                 config['BLOCK_SIZE_K'] = min(config['BLOCK_SIZE_K'], BLOCK_QUANT_SIZE)
@@ -105,8 +105,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_n = next_power_of_2(block_size_n)
         split_k      = max(split_k, 1)
         
-        # Block-quant: block sizes must be <= BLOCK_QUANT_SIZE
-        if channel_scale_mode == 4:
+        # INT Block-quant (mode==5): block sizes must be <= BLOCK_QUANT_SIZE
+        if channel_scale_mode == 5:
             # BLOCK_SIZE_M is unconstrained (scales_a is [M, K/BLOCK_QUANT_SIZE])
             block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
             block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
@@ -414,9 +414,9 @@ def gemm_splitK_INT_kernel(
     if(zero_is_scalar):
         zero_scalar = tl.load(zeros_ptr, eviction_policy='evict_last')
 
-    # Block-quantization: BxB weight scales (fp32), per-row per-B-K activation scales (fp32),
+    # INT Block-quantization (mode==5): BxB weight scales (fp32), per-row per-B-K activation scales (fp32),
     # where B = block_quant_size (kernel arg, defaulted from BLOCK_QUANT_SIZE in config.py).
-    if channel_scale_mode == 4:
+    if channel_scale_mode == 5:
         scales_a_ptrs     = scales_a_ptr + offs_am * stride_meta_a_m
         scales_b_base_ptr = scales_ptr + ((pid_n * BLOCK_SIZE_N) // block_quant_size) * stride_meta_n
 
@@ -460,8 +460,8 @@ def gemm_splitK_INT_kernel(
             a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
         
         #Dot
-        if channel_scale_mode == 4:
-            #Block-quant:
+        if channel_scale_mode == 5:
+            #INT Block-quant:
             k_m = ((k * SPLIT_K + pid_k) * BLOCK_SIZE_K) // block_quant_size
             scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g,  mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
             scales_b = tl.load(scales_b_base_ptr + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
@@ -711,8 +711,10 @@ def gemm_splitK_MX_kernel(
             scales_b = load_ptr(scales_b_ptrs + k_m * stride_meta_g, scale_b_mask, meta_evict_policy, not EVEN_K)
 
         if(channel_scale_mode == 4):
-            scale_a_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
-            scales_a = load_ptr(scales_a_ptrs + k_m * stride_meta_a_g, scale_a_mask, meta_evict_policy, not EVEN_K)
+            scale_a_mask_m = (offs_am[:, None] < M) if not EVEN_M else True
+            scale_a_mask_k = ((offs_k_scales[None, :] + k_m) < (K // group_size)) if not EVEN_K else True
+            scale_a_mask = scale_a_mask_m & scale_a_mask_k
+            scales_a = load_ptr(scales_a_ptrs + k_m * stride_meta_a_g, scale_a_mask, meta_evict_policy, not (EVEN_M and EVEN_K))
         else:
             scales_a = scales_a_1s
 

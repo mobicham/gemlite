@@ -64,8 +64,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-        # Block-quant: one tile fits inside a BxB scale block
-        if channel_scale_mode == 4:
+        # INT Block-quant (mode==5): one tile fits inside a BxB scale block
+        if channel_scale_mode == 5:
             block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
             block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
 
@@ -370,9 +370,9 @@ def gemv_INT_revsplitK_kernel(
     if(dot_prod_mode == 2):
         acc = tl.sum(a * b.to(input_dtype), axis=0, keep_dims=True)
 
-    # Block-quant: scale this stage's dot by the matching (A, B) 128-block scales before
+    # INT Block-quant (mode==5): scale this stage's dot by the matching (A, B) 128-block scales before
     # accumulating into the running total. Next stage starts from zero in  below.
-    if channel_scale_mode == 4:
+    if channel_scale_mode == 5:
         n_m_bq = (pid_n * BLOCK_SIZE_N) // block_quant_size
         k_m_bq1 = (pid_k * BLOCK_SIZE_K) // block_quant_size
         scales_b1 = tl.load(scales_ptr + k_m_bq1 * stride_meta_g + n_m_bq * stride_meta_n, eviction_policy=meta_evict_policy)
@@ -401,7 +401,7 @@ def gemv_INT_revsplitK_kernel(
     
     #Dot product
     if(dump_b_val > 0): b = b.to(tl.float32) * dump_b_val
-    if channel_scale_mode == 4:
+    if channel_scale_mode == 5:
         k_m_bq2 = ((pid_k + 1) * BLOCK_SIZE_K) // block_quant_size
         scales_b2 = tl.load(scales_ptr + k_m_bq2 * stride_meta_g + n_m_bq * stride_meta_n, eviction_policy=meta_evict_policy)
         scales_a2 = tl.load(scales_a_ptr + offs_am * stride_meta_a_m + k_m_bq2 * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)

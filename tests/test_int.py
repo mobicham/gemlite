@@ -348,7 +348,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
         gemlite_linear = A8W8_INT8_dynamic(device=device, dtype=compute_dtype, block_quant=True).from_linear(lin, del_orig=False)
 
         self.assertTrue(gemlite_linear.W_group_mode == 0)
-        self.assertTrue(gemlite_linear.channel_scale_mode == 4)
+        self.assertTrue(gemlite_linear.channel_scale_mode == 5)
 
         def input_fn(batch_size):
             return torch.randn((batch_size, in_features), dtype=compute_dtype, device=device) / 10.
@@ -368,7 +368,7 @@ class TestGemLiteLinearTriton(unittest.TestCase):
         gemlite_linear = A8W8_FP8_dynamic(device=device, dtype=compute_dtype, block_quant=True).from_linear(lin, del_orig=False)
 
         self.assertTrue(gemlite_linear.W_group_mode == 0)
-        self.assertTrue(gemlite_linear.channel_scale_mode == 4)
+        self.assertTrue(gemlite_linear.channel_scale_mode == 5)
 
         def input_fn(batch_size):
             return torch.randn((batch_size, in_features), dtype=compute_dtype, device=device) / 10.

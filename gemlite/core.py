@@ -71,6 +71,7 @@ GEMLITE_USE_TMA              = False # Set to False for faster MXFP8 on sm_120
 GEMLITE_ENABLE_PTX_FP4_PACK  = False # Set to True for hardware e2m1x2 FP4 packing (requires CUDA 13.0+ ptxas)
 GEMLITE_FAST_NVFP4           = False
 GEMLITE_NVFP4_META_SCALES    = []  # Pre-allocated per-GPU meta_scale tensors
+GEMLITE_NVFP4_INPUT_SCALES: dict = {}  # per-layer calibrated scale, keyed by W_q.data_ptr()
 
 ###################################################################################
 #Utils
@@ -224,7 +225,7 @@ def forward_functional(
         input_dtype = DType(meta_args[5])
         channel_scale_mode = meta_args[9]
 
-        if(input_dtype in FP8_INT8_DTYPES and channel_scale_mode == 4): #INT8 / FP8 block quantization
+        if(input_dtype in FP8_INT8_DTYPES and channel_scale_mode == 5): #INT8 / FP8 block quantization
             x, scales_x = scale_activations_per_block(x, w_dtype=DTYPE_TO_TORCH[input_dtype.value])
 
         elif(input_dtype in FP8_INT8_DTYPES): #INT8 / FP8
@@ -241,10 +242,13 @@ def forward_functional(
 
         elif(input_dtype in [DType.NVFP4] and channel_scale_mode == 4): #NVPF4: TODO
             meta_scale = tensor_args[3]
-            _static_meta = GEMLITE_NVFP4_META_SCALES[x.device.index] if GEMLITE_FAST_NVFP4 else None
+            _static_meta = GEMLITE_NVFP4_INPUT_SCALES.get(tensor_args[0].data_ptr()) \
+                if GEMLITE_NVFP4_INPUT_SCALES else None
+            if _static_meta is None and GEMLITE_FAST_NVFP4:
+                _static_meta = GEMLITE_NVFP4_META_SCALES[x.device.index]
             x, scales_x, meta_scale_a = scale_activations_nvfp4(x, meta_scale=_static_meta)
             meta_scale = 1.0 / (meta_scale * meta_scale_a)
-    
+
     # For weight-only NVFP4 (group_size=16): pass stored meta_scale to the kernel
     if not scaled_activations and meta_args[2] == 16:
         meta_scale = tensor_args[3]

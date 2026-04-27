@@ -69,8 +69,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-        # Block-quant: one tile fits inside a BxB scale block
-        if channel_scale_mode == 4:
+        # INT Block-quant (mode==5): one tile fits inside a BxB scale block
+        if channel_scale_mode == 5:
             block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
             block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
 
@@ -364,8 +364,8 @@ def gemv_INT_splitK_kernel(
         zero_scalar = tl.load(zeros_ptr, eviction_policy='evict_last')
     ##################################################################
 
-    # Block-quant setup: per-tile scales_a/scales_b ptr bases
-    if channel_scale_mode == 4:
+    # INT Block-quant setup (mode==5): per-tile scales_a/scales_b ptr bases
+    if channel_scale_mode == 5:
         scales_a_base_ptrs = scales_a_ptr + offs_am * stride_meta_a_m
         scales_b_base_ptr  = scales_ptr + ((pid_n * BLOCK_SIZE_N) // block_quant_size) * stride_meta_n
 
@@ -417,7 +417,7 @@ def gemv_INT_splitK_kernel(
         if(dot_prod_mode == 1):
             current_acc = tl.sum(a.reshape((BLOCK_SIZE_K, 1), can_reorder=False) * b.to(input_dtype), axis=0, keep_dims=True).to(acc_dtype) 
             
-        if channel_scale_mode == 4:
+        if channel_scale_mode == 5:
             k_m = ((k * SPLIT_K + pid_k) * BLOCK_SIZE_K) // block_quant_size
             scales_a_bq = tl.load(scales_a_base_ptrs + k_m * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
             scales_b_bq = tl.load(scales_b_base_ptr + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
