@@ -70,8 +70,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         block_size_k = next_power_of_2(block_size_k)
         block_size_n = next_power_of_2(block_size_n)
 
-        # Block-quant (channel_scale_mode==4): one tile must fit inside one BxB scale block
-        if channel_scale_mode == 4:
+        # INT Block-quant (channel_scale_mode==5): one tile must fit inside one BxB scale block
+        if channel_scale_mode == 5:
             block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
             block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
 
@@ -406,7 +406,7 @@ def gemv_INT_kernel(
         scales_b = tl.load(scales_ptr + offs_bn, mask=offs_bn < N,   other=1, eviction_policy=meta_evict_policy)
         acc      = acc.to(meta_dtype) * (scales_a[:, None] * scales_b[None, :])
 
-    if channel_scale_mode == 4: #block-quant: one scale_b/scale_a per tile
+    if channel_scale_mode == 5: #INT block-quant: one scale_b/scale_a per tile
         k_m_bq = (pid_k * BLOCK_SIZE_K) // block_quant_size
         n_m_bq = (pid_n * BLOCK_SIZE_N) // block_quant_size
         scales_b = tl.load(scales_ptr + k_m_bq * stride_meta_g + n_m_bq * stride_meta_n, eviction_policy=meta_evict_policy)

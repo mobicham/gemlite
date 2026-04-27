@@ -605,9 +605,9 @@ class A8W8_dynamic:
         gemlite_linear.scales = torch.nn.Parameter(block_scales, requires_grad=False)
         gemlite_linear.meta_dtype = DType.FP32
 
-        # channel_scale_mode=4: in-kernel block-scale multiply, no W_group dequant on B
+        # channel_scale_mode=5: INT/FP8 in-kernel block-scale multiply, no W_group dequant on B
         gemlite_linear.W_group_mode = 0
-        gemlite_linear.channel_scale_mode = 4
+        gemlite_linear.channel_scale_mode = 5
 
         # Refresh metadata tensor to reflect updated modes/meta_dtype
         gemlite_linear.metadata = torch.nn.Parameter(
@@ -1122,13 +1122,15 @@ class A4W4_NVFP_dynamic:
         self.group_size = 16
         self.input_dtype = DType.NVFP4
 
-    def from_packed_weights(self, weight_packed, bias=None, scales=None, meta_scale=None):
+    def from_packed_weights(self, weight_packed, bias=None, scales=None, meta_scale=None, input_scale=None):
         """Load pre-packed NVFP4 weights (nibble-packed [N, K//2] uint8).
         Scales: fp8_e4m3fn or uint8 (same bit pattern) [N, K//16].
-        meta_scale: global scale factor (fp32, = 448*6/global_amax = flashinfer gsf)."""
-        return self.from_weights(weight_packed, bias=bias, scales=scales, meta_scale=meta_scale, packed=True)
+        meta_scale: global scale factor (fp32, = 448*6/global_amax = flashinfer gsf).
+        input_scale: ModelOpt-style fp32 scalar = global_amax(x)/(448*6). If provided,
+        gemlite stores its reciprocal and skips the dynamic amax on activations."""
+        return self.from_weights(weight_packed, bias=bias, scales=scales, meta_scale=meta_scale, input_scale=input_scale, packed=True)
 
-    def from_weights(self, weight, bias=None, scales=None, meta_scale=None, packed=False):
+    def from_weights(self, weight, bias=None, scales=None, meta_scale=None, input_scale=None, packed=False):
         if(isinstance(weight, torch.nn.Parameter)):
             weight = weight.data
         if(isinstance(bias, torch.nn.Parameter)):
@@ -1145,20 +1147,20 @@ class A4W4_NVFP_dynamic:
         assert scales.dtype in [torch.float8_e4m3fn, torch.uint8], f"Invalid scales.dtype, should be float8_e4m3fn, got {scales.dtype}."
         assert self.dtype is not None, f"Input dtype should be either torch.float16 or torch.bfloat16, not None."
         assert self.group_size == 16, f"Only group_size=16 is supported for NVFP4, got {self.group_size}"
-         
+
         dtype = self.dtype
         gemlite_dtype = TORCH_TO_DTYPE[dtype]
-        
+
         W_q = weight.to(device=self.device)
-        scales = scales.to(device=self.device) 
+        scales = scales.to(device=self.device)
         if scales.dtype == torch.uint8:
             scales = scales.view(torch.float8_e4m3fn)
         bias = bias.to(device=self.device, dtype=dtype) if (bias is not None) else None
 
-        gemlite_linear = GemLiteLinearTriton(self.W_nbits, 
-                        group_size=self.group_size, 
-                        in_features=in_features, 
-                        out_features=out_features, 
+        gemlite_linear = GemLiteLinearTriton(self.W_nbits,
+                        group_size=self.group_size,
+                        in_features=in_features,
+                        out_features=out_features,
                         input_dtype=self.input_dtype,
                         output_dtype=gemlite_dtype,
                         scaled_activations=True,
@@ -1172,6 +1174,11 @@ class A4W4_NVFP_dynamic:
                 meta_scale.to(dtype=torch.float32, device=gemlite_linear.W_q.device).reshape(()),
                 requires_grad=False,
             )
+        if input_scale is not None:
+            # ModelOpt input_scale = global_amax/(448*6); gemlite kernel expects 1/input_scale.
+            from gemlite.core import GEMLITE_NVFP4_INPUT_SCALES
+            _is = input_scale.to(dtype=torch.float32, device=gemlite_linear.W_q.device).reshape(1)
+            GEMLITE_NVFP4_INPUT_SCALES[gemlite_linear.W_q.data_ptr()] = (1.0 / _is).contiguous()
         return gemlite_linear
 
 
@@ -1182,7 +1189,7 @@ class A4W4_NVFP_dynamic:
             self.quantizer_mx = WeightQuantizerMXFP(device=self.device, compute_dtype=linear_layer.weight.dtype)
 
         W = linear_layer.weight.data
-        bias = linear_layer.bias.clone() if (linear_layer.bias is not None) else None 
+        bias = linear_layer.bias.clone() if (linear_layer.bias is not None) else None
         N, K = W.shape
         W_q, scales, _meta_scale = self.quantizer_mx.quantize_nvfp4(W, index=True)
         W_q, scales = W_q.view([N, K]), scales.view(N, K // self.group_size)

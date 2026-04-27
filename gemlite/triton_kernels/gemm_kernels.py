@@ -52,8 +52,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
                 while (config['BLOCK_SIZE_K'] // g) % 4 != 0:
                     config['BLOCK_SIZE_K'] *= 2
 
-            # Block-quant: clamp block sizes <= BLOCK_QUANT_SIZE
-            if channel_scale_mode == 4:
+            # INT Block-quant (mode==5): clamp block sizes <= BLOCK_QUANT_SIZE
+            if channel_scale_mode == 5:
                 # BLOCK_SIZE_M is unconstrained (scales_a is [M, K/BLOCK_QUANT_SIZE])
                 config['BLOCK_SIZE_N'] = min(config['BLOCK_SIZE_N'], BLOCK_QUANT_SIZE)
                 config['BLOCK_SIZE_K'] = min(config['BLOCK_SIZE_K'], BLOCK_QUANT_SIZE)
@@ -98,8 +98,8 @@ def kernel_config_pruner(configs, nargs, **kwargs):
         else:
             block_size_k = max(min(block_size_k, g), 32) #tl.dot minimum K
 
-        #Block-quant: single fp32 scale per BxB block, so BLOCK_SIZE_{M,N,K} must be <=BLOCK_QUANT_SIZE
-        if channel_scale_mode == 4:
+        #INT Block-quant (mode==5): single fp32 scale per BxB block, so BLOCK_SIZE_{M,N,K} must be <=BLOCK_QUANT_SIZE
+        if channel_scale_mode == 5:
             # BLOCK_SIZE_M is unconstrained (scales_a is [M, K/BLOCK_QUANT_SIZE])
             block_size_n = min(block_size_n, BLOCK_QUANT_SIZE)
             block_size_k = min(block_size_k, BLOCK_QUANT_SIZE)
@@ -393,8 +393,8 @@ def gemm_INT_kernel(
     if(zero_is_scalar):
         zero_scalar = tl.load(zeros_ptr, eviction_policy='evict_last')
     
-    # Block-quantization: BxB weight scales (fp32), per-row per-B-K activation scales (fp32), where B = BLOCK_QUANT_SIZE
-    if channel_scale_mode == 4:
+    # INT Block-quantization (mode==5): BxB weight scales (fp32), per-row per-B-K activation scales (fp32), where B = BLOCK_QUANT_SIZE
+    if channel_scale_mode == 5:
         K_PER_SCALE:      tl.constexpr = block_quant_size // BLOCK_SIZE_K   #k-iters per B-K block (>=1)
         scales_a_ptrs     = scales_a_ptr + offs_am * stride_meta_a_m
         scales_b_base_ptr = scales_ptr + ((pid_n * BLOCK_SIZE_N) // block_quant_size) * stride_meta_n
@@ -438,18 +438,18 @@ def gemm_INT_kernel(
         if(A_load_order == 3): #Late load 
             a = load_ptr(a_ptrs, a_mask, a_evict, not (EVEN_M and EVEN_K))
         
-        #Block-quant: load per-block activation/weight fp32 scales before the dot.
-        if channel_scale_mode == 4:
+        #INT Block-quant (mode==5): load per-block activation/weight fp32 scales before the dot.
+        if channel_scale_mode == 5:
             k_m = k // K_PER_SCALE
             scales_a = tl.load(scales_a_ptrs + k_m * stride_meta_a_g, mask=offs_am < M, other=0.0, eviction_policy=meta_evict_policy)
             scales_b = tl.load(scales_b_base_ptr + k_m * stride_meta_g, eviction_policy=meta_evict_policy)
 
         #Dot
-        if channel_scale_mode == 4:
+        if channel_scale_mode == 5:
             tmp = tl.dot(a, b.to(input_dtype), out_dtype=acc_dtype)
             acc += tmp * scales_a[:, None] * scales_b
         else:
-            acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype) 
+            acc = tl.dot(a, b.to(input_dtype), acc=acc, out_dtype=acc_dtype)
         
         #Advance
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -685,11 +685,12 @@ def gemm_MX_kernel(
             scales_b = load_ptr(scales_b_ptrs + k_m * stride_meta_g, scale_b_mask, meta_evict_policy, not EVEN_K)
         
         if(channel_scale_mode == 4):
-            scale_a_mask = ((offs_k_scales[None, :] + k_m) < (K // group_size))
-            scales_a = load_ptr(scales_a_ptrs + k_m * stride_meta_a_g, scale_a_mask, meta_evict_policy, not EVEN_K)
+            scale_a_mask_m = (offs_am[:, None] < M) if not EVEN_M else True
+            scale_a_mask_k = ((offs_k_scales[None, :] + k_m) < (K // group_size)) if not EVEN_K else True
+            scale_a_mask = scale_a_mask_m & scale_a_mask_k
+            scales_a = load_ptr(scales_a_ptrs + k_m * stride_meta_a_g, scale_a_mask, meta_evict_policy, not (EVEN_M and EVEN_K))
         else:
             scales_a = scales_a_1s
-
         ####################################################################################
         
         acc = tl.dot_scaled(a, scales_a, a_dtype, b, scales_b, b_dtype, acc)
