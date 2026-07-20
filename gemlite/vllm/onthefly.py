@@ -4,6 +4,7 @@ time. Mirrors hqq.utils.vllm.set_vllm_onthefly_hqq_quant()."""
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -139,19 +140,24 @@ def set_onthefly_quant(weight_bits=4, group_size=None,
     from vllm.model_executor.layers import linear as _linear
 
     skip = list(skip_modules or [])
-    original_init = _linear.LinearBase.__init__
+    original_init = getattr(
+        _linear.LinearBase.__init__, "_gemlite_original_init",
+        _linear.LinearBase.__init__,
+    )
+    signature = inspect.signature(original_init)
 
-    def patched_init(self, input_size, output_size, skip_bias_add=False,
-                     params_dtype=None, quant_config=None, *args, **kwargs):
-        if quant_config is None:
-            quant_config = GemliteOnTheFlyConfig(
+    def patched_init(self, *args, **kwargs):
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        if bound.arguments.get("quant_config") is None:
+            bound.arguments["quant_config"] = GemliteOnTheFlyConfig(
                 weight_bits=weight_bits, group_size=group_size,
                 quant_mode=quant_mode, block_quant=block_quant,
                 skip_modules=skip,
             )
-        original_init(self, input_size, output_size, skip_bias_add,
-                      params_dtype, quant_config, *args, **kwargs)
+        original_init(*bound.args, **bound.kwargs)
 
+    patched_init._gemlite_original_init = original_init
     _linear.LinearBase.__init__ = patched_init
     logger.info("gemlite on-the-fly: weight_bits=%d mode=%s group=%s block=%s",
                 weight_bits, quant_mode, group_size, block_quant)

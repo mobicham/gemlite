@@ -12,21 +12,52 @@ import os
 from typing import Iterable, Optional
 
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization.awq import (
-    AWQConfig, AWQLinearMethod,
-)
-from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
+try:
+    from vllm.model_executor.layers.quantization.awq import (
+        AWQConfig, AWQLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinConfig
+    _AUTO_AWQ = False
+    _AWQ_LINEAR_METHODS = (AWQLinearMethod,)
+except ModuleNotFoundError:
+    from vllm.model_executor.layers.quantization.auto_awq import (
+        AutoAWQConfig as AWQConfig, AutoAWQMarlinLinearMethod,
+        AutoAWQLinearMethod as AWQLinearMethod,
+    )
+    AWQMarlinConfig = AWQConfig
+    _AUTO_AWQ = True
+    _AWQ_LINEAR_METHODS = (AWQLinearMethod, AutoAWQMarlinLinearMethod)
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8, CompressedTensorsW8A8Int8,
+)
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
-from vllm.model_executor.layers.quantization.gguf import (
-    GGUFConfig, GGUFLinearMethod,
-)
-from vllm.model_executor.layers.quantization.gptq import (
-    GPTQConfig, GPTQLinearMethod,
-)
-from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
+try:
+    from vllm.model_executor.layers.quantization.gguf import (
+        GGUFConfig, GGUFLinearMethod,
+    )
+    _HAS_GGUF = True
+except ModuleNotFoundError:
+    from vllm.model_executor.layers.linear import LinearMethodBase
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+    GGUFConfig = QuantizationConfig
+    GGUFLinearMethod = LinearMethodBase
+    _HAS_GGUF = False
+try:
+    from vllm.model_executor.layers.quantization.gptq import (
+        GPTQConfig, GPTQLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinConfig
+    _AUTO_GPTQ = False
+except ModuleNotFoundError:
+    from vllm.model_executor.layers.quantization.auto_gptq import (
+        AutoGPTQConfig as GPTQConfig,
+        AutoGPTQLinearMethod as GPTQLinearMethod,
+    )
+    GPTQMarlinConfig = GPTQConfig
+    _AUTO_GPTQ = True
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config, ModelOptNvFp4LinearMethod,
 )
@@ -35,10 +66,12 @@ from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE
 
 from .common import load_cache
 from .schemes import (
-    GemliteAwqLinearMethod, GemliteCTW4A4Fp4, GemliteCTW4A16Fp4,
-    GemliteCTW4A16Mxfp4, GemliteCTWNA16Int, GemliteFp8BlockLinearMethod,
-    GemliteFp8PerTensorLinearMethod, GemliteA16W4GroupLinearMethod,
-    GemliteGGUFLinearMethod, GemliteNvFp4LinearMethod,
+    GemliteAwqLinearMethod, GemliteCTW4A4Fp4, GemliteCTW4A4Mxfp4,
+    GemliteCTW4A16Fp4, GemliteCTW4A16Mxfp4, GemliteCTW8A8Fp8,
+    GemliteCTW8A8Int8, GemliteCTWNA16Int,
+    GemliteFp8BlockLinearMethod, GemliteFp8PerTensorLinearMethod,
+    GemliteA16W4GroupLinearMethod, GemliteGGUFLinearMethod,
+    GemliteNvFp4LinearMethod,
 )
 
 
@@ -62,6 +95,7 @@ _ALIASES = {"A16W4_INT": "A16W4_HQQ_INT", "A16W8_INT": "A16W8_HQQ_INT"}
 _HQQ_TOGGLE = {4: "A16W4_HQQ_INT", 8: "A16W8_HQQ_INT"}
 _PATCHED = False
 _ENABLED: set[str] = set()
+_OVERRIDES: dict[str, type] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -116,12 +150,15 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
         return "compressed-tensors"
 
     def _get_scheme_from_parts(self, weight_quant, input_quant,
-                               format=None, layer_name=None):
+                               output_quant=None, format=None, layer_name=None):
         if self._is_nvfp4_format(weight_quant) and input_quant is None:
             if _ENABLED & {"A16W4_MXFP", "A4W4_NVFP_DYNAMIC"}:
                 return GemliteCTW4A16Fp4()
-        if self._is_mxfp4(weight_quant) and "A16W4_MXFP" in _ENABLED:
-            return GemliteCTW4A16Mxfp4()
+        if self._is_mxfp4(weight_quant):
+            if "A4W4_MXFP_DYNAMIC" in _ENABLED:
+                return GemliteCTW4A4Mxfp4()
+            if "A16W4_MXFP" in _ENABLED:
+                return GemliteCTW4A16Mxfp4()
 
         # compressed_tensors moved this helper between versions; vLLM also
         # re-exports it from its CT utils module. Try all known locations so
@@ -172,9 +209,32 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
                 layer_name=layer_name,
             )
 
-        return super()._get_scheme_from_parts(
-            weight_quant, input_quant, format=format, layer_name=layer_name,
+        stock_scheme = super()._get_scheme_from_parts(
+            weight_quant, input_quant, output_quant=output_quant,
+            format=format, layer_name=layer_name,
         )
+        if ("A8W8_FP8_DYNAMIC" in _ENABLED
+                and isinstance(stock_scheme, CompressedTensorsW8A8Fp8)
+                and not stock_scheme.is_static_input_scheme
+                and (stock_scheme.weight_block_size is None
+                     or stock_scheme.weight_block_size == [BLOCK_QUANT_SIZE,
+                                                           BLOCK_QUANT_SIZE])):
+            return GemliteCTW8A8Fp8(
+                weight_quant=weight_quant,
+                is_static_input_scheme=stock_scheme.is_static_input_scheme,
+            )
+        if ("A8W8_INT8_DYNAMIC" in _ENABLED
+                and isinstance(stock_scheme, CompressedTensorsW8A8Int8)
+                and not stock_scheme.is_static_input_scheme
+                and stock_scheme.input_symmetric
+                and getattr(stock_scheme.strategy, "value",
+                            stock_scheme.strategy) == "channel"):
+            return GemliteCTW8A8Int8(
+                strategy=stock_scheme.strategy,
+                is_static_input_scheme=stock_scheme.is_static_input_scheme,
+                input_symmetric=stock_scheme.input_symmetric,
+            )
+        return stock_scheme
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +300,7 @@ class GemliteAwqConfig(AWQConfig):
 
     def get_quant_method(self, layer, prefix):
         method = super().get_quant_method(layer, prefix)
-        if isinstance(method, AWQLinearMethod) and _gptq_enabled(self):
+        if isinstance(method, _AWQ_LINEAR_METHODS) and _gptq_enabled(self):
             return _awq_method(self, method)
         return method
 
@@ -324,15 +384,24 @@ def _build_overrides() -> dict[str, type]:
         o["fp8"] = GemliteFp8Config
     if "A4W4_NVFP_DYNAMIC" in _ENABLED:
         o["modelopt_fp4"] = GemliteModelOptNvFp4Config
-    if _ENABLED & {"A4W4_NVFP_DYNAMIC", "A4W4_MXFP_DYNAMIC",
+    if _ENABLED & {"A8W8_FP8_DYNAMIC", "A8W8_INT8_DYNAMIC",
+                   "A4W4_NVFP_DYNAMIC", "A4W4_MXFP_DYNAMIC",
                    "A16W4_MXFP", "A16W4_HQQ_INT", "A16W8_HQQ_INT"}:
         o["compressed-tensors"] = GemliteCompressedTensorsConfig
     if _ENABLED & {"A16W4_HQQ_INT", "A16W8_HQQ_INT"}:
-        o["gptq"] = GemliteGptqConfig
-        o["gptq_marlin"] = GemliteGptqMarlinConfig
-        o["awq"] = GemliteAwqConfig
-        o["awq_marlin"] = GemliteAwqMarlinConfig
-    if _ENABLED & _GGUF_TOGGLES:
+        if _AUTO_GPTQ:
+            o.update({name: GemliteGptqConfig
+                      for name in ("gptq", "gptq_marlin", "auto_gptq")})
+        else:
+            o["gptq"] = GemliteGptqConfig
+            o["gptq_marlin"] = GemliteGptqMarlinConfig
+        if _AUTO_AWQ:
+            o.update({name: GemliteAwqConfig
+                      for name in ("awq", "awq_marlin", "auto_awq")})
+        else:
+            o["awq"] = GemliteAwqConfig
+            o["awq_marlin"] = GemliteAwqMarlinConfig
+    if _HAS_GGUF and _ENABLED & _GGUF_TOGGLES:
         o["gguf"] = GemliteGGUFConfig
     return o
 
@@ -340,7 +409,7 @@ def _build_overrides() -> dict[str, type]:
 def enable_gemlite(names: Optional[Iterable[str]] = None) -> None:
     """Swap vLLM's quant-config registry so requested types load through
     gemlite. `names=None` enables every type in `SUPPORTED`."""
-    global _PATCHED, _ENABLED
+    global _PATCHED, _ENABLED, _OVERRIDES
     import vllm.model_executor.layers.quantization as _vq
 
     requested = {_ALIASES.get(n, n)
@@ -353,13 +422,13 @@ def enable_gemlite(names: Optional[Iterable[str]] = None) -> None:
 
     load_cache()
     _register_v2_methods()
-    overrides = _build_overrides()
+    _OVERRIDES = _build_overrides()
 
     if not _PATCHED:
         orig = _vq.get_quantization_config
 
         def _patched(quantization: str):
-            return overrides.get(quantization) or orig(quantization)
+            return _OVERRIDES.get(quantization) or orig(quantization)
 
         _vq.get_quantization_config = _patched
         # Other modules `from ...quantization import get_quantization_config`,
@@ -380,7 +449,7 @@ def enable_gemlite(names: Optional[Iterable[str]] = None) -> None:
 
     registry = getattr(_vq, "QUANTIZATION_METHODS", None)
     if registry is not None:
-        for name, cls in overrides.items():
+        for name, cls in _OVERRIDES.items():
             try:
                 registry[name] = cls
             except Exception:

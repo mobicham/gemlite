@@ -10,18 +10,43 @@ import logging
 import torch
 
 from gemlite.helper import (
-    A4W4_NVFP_dynamic, A8W8_fp8_dynamic, A8W8_int8_dynamic,
+    A4W4_MXFP_dynamic, A4W4_NVFP_dynamic, A8W8_fp8_dynamic,
+    A8W8_int8_dynamic,
     A16W2_HQQ_INT, A16W4_HQQ_INT, A16W4_MXFP, A16W4_NVFP,
     A16W8_HQQ_INT, A16W8_INT8,
 )
 from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE
 
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsW4A4Fp4, CompressedTensorsW4A16Fp4,
-    CompressedTensorsW4A16Mxfp4, CompressedTensorsWNA16,
+    CompressedTensorsScheme, CompressedTensorsW4A4Fp4,
+    CompressedTensorsW8A8Fp8, CompressedTensorsW8A8Int8,
+    CompressedTensorsWNA16,
 )
+try:
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A16Fp4 as _CompressedTensorsW4A16Fp4Base,
+    )
+    _CT_NVFP4_USES_A16_FLAG = False
+except ImportError:
+    # vLLM >= 0.23 folds W4A16 into W4A4Fp4(use_a16=True).
+    _CompressedTensorsW4A16Fp4Base = CompressedTensorsW4A4Fp4
+    _CT_NVFP4_USES_A16_FLAG = True
+try:
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A16Mxfp4 as _CompressedTensorsMxfp4Base,
+    )
+except ImportError:
+    # vLLM >= 0.23 uses one loader for both the SM100+ W4A4 kernel and its
+    # weight-only fallback. GemLite chooses the execution mode below.
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A4Mxfp4 as _CompressedTensorsMxfp4Base,
+    )
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
-from vllm.model_executor.layers.quantization.gguf import GGUFLinearMethod
+try:
+    from vllm.model_executor.layers.quantization.gguf import GGUFLinearMethod
+except ModuleNotFoundError:
+    from vllm.model_executor.layers.linear import LinearMethodBase
+    GGUFLinearMethod = LinearMethodBase
 
 from .common import (
     GemliteApplyMixin, GemliteCTApplyMixin, StockWrappedGemliteMethod,
@@ -367,6 +392,68 @@ class GemliteAwqLinearMethod(StockWrappedGemliteMethod):
 # compressed-tensors wrappers
 # ---------------------------------------------------------------------------
 
+class GemliteCTW8A8Fp8(GemliteCTApplyMixin, CompressedTensorsW8A8Fp8):
+    """Compressed-tensors FP8 with dynamic activations."""
+
+    def process_weights_after_loading(self, layer) -> None:
+        assert not self.is_static_input_scheme
+        weight = layer.weight.data
+        block_quant = self.weight_block_size is not None
+        scales = layer.weight_scale.data
+        if block_quant:
+            assert self.weight_block_size == [BLOCK_QUANT_SIZE,
+                                              BLOCK_QUANT_SIZE], (
+                f"gemlite block FP8 requires "
+                f"{BLOCK_QUANT_SIZE}x{BLOCK_QUANT_SIZE}, "
+                f"got {self.weight_block_size}"
+            )
+        else:
+            scales = scales.view(-1, 1)
+            if scales.numel() == 1:
+                scales = scales.expand(weight.shape[0], 1).contiguous()
+        gl = A8W8_fp8_dynamic(
+            device=weight.device, dtype=layer.orig_dtype,
+            block_quant=block_quant,
+        ).from_weights(
+            weight, bias=None, scales=scales,
+        )
+        _attach(layer, gl, ("weight", "weight_scale", "input_scale"))
+
+
+class GemliteCTW8A8Int8(GemliteCTApplyMixin, CompressedTensorsW8A8Int8):
+    """Compressed-tensors channel-wise INT8 with dynamic token activations."""
+
+    def create_weights(self, layer, output_partition_sizes,
+                       input_size_per_partition, params_dtype, weight_loader,
+                       **kwargs) -> None:
+        layer.orig_dtype = params_dtype
+        return super().create_weights(
+            layer=layer,
+            output_partition_sizes=output_partition_sizes,
+            input_size_per_partition=input_size_per_partition,
+            params_dtype=params_dtype,
+            weight_loader=weight_loader,
+            **kwargs,
+        )
+
+    def process_weights_after_loading(self, layer) -> None:
+        assert not self.is_static_input_scheme
+        assert self.input_symmetric
+        weight = layer.weight.data
+        scales = layer.weight_scale.data.view(-1, 1)
+        if scales.numel() == 1:
+            scales = scales.expand(weight.shape[0], 1).contiguous()
+        gl = A8W8_int8_dynamic(
+            device=weight.device, dtype=layer.orig_dtype,
+        ).from_weights(weight, bias=None, scales=scales)
+        _attach(
+            layer,
+            gl,
+            ("weight", "weight_scale", "input_scale", "input_zero_point",
+             "azp_adj"),
+        )
+
+
 class GemliteCTW4A4Fp4(GemliteCTApplyMixin, CompressedTensorsW4A4Fp4):
     """W4A4 NVFP4.
 
@@ -393,8 +480,14 @@ class GemliteCTW4A4Fp4(GemliteCTApplyMixin, CompressedTensorsW4A4Fp4):
                             "weight_global_scale", "input_global_scale", "alpha"))
 
 
-class GemliteCTW4A16Fp4(GemliteCTApplyMixin, CompressedTensorsW4A16Fp4):
+class GemliteCTW4A16Fp4(GemliteCTApplyMixin, _CompressedTensorsW4A16Fp4Base):
     """W4A16 NVFP4 — weight-only NVFP4."""
+
+    def __init__(self) -> None:
+        if _CT_NVFP4_USES_A16_FLAG:
+            super().__init__(use_a16=True)
+        else:
+            super().__init__()
 
     def process_weights_after_loading(self, layer) -> None:
         w = layer.weight_packed.data
@@ -403,12 +496,25 @@ class GemliteCTW4A16Fp4(GemliteCTApplyMixin, CompressedTensorsW4A16Fp4):
             device=w.device, dtype=_pick_dtype(layer, attr="params_dtype"),
         ).from_packed_weights(
             weight_packed=w, scales=layer.weight_scale.data,
-            meta_scale=_recip_max(wg) if wg is not None else None,
+            meta_scale=_scalar_max_fp32(wg) if wg is not None else None,
         )
         _attach(layer, gl, ("weight_packed", "weight_scale", "weight_global_scale"))
 
 
-class GemliteCTW4A16Mxfp4(GemliteCTApplyMixin, CompressedTensorsW4A16Mxfp4):
+class GemliteCTW4A4Mxfp4(GemliteCTApplyMixin, _CompressedTensorsMxfp4Base):
+    """W4A4 MXFP4 — dynamically quantized MXFP4 activations."""
+
+    def process_weights_after_loading(self, layer) -> None:
+        w = layer.weight_packed.data
+        gl = A4W4_MXFP_dynamic(
+            device=w.device, dtype=_pick_dtype(layer, attr="params_dtype"),
+        ).from_packed_weights(
+            weight_packed=w, scales=layer.weight_scale.data, bias=None,
+        )
+        _attach(layer, gl, ("weight_packed", "weight_scale"))
+
+
+class GemliteCTW4A16Mxfp4(GemliteCTApplyMixin, _CompressedTensorsMxfp4Base):
     """W4A16 MXFP4 — e8m0 scales, no global scale."""
 
     def process_weights_after_loading(self, layer) -> None:

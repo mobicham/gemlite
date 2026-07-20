@@ -35,7 +35,7 @@ vLLM with a warning. Nothing hard-fails.
 - `vllm`
 - `hqq` — only if you use on-the-fly `int4_weightonly`
 
-On Blackewell, make sure you use CUDA 13 PTXAS
+On Blackwell, make sure you use CUDA 13 PTXAS
 ```
 export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.0/bin/ptxas
 ```
@@ -113,6 +113,11 @@ restrict.
 | `A16W4_HQQ_INT`      | GPTQ / AWQ / GPTQMarlin / AWQMarlin int4, HQQ int4, GGUF Q4_0 / Q4_1 / Q4_K, CT pack_quantized int4 |
 | `A16W8_HQQ_INT`      | GPTQ / AWQ int8, GGUF Q8_0, CT pack_quantized int8   |
 | `A16W2_HQQ_INT`      | GGUF Q2_K                                            |
+
+GGUF routing is available only on vLLM releases that provide the `gguf`
+quantization backend. vLLM 0.23 no longer provides that backend, so GemLite
+leaves `gguf` unregistered on that version instead of installing a broken
+override.
 
 Aliases: `A16W4_INT` → `A16W4_HQQ_INT`, `A16W8_INT` → `A16W8_HQQ_INT`.
 
@@ -209,6 +214,14 @@ plain `vllm serve` via plugin):
 | `cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit`   | CT pack-quantized int4     | `A16W4_HQQ_INT`                 |
 | `JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int4`  | GPTQ int4 (→ gptq_marlin)  | `A16W4_HQQ_INT`                 |
 | `unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_1`   | GGUF Q4_1                  | `A16W4_HQQ_INT`                 |
+
+Compatibility-checked on vLLM
+`0.23.1rc1.dev1279+gdcfebf93f` with the same Blackwell/CUDA 13 setup. This
+includes the plugin/env entry point, block FP8, compressed-tensors NVFP4 and
+MXFP4 weight loading, AutoAWQ/AutoGPTQ routing, and on-the-fly `LinearBase`
+construction. The mixed block-FP8/NVFP4 model
+`dropbox-dash/Qwen3.5-4B_glm-52-fp8_deepspeed_v2_take3_extradata_1_vlm-NVFP4-MIX-FP8KV`
+also loads and serves through the GemLite routes on this version.
 
 GGUF checkpoints require `--hf-config-path <hf-repo>` on `vllm serve`, and
 must use `--dtype float16` (vLLM rejects `bfloat16` for GGUF).
