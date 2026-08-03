@@ -235,9 +235,12 @@ class A16Wn:  # 8/4/2-bit weight-only as grouped "INT" / 8/4-bit as MXFP type
             self.post_scale = False
 
             N, K = W_q.shape
-            W_q, scales = W_q.view([N, K]), scales.view(N, K // group_size)#.float()
+            logical_K = K * (8 // W_nbits) if packed else K
+            W_q, scales = W_q.view([N, K]), scales.view(N, logical_K // group_size)#.float()
 
         in_features, out_features = W_q.shape[::-1] 
+        if(quant_type == "MXFP" and packed):
+            in_features *= 8 // W_nbits
 
         W_q = W_q.to(self.device)
         scales = scales.to(device=self.device) if (scales is not None) else None
@@ -388,7 +391,7 @@ class A16Wn_MXFP(A16Wn):
 
     def from_packed_weights(self, W_q_packed, scales, bias=None):
         """Load pre-packed MXFP weights (nibble/byte-packed)."""
-        group_size = W_q_packed.numel() * (self.W_nbits // 4) // scales.numel()
+        group_size = W_q_packed.numel() * (8 // self.W_nbits) // scales.numel()
         return super().from_packed_weights(
             W_q_packed, scales, zeros=None, W_nbits=self.W_nbits,
             group_size=group_size, bias=bias, quant_type="MXFP",
@@ -1374,4 +1377,3 @@ def warmup(
         torch.cuda.empty_cache()
         gc.collect()
         time.sleep(1)
-

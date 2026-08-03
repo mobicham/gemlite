@@ -35,7 +35,7 @@ vLLM with a warning. Nothing hard-fails.
 - `vllm`
 - `hqq` — only if you use on-the-fly `int4_weightonly`
 
-On Blackewell, make sure you use CUDA 13 PTXAS
+On Blackwell, make sure you use CUDA 13 PTXAS
 ```
 export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.0/bin/ptxas
 ```
@@ -113,6 +113,11 @@ restrict.
 | `A16W4_HQQ_INT`      | GPTQ / AWQ / GPTQMarlin / AWQMarlin int4, HQQ int4, GGUF Q4_0 / Q4_1 / Q4_K, CT pack_quantized int4 |
 | `A16W8_HQQ_INT`      | GPTQ / AWQ int8, GGUF Q8_0, CT pack_quantized int8   |
 | `A16W2_HQQ_INT`      | GGUF Q2_K                                            |
+
+GGUF routing is available only on vLLM releases that provide the `gguf`
+quantization backend. vLLM 0.23 no longer provides that backend, so GemLite
+leaves `gguf` unregistered on that version instead of installing a broken
+override.
 
 Aliases: `A16W4_INT` → `A16W4_HQQ_INT`, `A16W8_INT` → `A16W8_HQQ_INT`.
 
@@ -210,17 +215,81 @@ plain `vllm serve` via plugin):
 | `JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int4`  | GPTQ int4 (→ gptq_marlin)  | `A16W4_HQQ_INT`                 |
 | `unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_1`   | GGUF Q4_1                  | `A16W4_HQQ_INT`                 |
 
+Compatibility-checked on vLLM
+`0.23.1rc1.dev1279+gdcfebf93f` with the same Blackwell/CUDA 13 setup. This
+includes the plugin/env entry point, block FP8, compressed-tensors NVFP4 and
+MXFP4 weight loading, AutoAWQ/AutoGPTQ routing, and on-the-fly `LinearBase`
+construction. The mixed block-FP8/NVFP4 model
+`dropbox-dash/Qwen3.5-4B_glm-52-fp8_deepspeed_v2_take3_extradata_1_vlm-NVFP4-MIX-FP8KV`
+also loads and serves through the GemLite routes on this version.
+
+### vLLM nightly
+
+Validated on vLLM `0.26.1rc1.dev255+g5e35a6f4f`, PyTorch 2.13, Triton
+3.7.1, and CUDA 13 on RTX PRO 6000 Blackwell. Unless noted otherwise, these
+checks used vLLM's defaults: `enforce_eager=False`, `VLLM_COMPILE`, and all
+51 PIECEWISE plus all 51 FULL CUDA graph capture sizes.
+
+The following on-the-fly presets load, compile, capture, and generate
+successfully:
+
+| Preset                           | Result |
+| -------------------------------- | ------ |
+| `A16W8_INT8`                     | Pass   |
+| `A16W8_FP8`                      | Pass   |
+| `A16W4_INT4_HQQ`                 | Pass   |
+| `A8W8_INT8_DYNAMIC`              | Pass   |
+| `A8W8_FP8_DYNAMIC`               | Pass   |
+| `A8W8_FP8_DYNAMIC_BLOCK`         | Pass   |
+| `MXFP8_DYNAMIC`                  | Pass   |
+| `MXFP4_WEIGHTONLY`               | Pass   |
+| `A8W4_MXFP_DYNAMIC`              | Pass   |
+| `NVFP4_DYNAMIC`                  | Pass   |
+| `MXFP4_DYNAMIC`                  | Execution passes; see quality note below |
+
+Direct kernel comparisons for the INT8, MXFP8, MXFP4, and NVFP4 dynamic
+paths produced finite outputs and stayed within 0.43% relative L2 error of
+an explicitly dequantized reference across the sampled shapes. Fully dynamic
+MXFP4 also matched its quantized reference, but quantizing both weights and
+activations to FP4 caused roughly 16-17% error relative to BF16 and visibly
+degraded Qwen3-0.6B generation. Treat `MXFP4_DYNAMIC` as an aggressive
+quality/performance tradeoff, not as a generally quality-safe default.
+
+Triton 3.7 requires native BF16/FP16 operands of mixed MXFP4
+`tl.dot_scaled` to use a null lhs scale; GemLite follows that contract for
+weight-only MXFP4 on sm_120. Triton does not provide the corresponding
+native BF16/FP16 x NVFP4 weight-only `tl.dot_scaled` path. W4A4
+`NVFP4_DYNAMIC` is supported because both operands are FP4.
+
+The following pre-quantized checkpoints were also validated through GemLite
+with offline `LLM` and the same default compile/CUDA-graph settings:
+
+| Model                                        | Format                     | Result |
+| -------------------------------------------- | -------------------------- | ------ |
+| `Firworks/Qwen3-4B-Instruct-2507-nvfp4`      | CT NVFP4 W4A4              | Pass   |
+| `Qwen/Qwen3-4B-Instruct-2507-FP8`            | DeepSeek block FP8 128x128 | Pass   |
+| `cyankiwi/Qwen3-4B-Instruct-2507-AWQ-4bit`   | CT pack-quantized int4     | Pass   |
+| `JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int4`  | GPTQ int4                  | Pass   |
+
+Newer vLLM's DeepGEMM warmup discovers block-FP8 layers through the stock
+`fp8_linear` selector. GemLite clears that selector after replacing the stock
+weights so the warmup does not inspect tensors that have already been packed
+and removed. The GGUF checkpoint cannot be run on this nightly because this
+vLLM release does not expose a GGUF quantization backend. The mixed Dropbox
+FP8/NVFP4 checkpoint was not rechecked because it requires access to its
+private Hugging Face repository.
+
 GGUF checkpoints require `--hf-config-path <hf-repo>` on `vllm serve`, and
 must use `--dtype float16` (vLLM rejects `bfloat16` for GGUF).
 
 ## Troubleshooting
 
 - **`KeyError: 'gemlite_linear'` after toggling `VLLM_GEMLITE_ENABLE`** —
-  vLLM's torch.compile cache key doesn't include the quant method, so a
-  graph compiled with gemlite enabled gets reused on the next run with
-  gemlite disabled (and vice-versa), and the cached graph references
-  `layer.gemlite_linear` which no longer exists. Wipe the cache when
-  switching backends:
+  recent vLLM releases expose their environment-variable registry; GemLite
+  registers its plugin settings there so different modes receive different
+  torch.compile cache keys. On older releases without that registry, a graph
+  compiled with GemLite enabled can be reused with GemLite disabled (or vice
+  versa). Wipe the cache when switching backends on those releases:
 
   ```bash
   rm -rf ~/.cache/vllm/torch_compile_cache
