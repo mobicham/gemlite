@@ -78,6 +78,40 @@ from .schemes import (
 logger = logging.getLogger(__name__)
 
 
+_VLLM_ENV_DEFAULTS = {
+    "VLLM_GEMLITE_ENABLE": "0",
+    "VLLM_GEMLITE_ENABLE_LIST": "",
+    "VLLM_GEMLITE_ONTHEFLY_QUANT": "",
+    "VLLM_GEMLITE_SKIP_MODULES": "lm_head,visual,vision",
+}
+
+
+def _register_vllm_env_vars() -> None:
+    """Teach recent vLLM releases about GemLite's plugin environment.
+
+    Besides suppressing unknown-variable warnings, this includes the GemLite
+    settings in vLLM's torch.compile cache key.  Without that, graphs created
+    with different GemLite modes can be incorrectly reused across launches.
+    """
+    try:
+        import vllm.envs as vllm_envs
+    except ImportError:
+        return
+
+    registry = getattr(vllm_envs, "environment_variables", None)
+    if not isinstance(registry, dict):
+        return
+
+    for name, default in _VLLM_ENV_DEFAULTS.items():
+        registry.setdefault(
+            name,
+            lambda name=name, default=default: os.getenv(name, default),
+        )
+
+
+_register_vllm_env_vars()
+
+
 SUPPORTED = {
     "A8W8_FP8_DYNAMIC",     # FP8 dynamic (block + per-tensor/channel)
     "A16W8_FP8",            # FP8 weight-only per-channel

@@ -715,6 +715,10 @@ def gemm_splitK_MX_kernel(
             scale_a_mask_k = ((offs_k_scales[None, :] + k_m) < (K // group_size)) if not EVEN_K else True
             scale_a_mask = scale_a_mask_m & scale_a_mask_k
             scales_a = load_ptr(scales_a_ptrs + k_m * stride_meta_a_g, scale_a_mask, meta_evict_policy, not (EVEN_M and EVEN_K))
+        # Native activations are not microscaled. Triton 3.7 expects a null
+        # lhs scale here; a synthetic E8M0-one tensor breaks SM120 lowering.
+        elif group_size == 32 and (a_dtype == "bf16" or a_dtype == "fp16"):
+            scales_a = None
         else:
             scales_a = scales_a_1s
 

@@ -148,6 +148,11 @@ class GemliteFp8BlockLinearMethod(_GemliteFp8Base):
             device=w.device, dtype=layer.orig_dtype, block_quant=True,
         ).from_weights(w, bias=None, scales=layer.weight_scale_inv.data)
         _attach(layer, gl, _FP8_CLEANUP)
+        # vLLM's DeepGEMM warmup detects block-FP8 layers through this stock
+        # kernel selector.  GemLite has replaced the stock tensors above, so
+        # leaving it set makes recent vLLM nightlies try to warm up DeepGEMM
+        # against a layer that no longer has ``weight`` / ``weight_scale``.
+        self.fp8_linear = None
 
 
 class GemliteFp8PerTensorLinearMethod(_GemliteFp8Base):
