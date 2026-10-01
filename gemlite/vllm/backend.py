@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8, CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A16Fp8,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 try:
@@ -58,9 +59,14 @@ except ModuleNotFoundError:
     )
     GPTQMarlinConfig = GPTQConfig
     _AUTO_GPTQ = True
-from vllm.model_executor.layers.quantization.modelopt import (
-    ModelOptNvFp4Config, ModelOptNvFp4LinearMethod,
-)
+from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+try:
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4LinearMethod
+except ImportError:
+    # vLLM >= 0.30 merged the format-specific ModelOpt linear methods.
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod as ModelOptNvFp4LinearMethod,
+    )
 
 from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE
 
@@ -68,6 +74,7 @@ from .common import load_cache
 from .schemes import (
     GemliteAwqLinearMethod, GemliteCTW4A4Fp4, GemliteCTW4A4Mxfp4,
     GemliteCTW4A16Fp4, GemliteCTW4A16Mxfp4, GemliteCTW8A8Fp8,
+    GemliteCTW8A16Fp8,
     GemliteCTW8A8Int8, GemliteCTWNA16Int,
     GemliteFp8BlockLinearMethod, GemliteFp8PerTensorLinearMethod,
     GemliteA16W4GroupLinearMethod, GemliteGGUFLinearMethod,
@@ -155,9 +162,11 @@ class GemliteFp8Config(Fp8Config):
         if self._block_ok() and "A8W8_FP8_DYNAMIC" in _ENABLED:
             return GemliteFp8BlockLinearMethod(self)
         if (self.weight_block_size is None
-                and self.activation_scheme == "dynamic"
-                and "A16W8_FP8" in _ENABLED):
-            return GemliteFp8PerTensorLinearMethod(self)
+                and self.activation_scheme == "dynamic"):
+            if "A8W8_FP8_DYNAMIC" in _ENABLED:
+                return GemliteFp8PerTensorLinearMethod(self)
+            if "A16W8_FP8" in _ENABLED:
+                return GemliteFp8PerTensorLinearMethod(self, weight_only=True)
         return method
 
 
@@ -172,7 +181,11 @@ class GemliteModelOptNvFp4Config(ModelOptNvFp4Config):
 
     def get_quant_method(self, layer, prefix):
         method = super().get_quant_method(layer, prefix)
+        # Legacy configs only support NVFP4 and lack quant_method.
+        # Newer configs also handle W4A16; this wrapper expects W4A4.
         if (isinstance(method, ModelOptNvFp4LinearMethod)
+                and (not hasattr(self, "quant_method")
+                     or self.quant_method == "NVFP4")
                 and "A4W4_NVFP_DYNAMIC" in _ENABLED):
             return GemliteNvFp4LinearMethod(self, method)
         return method
@@ -232,14 +245,16 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
                 and weight_quant.strategy in ("group", "channel")
                 and not weight_quant.dynamic
                 and getattr(weight_quant, "actorder", None) in (None, "static")
-                and _HQQ_TOGGLE[weight_quant.num_bits] in _ENABLED
+                and (_HQQ_TOGGLE[weight_quant.num_bits] in _ENABLED
+                     or (weight_quant.num_bits == 8
+                         and weight_quant.strategy == "channel"
+                         and "A16W8_INT8" in _ENABLED))
                 and (format or self.quant_format) == "pack-quantized"):
             return GemliteCTWNA16Int(
                 num_bits=weight_quant.num_bits,
                 strategy=weight_quant.strategy,
                 symmetric=weight_quant.symmetric,
                 group_size=weight_quant.group_size,
-                actorder=weight_quant.actorder,
                 layer_name=layer_name,
             )
 
@@ -256,6 +271,15 @@ class GemliteCompressedTensorsConfig(CompressedTensorsConfig):
             return GemliteCTW8A8Fp8(
                 weight_quant=weight_quant,
                 is_static_input_scheme=stock_scheme.is_static_input_scheme,
+            )
+        if ("A16W8_FP8" in _ENABLED
+                and isinstance(stock_scheme, (CompressedTensorsW8A8Fp8,
+                                              CompressedTensorsW8A16Fp8))
+                and not stock_scheme.is_static_input_scheme
+                and stock_scheme.weight_block_size is None):
+            return GemliteCTW8A16Fp8(
+                weight_quant=weight_quant,
+                is_static_input_scheme=False,
             )
         if ("A8W8_INT8_DYNAMIC" in _ENABLED
                 and isinstance(stock_scheme, CompressedTensorsW8A8Int8)
@@ -419,6 +443,7 @@ def _build_overrides() -> dict[str, type]:
     if "A4W4_NVFP_DYNAMIC" in _ENABLED:
         o["modelopt_fp4"] = GemliteModelOptNvFp4Config
     if _ENABLED & {"A8W8_FP8_DYNAMIC", "A8W8_INT8_DYNAMIC",
+                   "A16W8_FP8", "A16W8_INT8",
                    "A4W4_NVFP_DYNAMIC", "A4W4_MXFP_DYNAMIC",
                    "A16W4_MXFP", "A16W4_HQQ_INT", "A16W8_HQQ_INT"}:
         o["compressed-tensors"] = GemliteCompressedTensorsConfig
