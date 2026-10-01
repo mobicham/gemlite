@@ -55,12 +55,21 @@ def routing_layer():
         yield LinearBase(128, 128, params_dtype=torch.bfloat16, disable_tp=True)
 
 
+@pytest.mark.parametrize("legacy_config", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_modelopt_nvfp4_routing(monkeypatch, routing_layer, enabled):
+def test_modelopt_nvfp4_routing(monkeypatch, routing_layer, enabled, legacy_config):
     monkeypatch.setattr(backend, "_ENABLED",
                         {"A4W4_NVFP_DYNAMIC"} if enabled else set())
     config = backend.GemliteModelOptNvFp4Config(
-        is_checkpoint_nvfp4_serialized=True)
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None, exclude_modules=[])
+    if legacy_config:
+        stock = backend.ModelOptNvFp4Config.get_quant_method(
+            config, routing_layer, "proj")
+        # Legacy configs lack quant_method and only dispatch NVFP4.
+        monkeypatch.delattr(config, "quant_method", raising=False)
+        monkeypatch.setattr(backend.ModelOptNvFp4Config, "get_quant_method",
+                            lambda self, layer, prefix: stock)
     method = config.get_quant_method(routing_layer, "proj")
     if enabled:
         assert isinstance(method, GemliteNvFp4LinearMethod)

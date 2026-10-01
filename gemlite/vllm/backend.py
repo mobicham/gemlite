@@ -181,9 +181,11 @@ class GemliteModelOptNvFp4Config(ModelOptNvFp4Config):
 
     def get_quant_method(self, layer, prefix):
         method = super().get_quant_method(layer, prefix)
-        # The merged method also handles W4A16; this wrapper expects W4A4.
+        # Legacy configs only support NVFP4 and lack quant_method.
+        # Newer configs also handle W4A16; this wrapper expects W4A4.
         if (isinstance(method, ModelOptNvFp4LinearMethod)
-                and self.quant_method == "NVFP4"
+                and (not hasattr(self, "quant_method")
+                     or self.quant_method == "NVFP4")
                 and "A4W4_NVFP_DYNAMIC" in _ENABLED):
             return GemliteNvFp4LinearMethod(self, method)
         return method

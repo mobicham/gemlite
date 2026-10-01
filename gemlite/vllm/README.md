@@ -362,8 +362,9 @@ Run the focused import, routing, and numerical scale regressions with:
 python3 -m pytest tests/vllm_test.py
 ```
 
-All 23 cases pass. The legacy ModelOpt symbol is tested in an isolated
-process; an older vLLM runtime was not reinstalled. Ada/L4, FP16 serving, and
+All 25 cases pass. The legacy ModelOpt symbol and configs without
+`quant_method` are tested in isolation; an older vLLM runtime was not
+reinstalled. Ada/L4, FP16 serving, and
 multi-GPU configurations were not tested. These are compatibility/generation
 smoke checks, not model-accuracy or latency benchmarks.
 
