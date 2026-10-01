@@ -13,13 +13,14 @@ from gemlite.helper import (
     A4W4_MXFP_dynamic, A4W4_NVFP_dynamic, A8W8_fp8_dynamic,
     A8W8_int8_dynamic,
     A16W2_HQQ_INT, A16W4_HQQ_INT, A16W4_MXFP, A16W4_NVFP,
-    A16W8_HQQ_INT, A16W8_INT8,
+    A16W8_HQQ_INT, A16W8_INT8, A16W8_FP8,
 )
 from gemlite.triton_kernels.config import BLOCK_QUANT_SIZE
 
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme, CompressedTensorsW4A4Fp4,
     CompressedTensorsW8A8Fp8, CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
 )
 try:
@@ -42,6 +43,9 @@ except ImportError:
         CompressedTensorsW4A4Mxfp4 as _CompressedTensorsMxfp4Base,
     )
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    convert_to_channelwise,
+)
 try:
     from vllm.model_executor.layers.quantization.gguf import GGUFLinearMethod
 except ModuleNotFoundError:
@@ -70,6 +74,33 @@ def _scalar_max_fp32(t):
 def _recip_max(t):
     """1 / max(t) in fp32 — the ModelOpt meta_scale convention."""
     return 1.0 / _scalar_max_fp32(t)
+
+
+def _fp8_channel_scales(layer, weight):
+    """Expand serialized tensor/shard scales to the rows GemLite consumes."""
+    scales = layer.weight_scale.data.view(-1, 1)
+    rows = weight.shape[0]
+    if scales.numel() == rows:
+        return scales.contiguous()
+    if scales.numel() == 1:
+        return scales.expand(rows, 1).contiguous()
+    widths = layer.logical_widths
+    if scales.numel() != len(widths) or sum(widths) != rows:
+        raise ValueError(
+            f"FP8 scale count {scales.numel()} does not match {rows} rows "
+            f"or logical shard widths {widths}"
+        )
+    return convert_to_channelwise(scales, widths).contiguous()
+
+
+def _mxfp4_scales(layer):
+    """vLLM stores E8M0 exponent bytes; GemLite accepts typed E8M0 values."""
+    scales = layer.weight_scale.data
+    if scales.dtype == torch.uint8:
+        return scales.view(torch.float8_e8m0fnu)
+    if scales.dtype == torch.float8_e8m0fnu:
+        return scales
+    raise ValueError(f"Unsupported MXFP4 weight_scale dtype: {scales.dtype}")
 
 
 def _pick_dtype(obj, *, attr: str = "orig_dtype", default=torch.bfloat16):
@@ -156,18 +187,25 @@ class GemliteFp8BlockLinearMethod(_GemliteFp8Base):
 
 
 class GemliteFp8PerTensorLinearMethod(_GemliteFp8Base):
-    """Per-tensor / per-channel FP8, dynamic activations."""
+    """Per-tensor / per-channel FP8 with dynamic or 16-bit activations."""
+
+    def __init__(self, quant_config, weight_only=False):
+        super().__init__(quant_config)
+        self.weight_only = weight_only
 
     def process_weights_after_loading(self, layer) -> None:
         assert not self.block_quant
         w = layer.weight.data
-        scale = layer.weight_scale.data.view(-1, 1)
-        if scale.numel() == 1:
-            scale = scale.expand(w.shape[0], 1).contiguous()
-        gl = A8W8_fp8_dynamic(
-            device=w.device, dtype=layer.orig_dtype, block_quant=False,
-        ).from_weights(w, bias=None, scales=scale)
+        scale = _fp8_channel_scales(layer, w)
+        if self.weight_only:
+            processor = A16W8_FP8(device=w.device, dtype=layer.orig_dtype)
+        else:
+            processor = A8W8_fp8_dynamic(
+                device=w.device, dtype=layer.orig_dtype, block_quant=False,
+            )
+        gl = processor.from_weights(w, bias=None, scales=scale)
         _attach(layer, gl, _FP8_CLEANUP)
+        self.fp8_linear = None
 
 
 # ---------------------------------------------------------------------------
@@ -413,9 +451,7 @@ class GemliteCTW8A8Fp8(GemliteCTApplyMixin, CompressedTensorsW8A8Fp8):
                 f"got {self.weight_block_size}"
             )
         else:
-            scales = scales.view(-1, 1)
-            if scales.numel() == 1:
-                scales = scales.expand(weight.shape[0], 1).contiguous()
+            scales = _fp8_channel_scales(layer, weight)
         gl = A8W8_fp8_dynamic(
             device=weight.device, dtype=layer.orig_dtype,
             block_quant=block_quant,
@@ -423,6 +459,21 @@ class GemliteCTW8A8Fp8(GemliteCTApplyMixin, CompressedTensorsW8A8Fp8):
             weight, bias=None, scales=scales,
         )
         _attach(layer, gl, ("weight", "weight_scale", "input_scale"))
+
+
+class GemliteCTW8A16Fp8(GemliteCTApplyMixin, CompressedTensorsW8A16Fp8):
+    """Serialized tensor/channel FP8 weights with BF16/FP16 activations."""
+
+    def process_weights_after_loading(self, layer) -> None:
+        assert self.weight_block_size is None
+        weight = layer.weight.data
+        gl = A16W8_FP8(
+            device=weight.device, dtype=layer.orig_dtype,
+        ).from_weights(
+            weight, bias=None, scales=_fp8_channel_scales(layer, weight),
+        )
+        _attach(layer, gl, ("weight", "weight_scale", "input_scale"))
+        self.linear_kernel = None
 
 
 class GemliteCTW8A8Int8(GemliteCTApplyMixin, CompressedTensorsW8A8Int8):
@@ -514,7 +565,7 @@ class GemliteCTW4A4Mxfp4(GemliteCTApplyMixin, _CompressedTensorsMxfp4Base):
         gl = A4W4_MXFP_dynamic(
             device=w.device, dtype=_pick_dtype(layer, attr="params_dtype"),
         ).from_packed_weights(
-            weight_packed=w, scales=layer.weight_scale.data, bias=None,
+            weight_packed=w, scales=_mxfp4_scales(layer), bias=None,
         )
         _attach(layer, gl, ("weight_packed", "weight_scale"))
 
@@ -527,7 +578,7 @@ class GemliteCTW4A16Mxfp4(GemliteCTApplyMixin, _CompressedTensorsMxfp4Base):
         gl = A16W4_MXFP(
             device=w.device, dtype=_pick_dtype(layer, attr="params_dtype"),
         ).from_packed_weights(
-            W_q_packed=w, scales=layer.weight_scale.data, bias=None,
+            W_q_packed=w, scales=_mxfp4_scales(layer), bias=None,
         )
         _attach(layer, gl, ("weight_packed", "weight_scale"))
 
